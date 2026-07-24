@@ -1,0 +1,842 @@
+// created: 10.02.2022
+// updated: 28.06.2026
+
+#include "settings.h"
+
+#if TFT_CONTROLLER == 0
+    #define TFT_MODE_SPI
+    #define TFT_LAYOUT_S
+#endif
+
+#if TFT_CONTROLLER == 11
+    #define TFT_MODE_SPI
+    #define TFT_LAYOUT_XS
+#endif
+
+#if (TFT_CONTROLLER == 3 || TFT_CONTROLLER == 4 || TFT_CONTROLLER == 5)
+    #define TFT_MODE_SPI
+    #define TFT_LAYOUT_M
+#endif
+
+#if (TFT_CONTROLLER == 7)
+    #define TFT_MODE_RGB
+    #define TFT_ALIGN_LANDSCAPE
+    #define TFT_LAYOUT_L
+#endif
+
+#if (TFT_CONTROLLER == 8 || TFT_CONTROLLER == 9)
+    #define TFT_MODE_DSI
+    #define TFT_ALIGN_LANDSCAPE
+    #define TFT_LAYOUT_XL
+#endif
+
+#if (TFT_CONTROLLER == 10)
+    #define TFT_MODE_DSI
+    #define TFT_ALIGN_PORTRAIT
+    #define TFT_LAYOUT_L
+#endif
+
+#if (TP_CONTROLLER < 7)
+    #define TP_MODE_XPT2046
+#endif
+
+#if (TP_CONTROLLER == 7)
+    #define TP_MODE_GT911
+#endif
+
+#if (TP_CONTROLLER == 8)
+    #define TP_MODE_FT6X63
+#endif
+
+#if (TP_CONTROLLER == 9)
+    #define TP_MODE_CST816
+#endif
+
+#pragma once
+
+#include "Audio.h"
+#include "BH1750.h"
+#include "DLNAClient.h"
+#include "ESP32FtpServer.h"
+#include "IR.h"
+#include "SPIFFS.h"
+#include "base64.h"
+#include "driver/ledc.h"
+#include "es8311.h"
+#include "esp_log.h"
+#include "esp_psram.h"
+#include "kcx_bt_emitter.h"
+#include "mbedtls/sha1.h"
+#include "rtime.h"
+#include "websrv.h"
+#include <Arduino.h>
+#include <ArduinoOTA.h>
+#include <ESPmDNS.h>
+#include <FFat.h>
+#include <FS.h>
+#include <Preferences.h>
+#include <SD_MMC.h>
+#include <SPI.h>
+#include <Ticker.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
+#include <WiFiMulti.h>
+#include <Wire.h>
+#include <mbedtls/aes.h>
+#include <mbedtls/base64.h>
+#include <vector>
+
+Audio       audio;
+Preferences pref;
+WebSrv      webSrv;
+WiFiMulti   wifiMulti;
+RTIME       rtc;
+Ticker      ticker100ms;
+TwoWire     i2cBusOne = TwoWire(0); // additional HW, sensors, buttons, encoder etc
+TwoWire     i2cBusTwo = TwoWire(1); // external DAC, AC101 or ES8388
+SPIClass    spiBus(FSPI);
+
+#ifdef TFT_MODE_SPI
+    #include "tft_spi.h"
+#elifdef TFT_MODE_RGB
+    #include "tft_rgb.h"
+#elifdef TFT_MODE_DSI
+    #include "tft_dsi.h"
+#else
+printf("unknown TFT_CONTROLLER\n")
+#endif
+
+#ifdef TP_MODE_XPT2046
+    #include "tp_xpt2046.h"
+#elifdef TP_MODE_GT911
+    #include "tp_gt911.h"
+#elifdef TP_MODE_FT6X63
+    #include "tp_ft6x36.h"
+#elifdef TP_MODE_CST816
+    #include "tp_cst816.h"
+#else
+    printf("unknown TP_CONTROLLER\n")
+#endif
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+//  output on serial terminal
+#define ANSI_ESC_RESET "\033[0m"
+
+#define ANSI_ESC_BLACK        "\033[30m"
+#define ANSI_ESC_RED          "\033[31m"
+#define ANSI_ESC_GREEN        "\033[32m"
+#define ANSI_ESC_YELLOW       "\033[33m"
+#define ANSI_ESC_BLUE         "\033[34m"
+#define ANSI_ESC_MAGENTA      "\033[35m"
+#define ANSI_ESC_CYAN         "\033[36m"
+#define ANSI_ESC_WHITE        "\033[37m"
+#define ANSI_ESC_BG_BLACK     "\033[40m"
+#define ANSI_ESC_BG_RED       "\033[41m"
+#define ANSI_ESC_BG_GREEN     "\033[42m"
+#define ANSI_ESC_BG_YELLOW    "\033[43m"
+#define ANSI_ESC_BG_BLUE      "\033[44m"
+#define ANSI_ESC_BG_MAGENTA   "\033[45m"
+#define ANSI_ESC_BG_CYAN      "\033[46m"
+#define ANSI_ESC_BG_WHITE     "\033[47m"
+#define ANSI_ESC_GREY         "\033[90m"
+#define ANSI_ESC_LIGHTRED     "\033[91m"
+#define ANSI_ESC_LIGHTGREEN   "\033[92m"
+#define ANSI_ESC_LIGHTYELLOW  "\033[93m"
+#define ANSI_ESC_LIGHTBLUE    "\033[94m"
+#define ANSI_ESC_LIGHTMAGENTA "\033[95m"
+#define ANSI_ESC_LIGHTCYAN    "\033[96m"
+#define ANSI_ESC_LIGHTGREY    "\033[97m"
+#define ANSI_ESC_DARKRED      "\033[38;5;52m"
+#define ANSI_ESC_DARKGREEN    "\033[38;5;22m"
+#define ANSI_ESC_DARKYELLOW   "\033[38;5;136m"
+#define ANSI_ESC_DARKBLUE     "\033[38;5;17m"
+#define ANSI_ESC_DARKMAGENTA  "\033[38;5;53m"
+#define ANSI_ESC_DARKCYAN     "\033[38;5;23m"
+#define ANSI_ESC_DARKGREY     "\033[38;5;240m"
+#define ANSI_ESC_BROWN        "\033[38;5;130m"
+#define ANSI_ESC_ORANGE       "\033[38;5;214m"
+#define ANSI_ESC_DARKORANGE   "\033[38;5;166m"
+#define ANSI_ESC_LIGHTORANGE  "\033[38;5;215m"
+#define ANSI_ESC_PURPLE       "\033[38;5;129m"
+#define ANSI_ESC_PINK         "\033[38;5;213m"
+#define ANSI_ESC_LIME         "\033[38;5;190m"
+#define ANSI_ESC_NAVY         "\033[38;5;25m"
+#define ANSI_ESC_AQUAMARINE   "\033[38;5;51m"
+#define ANSI_ESC_LAVENDER     "\033[38;5;189m"
+#define ANSI_ESC_LIGHTBROWN   "\033[38;2;210;180;140m"
+#define ANSI_ESC_RESET        "\033[0m"
+#define ANSI_ESC_BOLD         "\033[1m"
+#define ANSI_ESC_FAINT        "\033[2m"
+#define ANSI_ESC_ITALIC       "\033[3m"
+#define ANSI_ESC_UNDERLINE    "\033[4m"
+#define ANSI_ESC_BLINK        "\033[5m"
+#define ANSI_ESC_INVERT       "\033[7m"
+#define ANSI_ESC_STRIKE       "\033[9m"
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+struct _emojis {
+    const char greenCircle[5] = {0xF0, 0x9F, 0x9F, 0xA2, 0x00};  // UTF-8: "🟢"
+    const char yellowCircle[5] = {0xF0, 0x9F, 0x9F, 0xA1, 0x00}; // UTF-8: "🟡"
+    const char redCircle[5] = {0xF0, 0x9F, 0x94, 0xB4, 0x00};    // UTF-8: "🔴"
+    const char blueCircle[5] = {0xF0, 0x9F, 0x94, 0xB5, 0x00};   // UTF-8: "🔵"
+    const char orangeCircle[5] = {0xF0, 0x9F, 0x9F, 0xA0, 0x00}; // UTF-8: "🟠"
+    const char purpleCircle[5] = {0xF0, 0x9F, 0x9F, 0xA3, 0x00}; // UTF-8: "🟣"
+    const char brownCircle[5] = {0xF0, 0x9F, 0x9F, 0xA4, 0x00};  // UTF-8: "🟤"
+    const char greenSquare[5] = {0xF0, 0x9F, 0x9F, 0xA9, 0x00};  // UTF-8: "🟩"
+    const char yellowSquare[5] = {0xF0, 0x9F, 0x9F, 0xA8, 0x00}; // UTF-8: "🟨"
+    const char redSquare[5] = {0xF0, 0x9F, 0x9F, 0xA5, 0x00};    // UTF-8: "🟥"
+    const char blueSquare[5] = {0xF0, 0x9F, 0x9F, 0xA6, 0x00};   // UTF-8: "🟦"
+    const char orangeSquare[5] = {0xF0, 0x9F, 0x9F, 0xA7, 0x00}; // UTF-8: "🟧"
+    const char purpleSquare[5] = {0xF0, 0x9F, 0x9F, 0xAA, 0x00}; // UTF-8: "🟪"
+    const char brownSquare[5] = {0xF0, 0x9F, 0x9F, 0xAB, 0x00};  // UTF-8: "🟫"
+} emoji;
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+enum status {
+    NONE = 0,
+    RADIO = 1,
+    PLAYER = 2,
+    DLNA = 3,
+    CLOCK = 4,
+    BRIGHTNESS = 5,
+    ALARMCLOCK = 6,
+    SLEEPTIMER = 7,
+    STATIONSLIST = 8,
+    AUDIOFILESLIST = 9,
+    DLNAITEMSLIST = 10,
+    BLUETOOTH = 11,
+    EQUALIZER = 12,
+    SETTINGS = 13,
+    IR_SETTINGS = 14,
+    RINGING = 15,
+    WIFI_SETTINGS = 16,
+    SLEEP = 17,
+    UNDEFINED = -1
+};
+
+inline ps_ptr<char> getStatusName(int8_t status) {
+    ps_ptr<char> name;
+    switch (status) {
+        case 0: name = "NONE"; break;
+        case 1: name = "RADIO"; break;
+        case 2: name = "PLAYER"; break;
+        case 3: name = "DLNA"; break;
+        case 4: name = "CLOCK"; break;
+        case 5: name = "BRIGHTNESS"; break;
+        case 6: name = "ALARMCLOCK"; break;
+        case 7: name = "SLEEPTIMER"; break;
+        case 8: name = "STATIONSLIST"; break;
+        case 9: name = "AUDIOFILESLIST"; break;
+        case 10: name = "DLNAITEMSLIST"; break;
+        case 11: name = "BLUETOOTH"; break;
+        case 12: name = "EQUALIZER"; break;
+        case 13: name = "SETTINGS"; break;
+        case 14: name = "IR_SETTINGS"; break;
+        case 15: name = "RINGING"; break;
+        case 16: name = "WIFI_SETTINGS"; break;
+        case 17: name = "SLEEP"; break;
+        default: name = "UNDEFINED"; break;
+    }
+    return name;
+}
+
+enum ir_shift { IR_RIGHT = +100, IR_LEFT = -100, IR_UP = +101, IR_DOWN = -101, IR_RESET = -127 };
+
+extern SemaphoreHandle_t        mutex_rtc;
+extern RTIME                    rtc;
+extern WebSrv                   webSrv;
+extern std::deque<ps_ptr<char>> s_logBuffer;
+
+struct dlnaHistory_s {
+    ps_ptr<char> objId;
+    ps_ptr<char> name;
+    int16_t      maxItems = -1;
+    int16_t      childCount = -1;
+};
+struct releasedArg {
+    ps_ptr<char> arg1;
+    ps_ptr<char> arg2;
+    ps_ptr<char> arg3;
+    int16_t      val1 = 0;
+    int16_t      val2 = 0;
+};
+struct timecounter_s {
+    uint8_t timer = 0;
+    uint8_t factor = 2;
+    uint8_t tmp = 0;
+};
+struct irButtons {
+    int16_t val;
+    char*   label;
+};
+struct settings_s {
+    irButtons    irbuttons[45];
+    uint8_t      numOfIrButtons = 0;
+    ps_ptr<char> lastconnectedhost = {};
+    ps_ptr<char> lastconnectedfile = {};
+} s_settings;
+
+struct volume_s {
+    uint8_t cur_volume = 21;
+    uint8_t ringVolume = 21;
+    uint8_t volumeAfterAlarm = 12;
+    uint8_t volumeSteps = 21;
+} s_volume;
+
+struct bt_emitter_s {
+    bool         found = false;
+    bool         connect = false;
+    bool         enabled = false;
+    bool         play = true; // play: true, pause: false
+    uint8_t      volume = 0;
+    ps_ptr<char> mode = {};
+    ps_ptr<char> version = {};
+} s_bt_emitter;
+
+struct tone_s {
+    int16_t LP = 0;  // -40 ... +6 (dB)        audioI2S
+    int16_t BP = 0;  // -40 ... +6 (dB)        audioI2S
+    int16_t HP = 0;  // -40 ... +6 (dB)        audioI2S
+    int16_t BAL = 0; // -16...0....+16         audioI2S
+} s_tone;
+
+struct i2c_items_s {
+    bool es8311_found = false;
+    int  es8311_addr = -1;
+    bool es7210_found = false;
+    int  es7210_addr = -1;
+    bool gt911_found = false;
+    int  gt911_addr = -1;
+    bool ft6x36u_found = false;
+    int  ft6x36u_addr = -1;
+    bool cst816_found = false;
+    int  cst816_addr = -1;
+    bool bh1750_found = false;
+    int  bh1750_addr = -1;
+} s_i2c_items;
+
+struct tag_s {
+    ps_ptr<char> none = "";
+    ps_ptr<char> arduino = "Arduino:";
+    ps_ptr<char> audio_info = "Audio_Info:";
+    ps_ptr<char> wifi_info = "WiFi_Info:";
+    ps_ptr<char> setup = "Setup:";
+    ps_ptr<char> new_host = "New_Host:";
+    ps_ptr<char> playlist = "Playlist:";
+    ps_ptr<char> sd_card = "SD_Card:";
+    ps_ptr<char> file_name = "File_Name:";
+    ps_ptr<char> action = "Action:";
+    ps_ptr<char> country = "Country:";
+    ps_ptr<char> alarm_time = "Alarm_Time:";
+    ps_ptr<char> audio_codec = "Audio_Codec:";
+    ps_ptr<char> terminal = "Terminal:";
+    ps_ptr<char> ftp_server = "FTP_Server:";
+    ps_ptr<char> rtime_info = "RTIME_Info:";
+    ps_ptr<char> tft_info = "TFT_Info:";
+    ps_ptr<char> tp_info = "TP_Info:";
+    ps_ptr<char> ir_info = "IR_Info:";
+    ps_ptr<char> webserver = "Web_Server:";
+    ps_ptr<char> dlna_server = "DLNA_Server:";
+    ps_ptr<char> bt_emitter = "BT_Emitter:";
+    ps_ptr<char> sys_info = "System_Info:";
+    ps_ptr<char> recorder = "Recorder:";
+} s_tag;
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+template <typename... Args> void printfln(ps_ptr<char> tag, const char* fmt, Args&&... args) {
+    if (s_logBuffer.size() == 1024) s_logBuffer.pop_back();
+
+    ps_ptr<char> myLog;
+    myLog.reserve(200);
+    rtc.hasValidTime() ? myLog.append(rtc.gettime_s()) : myLog.append("00:00:00");
+    myLog.appendf(" {} ", tag);
+    while (myLog.strlen() < 25) { myLog.append("."); }
+    myLog.append(" ");
+    myLog.append(" \033[0m");
+    myLog.appendf(fmt, std::forward<Args>(args)...);
+    myLog.append("\033[0m\r\n");
+    printf("%s", myLog.c_get());
+    s_logBuffer.insert(s_logBuffer.begin(), std::move(myLog));
+    myLog.reset();
+}
+
+template <typename... Args> void printfcr(ps_ptr<char> tag, const char* fmt, Args&&... args) {
+    if (s_logBuffer.size() == 1024) s_logBuffer.pop_back();
+
+    ps_ptr<char> myLog;
+    myLog.reserve(200);
+    rtc.hasValidTime() ? myLog.append(rtc.gettime_s()) : myLog.append("00:00:00");
+    myLog.appendf(" {} ", tag);
+    while (myLog.strlen() < 25) { myLog.append("."); }
+    myLog.append(" ");
+    myLog.append(" \033[0m");
+    myLog.appendf(fmt, std::forward<Args>(args)...);
+    myLog.append("\033[0m\r");
+    printf("%s", myLog.c_get());
+    s_logBuffer.insert(s_logBuffer.begin(), std::move(myLog));
+    myLog.reset();
+}
+
+inline void printflnCut(ps_ptr<char> tag, ps_ptr<char> item, const char* color, ps_ptr<char> str) {
+    uint8_t maxLength = 100;
+    if (str.strlen() > maxLength) {
+        ps_ptr<char> tmp1 = str.substr(0, 70);
+        ps_ptr<char> tmp2 = str.substr(str.strlen() - 20);
+        str.assignf("{}...{}", tmp1, tmp2);
+    }
+    printfln(tag, "{}{}{}", item, color, str);
+}
+
+int log_redirect_handler(const char* format, va_list args) {
+    va_list args_len;
+    va_copy(args_len, args);
+    char probe[1];
+    int  len = vsnprintf(probe, sizeof(probe), format, args_len);
+    va_end(args_len);
+    if (len < 0) return 0;
+    len += 1;
+    // Puffer fuer die formatierte Nachricht
+    ps_ptr<char> log_buffer;
+    log_buffer.alloc(len);
+    char* log_dst = log_buffer.get();
+    if (!log_dst) return 0;
+    va_list args_msg;
+    va_copy(args_msg, args);
+    vsnprintf(log_dst, len, format, args_msg);
+    va_end(args_msg);
+    if (len > 0) {
+        // 0x1B 0x5B 0x30 0x3B 0x33 0x32 0x6D 0x49 0x20 0x28    0x31 0x35 0x33 0x37 0x29 0x20 0x41 0x52 0x44 0x55    0x49 0x4E 0x4F 0x3A 0x20
+        //  ESC  [    0    ;    3    2    m    I         (       1    5    3    7    )         A    R    D    U       I    N    O    :
+        int  idx = log_buffer.index_of("ARDUINO:");
+        char c = log_buffer[7]; // 0...7 is ANSI_ESC_CODE
+        if (idx > 0) {
+            idx += 9; // after "ARDUINO: "
+            log_buffer.remove_before(idx, true);
+            log_buffer.truncate_at(log_buffer.strlen() - 1); // remove '\n'
+            if (c == 'E') log_buffer.insert(ANSI_ESC_RED, 0);
+            if (c == 'W') log_buffer.insert(ANSI_ESC_YELLOW, 0);
+            if (c == 'I') log_buffer.insert(ANSI_ESC_GREEN, 0);
+            if (c == 'D') log_buffer.insert(ANSI_ESC_CYAN, 0);
+            if (c == 'V') log_buffer.insert(ANSI_ESC_GREY, 0);
+            printfln(s_tag.arduino, "{}", log_buffer.c_get());
+        } else {
+            printfln(s_tag.none, "{}", log_buffer.c_get());
+        }
+    }
+    return 0;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+// prototypes (main.cpp)
+bool         SD_MMC_exists(const char* path);
+boolean      defaultsettings();
+void         updateSettings();
+void         urldecode(char* str);
+void         fall_asleep();
+void         wake_up(int8_t state, int8_t substate);
+void         setRTC(ps_ptr<char> TZString);
+boolean      isAlarm(uint8_t weekDay, uint8_t alarmDays, uint16_t minuteOfTheDay, int16_t* alarmTime);
+boolean      copySDtoFFat(const char* path);
+void         showStationName();
+void         showStreamTitle(ps_ptr<char> streamTitle);
+void         showLogoAndStationName();
+ps_ptr<char> getStationName();
+ps_ptr<char> getLogoPath();
+void         webSrv_send_station_items();
+void         showFileLogo(int8_t state, int8_t subState);
+void         showPlayerFileName(const char* fname);
+void         show_DLNA_FileName(const char* fname);
+void         showPlsFileNumber();
+void         showAudioFileNumber();
+void         display_sleeptime(int8_t ud = 0);
+boolean      drawImage(ps_ptr<char> path, uint16_t posX, uint16_t posY, uint16_t maxWidth = 0, uint16_t maxHeigth = 0);
+boolean      isAudio(File file);
+boolean      isAudio(const char* path);
+boolean      isPlaylist(File file);
+bool         connectToWiFi();
+void         setWiFiCredentials(ps_ptr<char> ssid, ps_ptr<char> password);
+ps_ptr<char> scaleImage(ps_ptr<char> path);
+bool         detect_i2_c_devices(TwoWire* twi, int8_t sda, int8_t scl, i2c_items_s* i2c_items);
+void         set_tft_items();
+void         set_tp_items();
+bool         init_SD_card();
+void         setVolume(uint8_t vol);
+uint8_t      downvolume();
+uint8_t      upvolume();
+void         setStation(ps_ptr<char> url, ps_ptr<char> extension = {});
+void         setStation(uint16_t sta);
+const char*  getFlagPath(uint16_t station);
+void         nextStation();
+void         prevStation();
+void         setStationByNumber(uint16_t staNr);
+
+void         savefile(ps_ptr<char> fileName, uint32_t contentLength, ps_ptr<char> contenttype);
+void         setI2STone();
+ps_ptr<char> getI2STone();
+void         SD_playFile(ps_ptr<char> pathWoFileName, const char* fileName);
+void         SD_playFile(ps_ptr<char> path, uint32_t resumeFilePos = 0, bool showFN = true);
+bool         SD_rename(const char* src, const char* dest);
+bool         SD_newFolder(const char* folderPathName);
+bool         SD_delete(const char* itemPath);
+void         processPlaylist();
+void         changeState(int8_t state, int8_t subState);
+void         connecttohost(ps_ptr<char> host);
+void         connecttoFS(const char* FS, const char* filename, uint32_t fileStartTime = 0);
+void         stopSong();
+void         placingGraphicObjects();
+void         muteChanged(bool m);
+void         setTimeCounter(uint8_t sec);
+ps_ptr<char> get_WiFi_PW(const char* ssid);
+void         my_audio_info(Audio::msg_t m);
+void         on_dlna_client(const DLNA_Client::msg_s& msg);
+void         on_kcx_bt_emitter(const KCX_BT_Emitter::msg_s& msg);
+void         on_websrv(const WebSrv::msg_s& msg);
+void         tp_pressed(uint16_t x, uint16_t y);
+void         tp_long_pressed(uint16_t x, uint16_t y);
+void         tp_moved(uint16_t x, uint16_t y);
+void         tp_released(uint16_t x, uint16_t y);
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline const char* byte_to_binary(int8_t x) { // e.g. alarmdays
+    static char b[9];
+    b[0] = '\0';
+
+    int32_t z;
+    for (z = 128; z > 0; z >>= 1) { strcat(b, ((x & z) == z) ? "1" : "0"); }
+    return b;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline uint32_t simpleHash(const char* str) {
+    if (str == NULL) return 0;
+    uint32_t hash = 0;
+    for (int32_t i = 0; i < strlen(str); i++) {
+        if (str[i] < 32) continue; // ignore control sign
+        hash += (str[i] - 31) * i * 32;
+    }
+    return hash;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline int32_t str2int(const char* str) {
+    int32_t len = strlen(str);
+    if (len > 0) {
+        for (int32_t i = 0; i < len; i++) {
+            if (!isdigit(str[i])) {
+                log_e("NaN");
+                return 0;
+            }
+        }
+        return std::stoi(str);
+    }
+    return 0;
+}
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline char* int2str(int32_t val) {
+    static char ret[12];
+    itoa(val, ret, 10);
+    return ret;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline void trim(char* s) {
+    // fb   trim in place
+    char* pe;
+    char* p = s;
+    while (isspace(*p)) p++; // left
+    pe = p;                  // right
+    while (*pe != '\0') pe++;
+    do { pe--; } while ((pe > p) && isspace(*pe));
+    if (p == s) {
+        *++pe = '\0';
+    } else { // move
+        while (p <= pe) *s++ = *p++;
+        *s = '\0';
+    }
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline bool startsWith(const char* base, const char* searchString) {
+    if (base == NULL) {
+        log_e("base = NULL");
+        return false;
+    } // guard
+    if (searchString == NULL) {
+        log_e("searchString == NULL");
+        return false;
+    } // guard
+    if (strlen(searchString) > strlen(base)) return false;
+    char c;
+    while ((c = *searchString++) != '\0')
+        if (c != *base++) return false;
+    return true;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline bool endsWith(const char* base, const char* searchString) {
+    if (base == NULL) {
+        log_e("base = NULL");
+        return false;
+    } // guard
+    if (searchString == NULL) {
+        log_e("searchString == NULL");
+        return false;
+    } // guard
+    int32_t slen = strlen(searchString);
+    if (slen == 0) return false;
+    const char* p = base + strlen(base);
+    //  while(p > base && isspace(*p)) p--;  // rtrim
+    p -= slen;
+    if (p < base) return false;
+    return (strncmp(p, searchString, slen) == 0);
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline int32_t indexOf(const char* haystack, const char* needle, int32_t startIndex) {
+    const char* p = haystack;
+    for (; startIndex > 0; startIndex--)
+        if (*p++ == '\0') return -1;
+    const char* pos = strstr(p, needle);
+    if (pos == nullptr) return -1;
+    return pos - haystack;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+inline int32_t lastIndexOf(const char* haystack, const char needle) {
+    const char* p = strrchr(haystack, needle);
+    return (p ? p - haystack : -1);
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+inline int rfind(const char* str, char ch, int start = -1) { // same as indexof() burt from right to left
+    if (!str) return -1;                                     // if str is NULL
+    int len = strlen(str);
+    if (start == -1 || start >= len) start = len - 1; // Default: Search from the end of the string
+
+    for (int i = start; i >= 0; --i) {
+        if (str[i] == ch) return i; // character found
+    }
+    return -1; // character not found
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+inline int replacestr(char* line, const char* search, const char* replace, int depth = 0) { /* returns number of strings replaced.*/
+    const int MAX_RECURSION_DEPTH = 100;                                                    // Prevent stack overflow from excessive recursion
+    if (depth > MAX_RECURSION_DEPTH) {
+        log_w("replacestr: max recursion depth reached");
+        return 0;
+    }
+    int   count = 0;
+    char* sp; // start of pattern
+    // printf("replacestr(%s, %s, %s)\n", line, search, replace);
+    if ((sp = strstr(line, search)) == NULL) { return (0); }
+    count = 1;
+    int sLen = strlen(search);
+    int rLen = strlen(replace);
+    if (sLen > rLen) {
+        // move from right to left
+        char* src = sp + sLen;
+        char* dst = sp + rLen;
+        while ((*dst = *src) != '\0') {
+            dst++;
+            src++;
+        }
+    } else if (sLen < rLen) {
+        // move from left to right
+        int   tLen = strlen(sp) - sLen;
+        char* stop = sp + rLen;
+        char* src = sp + sLen + tLen;
+        char* dst = sp + rLen + tLen;
+        while (dst >= stop) {
+            *dst = *src;
+            dst--;
+            src--;
+        }
+    }
+    memcpy(sp, replace, rLen);
+    count += replacestr(sp + rLen, search, replace, depth + 1);
+    return (count);
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+inline int32_t clamp_min_max(int32_t val, int32_t min, int32_t max) {
+    if (min >= max) {
+        log_e("min >= max, min: %i, max %i", min, max);
+        return val;
+    }
+    if (val < min) val = min;
+    if (val > max) val = max;
+    return val;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline char* x_ps_malloc(uint16_t len) {
+    char* ps_str = NULL;
+    if (psramFound()) { ps_str = (char*)ps_malloc(len); }
+    if (!ps_str) { ps_str = (char*)malloc(len); }
+    if (!ps_str) { log_e("oom"); }
+    return ps_str;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline char* x_ps_calloc(uint16_t len, uint8_t size) {
+    char* ps_str = NULL;
+    if (psramFound()) { ps_str = (char*)ps_calloc(len, size); }
+    if (!ps_str) { ps_str = (char*)calloc(len, size); }
+    if (!ps_str) { log_e("oom"); }
+    return ps_str;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline char* x_ps_strdup(const char* str) {
+    if (!str) {
+        log_e("str is NULL");
+        return NULL;
+    }
+    char* ps_str = NULL;
+    if (psramFound()) { ps_str = (char*)ps_malloc(strlen(str) + 1); }
+    if (!ps_str) { ps_str = (char*)malloc(strlen(str) + 1); }
+    if (!ps_str) {
+        log_e("oom");
+        return NULL;
+    }
+    strcpy(ps_str, str);
+    return ps_str;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline char* x_ps_strndup(const char* str, uint16_t n) { // with '\0' termination
+    if (!str) {
+        log_e("str is NULL");
+        return NULL;
+    }
+    char* ps_str = NULL;
+    if (psramFound()) { ps_str = (char*)ps_malloc(n + 1); }
+    if (!ps_str) { ps_str = (char*)malloc(n + 1); }
+    if (!ps_str) {
+        log_e("oom");
+        return NULL;
+    }
+    strncpy(ps_str, str, n);
+    ps_str[n] = '\0';
+    return ps_str;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+int find_first_of(const char* source, const char* delimiters, int start = 0) {
+    for (int i = start; source[i] != '\0'; ++i) {     // search at start
+        for (int j = 0; delimiters[j] != '\0'; ++j) { // search delimiters
+            if (source[i] == delimiters[j]) {
+                return i; // position of first found delimiter
+            }
+        }
+    }
+    return -1; // not found
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline int16_t strlenUTF8(const char* str) { // returns only printable glyphs, all ASCII and UTF-8 until 0xDFBD
+    if (str == NULL) return -1;
+    uint16_t idx = 0;
+    uint16_t cnt = 0;
+    while (*(str + idx) != '\0') {
+        if ((*(str + idx) < 0xC0) && (*(str + idx) > 0x1F)) cnt++;
+        if ((*(str + idx) == 0xE2) && (*(str + idx + 1) == 0x80)) cnt++; // general punctuation
+        idx++;
+    }
+    return cnt;
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline int32_t map_l(int32_t x, int32_t in_min, int32_t in_max, int32_t out_min, int32_t out_max) {
+    // --- Clamp Input ---
+    if (x <= in_min) return out_min;
+    if (x >= in_max) return out_max;
+
+    // --- Normal map operation with 64-bit ---
+    const int64_t run = int64_t(in_max) - int64_t(in_min);
+    if (run == 0) {
+        log_e("map(): Invalid range, %li == %li (min == max)", in_min, in_max);
+        return out_min; // fallback
+    }
+
+    const int64_t rise = int64_t(out_max) - int64_t(out_min);
+    const int64_t delta = int64_t(x) - int64_t(in_min);
+
+    return int32_t((delta * rise) / run + out_min);
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+inline void setupBacklight(int pin, uint32_t freq_hz) {
+
+    ledc_channel_config_t ch = {.gpio_num = (gpio_num_t)pin, .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_1, .intr_type = LEDC_INTR_DISABLE, .timer_sel = LEDC_TIMER_3, .duty = 0, .hpoint = 0};
+
+    ledc_timer_config_t tmr = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_8_BIT,
+        .timer_num = LEDC_TIMER_3,
+        .freq_hz = freq_hz,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+
+    // Timer zuerst initialisieren
+    ledc_timer_config(&tmr);
+
+    // Dann Channel anlegen
+    ledc_channel_config(&ch);
+
+    // Optional Helligkeit setzen
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, 255);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+}
+
+inline void setTFTbrightness(uint8_t brightness, uint8_t bh1750Value) {
+    extern bool s_f_sleeping;
+    uint8_t     duty = std::min(brightness, bh1750Value);
+    if (s_f_sleeping) { duty = 0; }
+    if (BRIGHTNESS_INVERSION) { duty = 255 - duty; }
+
+    if (TFT_BL >= 0) {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1, duty);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_1);
+    }
+}
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+#ifdef TFT_MODE_SPI // ⏹⏹⏹⏹
+extern TFT_SPI tft;
+#elif defined(TFT_MODE_RGB)
+extern TFT_RGB tft;
+#elif defined(TFT_MODE_DSI)
+extern TFT_DSI tft;
+#endif
+
+inline void x_ps_free(char** b) {
+    if (*b) {
+        free(*b);
+        *b = NULL;
+    }
+}
+inline void x_ps_free(unsigned char** b) {
+    if (*b) {
+        free(*b);
+        *b = NULL;
+    }
+}
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+inline void vector_clear_and_shrink(vector<char*>& vec) {
+    uint size = vec.size();
+    for (int32_t i = 0; i < size; i++) { x_ps_free(&vec[i]); }
+    vec.clear();
+    vec.shrink_to_fit();
+}
+
+// ——————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————————
+// Macro for comfortable calls
+#define MWR_LOG_ERROR(fmt, ...)   Audio::AUDIO_LOG_IMPL(1, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define MWR_LOG_WARN(fmt, ...)    Audio::AUDIO_LOG_IMPL(2, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define MWR_LOG_INFO(fmt, ...)    Audio::AUDIO_LOG_IMPL(3, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define MWR_LOG_DEBUG(fmt, ...)   Audio::AUDIO_LOG_IMPL(4, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)
+#define MWR_LOG_VERBOSE(fmt, ...) Audio::AUDIO_LOG_IMPL(5, __FILE__, __LINE__, __func__, fmt, ##__VA_ARGS__)

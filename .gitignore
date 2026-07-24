@@ -1,0 +1,15 @@
+.pio
+.vscode
+.env
+platformio_override.ini
+build
+logs
+managed_components
+dependencies.lock
+
+.git-upstream-shallow/
+.pio-core/
+.cache/
+*.log
+pio-build*.err.log
+sdkconfig.waveshare-s3-touch-lcd-1_9-pico-audio
