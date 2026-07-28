@@ -1,0 +1,14 @@
+.pio
+.vscode
+.env
+platformio_override.ini
+build
+logs
+managed_components
+dependencies.lock
+
+lib/lvgl/
+lib/lvgl9/
+.cache/
+.dummy/
+Content_on_SD_Card.zip

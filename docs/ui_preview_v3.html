@@ -1,0 +1,383 @@
+<title>HiFi Player — 320×170 dark-neon UI (v3)</title>
+<style>
+  :root{
+    --bg:#0A0B12; --panel-a:#161A2B; --panel-b:#0E1019; --statusbar:#05060A;
+    --ink:#F2F3F7; --ink-dim:#9AA0B4; --ink-faint:#565C70;
+    --accent:#A855F7; --accent-bright:#C77DFF; --accent-deep:#6D28D9;
+    --magenta:#D946EF; --ok:#34D399;
+    --line:rgba(168,85,247,.20); --glow:rgba(168,85,247,.55);
+    --page-ink:#E9E8F0; --page-dim:#8b8fa6;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:36px clamp(14px,4vw,56px) 90px;
+    background:radial-gradient(1200px 500px at 20% -10%,#17122b 0,transparent 60%),radial-gradient(900px 500px at 100% 0,#10203a 0,transparent 55%),#07070c;
+    color:var(--page-ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1360px;margin:0 auto}
+  .eyebrow{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--accent-bright);font-weight:700}
+  h1{font-size:clamp(22px,3vw,30px);margin:8px 0 6px;letter-spacing:-.01em}
+  .lede{color:var(--page-dim);font-size:14px;max-width:72ch;line-height:1.6}
+  .bar-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0 2px}
+  button.tgl{font:inherit;font-size:12px;font-weight:600;padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--page-ink);cursor:pointer}
+  button.tgl[aria-pressed="true"]{background:var(--accent);border-color:var(--accent);color:#140f22}
+  button.tgl:focus-visible{outline:2px solid var(--accent-bright);outline-offset:2px}
+
+  .screens{display:flex;flex-direction:column;gap:38px;margin-top:30px}
+  figure{margin:0}
+  figcaption{display:flex;justify-content:space-between;align-items:baseline;margin:0 4px 12px;gap:12px}
+  figcaption b{font-size:15px;color:var(--page-ink);font-weight:650}
+  figcaption span{font-size:12px;color:var(--page-dim)}
+
+  /* device authored in real 320x170 px, shown at 4x */
+  .bezel{width:1296px;max-width:100%;padding:8px;border-radius:14px;background:linear-gradient(#141420,#0a0a0f);box-shadow:0 30px 60px -30px #000,0 0 0 1px rgba(255,255,255,.04) inset}
+  .stage{width:1280px;height:680px;max-width:100%;aspect-ratio:320/170;overflow:hidden;border-radius:6px;background:var(--bg)}
+  .px{width:320px;height:170px;transform:scale(4);transform-origin:top left;position:relative;background:var(--bg);font-size:10px;color:var(--ink)}
+  .px *{position:absolute;box-sizing:border-box}
+  .mono{font-variant-numeric:tabular-nums}
+  .row-f{display:flex;align-items:center}
+
+  /* status bar (0..320 x 0..20) — flex auto-layout so nothing overlaps */
+  .sb{left:0;top:0;width:320px;height:20px;background:var(--statusbar);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:5px;padding:0 6px}
+  .sb *{position:static}
+  .sb .hitlbl{position:absolute;left:1px;top:-6px}
+  .sb .t{font-size:10px;font-weight:700;color:var(--ink);flex:none}
+  .sb .wifi{width:12px;height:12px;flex:none}
+  .sb .grp{display:flex;align-items:center;gap:3px;flex:none}
+  .sb .dac{font-size:7px;font-weight:700;color:var(--accent-bright);border:1px solid var(--accent);border-radius:2px;padding:0 2px;line-height:9px}
+  .sb .rate{font-size:8px;color:var(--ink-dim)}
+  .sb .amp{display:flex;align-items:center;gap:2px;font-size:8px;font-weight:700;color:var(--ok);flex:none}
+  .sb .amp svg{width:11px;height:11px}
+  .sb .amp.off{color:var(--ink-faint)}
+  .sb .gain{font-size:8px;color:var(--accent-bright);flex:none}
+  .sb .sepv{width:1px;height:10px;background:var(--ink-faint);opacity:.45;flex:none}
+  .volgrp{position:relative;margin-left:auto;height:16px;border-radius:5px;display:flex;align-items:center;gap:3px;flex:none;padding:0 2px}
+  .volgrp .n{font-size:8px;color:var(--ink);font-weight:600}
+  .volgrp .bars{display:flex;align-items:flex-end;gap:1.5px;height:11px}
+  .volgrp .bars i{width:2px;background:var(--accent);border-radius:1px}
+  .volgrp svg{width:10px;height:10px}
+
+  .panel{background:linear-gradient(150deg,var(--panel-a),var(--panel-b));border:1px solid var(--line);border-radius:10px}
+
+  /* vinyl */
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .disc{border-radius:50%;background:repeating-radial-gradient(circle at 50% 50%,#0b0b10 0 1.4px,#18181f 1.4px 2.8px);box-shadow:0 0 0 1px #05050a,0 3px 8px -2px #000;animation:spin 16s linear infinite}
+  .disc::after{content:"";position:absolute;inset:0;border-radius:50%;background:conic-gradient(from 210deg,rgba(255,255,255,.12),transparent 25%,rgba(255,255,255,.05) 50%,transparent 75%,rgba(255,255,255,.12))}
+  .cover{border-radius:50%;overflow:hidden;animation:spin 16s linear infinite;
+    background:radial-gradient(circle at 50% 30%,#e6c8ff 0,#9a7be0 20%,#4a3a86 46%,#171238 72%),linear-gradient(#241a44,#0e0a22)}
+  .cover::before{content:"";position:absolute;left:0;right:0;bottom:0;height:52%;background:linear-gradient(#8f72e6,#2a1f52);opacity:.5;-webkit-mask:radial-gradient(120% 90% at 50% 120%,#000 40%,transparent 72%);mask:radial-gradient(120% 90% at 50% 120%,#000 40%,transparent 72%)}
+  .cover.logo{animation-duration:16s;background:radial-gradient(circle at 50% 45%,#241b3e,#0e0a20)}
+  .glowring{border-radius:50%;border:1px solid rgba(168,85,247,.5);box-shadow:0 0 10px -1px var(--glow)}
+  .rbar{transform-origin:0 0;border-radius:1px}
+
+  .title{color:var(--ink);font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sub{color:var(--ink-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tech{color:var(--ink-dim)}
+  .pbar{background:#2a2440;border-radius:2px;overflow:hidden}
+  .pbar i{position:absolute;left:0;top:0;height:100%;background:linear-gradient(90deg,var(--accent-deep),var(--accent),var(--magenta));border-radius:2px}
+
+  /* circular buttons */
+  .rb{border-radius:50%;background:linear-gradient(#191a24,#0e0f16);border:1px solid rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center}
+  .rb svg{position:static}
+  .rb.play{border:1.5px solid var(--accent);box-shadow:0 0 12px -1px var(--glow),0 0 4px var(--glow) inset}
+
+  /* nav card */
+  .nav{border-radius:9px;background:linear-gradient(160deg,#12131d,#0c0d15);border:1px solid rgba(255,255,255,.05);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px}
+  .nav svg{position:static;width:18px;height:18px}
+  .nav span{position:static;font-size:9px;color:var(--ink-dim)}
+  .nav.on{background:linear-gradient(160deg,#2a1b52,#1a1140);border-color:var(--accent);box-shadow:0 0 10px -2px var(--glow)}
+  .nav.on span{color:var(--ink)} .nav.on svg{filter:drop-shadow(0 0 4px var(--glow))}
+
+  /* touch-target overlay */
+  .hit{outline:1px dashed rgba(52,211,153,.7);outline-offset:-1px;border-radius:6px}
+  .stage:not(.showhit) .hit{outline:none}
+  .stage.showhit .hitlbl{display:block}
+  .hitlbl{display:none;font-size:6px;color:#34D399;left:1px;top:0}
+
+  /* settings list rows */
+  .srow{left:6px;width:302px;height:23px;border-radius:8px;background:linear-gradient(#12131f,#0b0b12);border:1px solid rgba(255,255,255,.04);display:flex;align-items:center;gap:7px;padding:0 8px}
+  .srow *{position:static}
+  .srow.on{border-color:var(--accent);box-shadow:0 0 9px -3px var(--glow)}
+  .srow .si{width:14px;height:14px;flex:none}
+  .srow .sl{font-size:11px;color:var(--ink);white-space:nowrap}
+  .srow .sv{margin-left:auto;font-size:9px;color:var(--ink-dim);white-space:nowrap}
+  .srow .chev{width:10px;height:10px;flex:none;color:var(--ink-faint);margin-left:2px}
+  .tg{width:22px;height:12px;border-radius:6px;background:#2a2440;position:relative;flex:none;margin-left:auto}
+  .tg.on{background:var(--accent);box-shadow:0 0 7px -1px var(--glow)}
+  .tg b{position:absolute;top:1.5px;left:1.5px;width:9px;height:9px;border-radius:50%;background:#fff}
+  .tg.on b{left:11.5px}
+  .sbar{right:2px;width:2px;border-radius:1px;background:var(--accent);opacity:.6}
+  .notes{max-width:1360px;margin:44px auto 0;display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:18px 28px;padding-top:24px;border-top:1px solid rgba(168,85,247,.16)}
+  .notes h3{margin:0 0 7px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--accent-bright)}
+  .notes p{margin:0;font-size:13px;line-height:1.55;color:var(--page-ink)} .notes b{color:#fff}
+</style>
+
+<div class="wrap">
+  <div class="eyebrow">Esp-HiFi · UI v3 · 320×170 · touch-first</div>
+  <h1>深色霓虹 UI — 统一坐标重排 + 触摸热区</h1>
+  <p class="lede">整屏按真实 320×170 设备像素绘制、再 4× 放大（与 LVGL 坐标一致），修掉了上一版的比例错位/元素重叠。点下面按钮可<b>叠加显示触摸热区</b>——绿色虚线是可点区域，用来核对手指够不够大、有没有挤在一起。主控制/导航都放在便于拇指触及的下方与四角。</p>
+  <div class="bar-tools">
+    <button class="tgl" id="btnHit" aria-pressed="false">显示触摸热区</button>
+    <span style="font-size:12px;color:var(--page-dim)">触摸目标目标 ≥ ~44px 等效；列表行、导航卡、播放键为主要热区</span>
+  </div>
+
+  <div class="screens" id="screens">
+
+  <!-- ================= HOME ================= -->
+  <figure>
+    <figcaption><b>首页 Home</b><span>翻页钟 · 天气 · 正在播放 · 5 导航卡</span></figcaption>
+    <div class="bezel"><div class="stage"><div class="px">
+      <div class="sb">
+        <span class="t mono">12:30</span>
+        <svg class="wifi" viewBox="0 0 24 24" fill="none" stroke="#F2F3F7" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.2" fill="#F2F3F7" stroke="none"/></svg>
+        <span class="dac">DAC</span><span class="rate mono">44.1k</span>
+        <span class="sepv"></span><span class="amp"><svg viewBox="0 0 24 24" fill="none" stroke="#34D399" stroke-width="2"><path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="3" y="12" width="4" height="6" rx="1.5"/><rect x="17" y="12" width="4" height="6" rx="1.5"/></svg>ON</span><span class="sepv"></span><span class="gain">高增益</span><div class="volgrp hit"><span class="hitlbl">音量</span><svg viewBox="0 0 24 24" fill="#9AA0B4"><path d="M3 9v6h4l5 4V5L7 9z"/></svg><span class="n">20%</span><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:9px"></i><i style="height:6px;background:#565C70"></i><i style="height:8px;background:#565C70"></i></span></div>
+      </div>
+      <!-- clock/weather panel -->
+      <div class="panel" style="left:6px;top:26px;width:150px;height:100px"></div>
+      <div style="left:16px;top:34px;width:56px;height:44px;border-radius:7px;background:linear-gradient(#20223a,#101224);border:1px solid rgba(255,255,255,.06)"><span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:800;color:#fff;letter-spacing:-2px">12</span></div>
+      <span style="left:74px;top:44px;font-size:24px;font-weight:800;color:var(--ink-faint)">:</span>
+      <div style="left:86px;top:34px;width:56px;height:44px;border-radius:7px;background:linear-gradient(#20223a,#101224);border:1px solid rgba(255,255,255,.06)"><span style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:34px;font-weight:800;color:#fff;letter-spacing:-2px">30</span></div>
+      <span style="left:18px;top:86px;font-size:10px;color:var(--ink-dim)">周二　08 Jul</span>
+      <svg viewBox="0 0 24 24" style="left:16px;top:100px;width:20px;height:20px" fill="none" stroke="#C77DFF" stroke-width="1.5"><circle cx="8" cy="8" r="3"/><path d="M8 2v2M2 8h2M3.5 3.5l1.3 1.3"/><path d="M13 19a4 4 0 0 1 0-8 4.4 4.4 0 0 1 8 1.2A3.4 3.4 0 0 1 20 19z" fill="#1a1630" stroke="#9AA0B4"/></svg>
+      <span style="left:44px;top:102px;font-size:18px;font-weight:700;color:#fff">26℃</span>
+      <!-- now playing panel -->
+      <div class="panel" style="left:162px;top:26px;width:152px;height:100px"></div>
+      <span style="left:170px;top:31px;font-size:9px;font-weight:600;color:var(--accent-bright)">♫ 正在播放</span>
+      <div class="disc" style="left:168px;top:44px;width:38px;height:38px"></div>
+      <div class="cover" style="left:176px;top:52px;width:22px;height:22px"></div>
+      <span class="title" style="left:212px;top:44px;width:100px;font-size:11px">夜空中最亮的星</span>
+      <span class="sub" style="left:212px;top:58px;width:100px;font-size:9px">逃跑计划</span>
+      <div class="pbar" style="left:212px;top:72px;width:78px;height:3px"><i style="width:47%"></i></div>
+      <span class="mono" style="left:212px;top:78px;font-size:7px;color:var(--ink-faint)">02:18</span>
+      <span class="mono" style="left:296px;top:78px;font-size:7px;color:var(--ink-faint)">04:35</span>
+      <!-- quick transport controls on Home (matches reference) -->
+      <div class="hit rb" style="left:214px;top:92px;width:24px;height:24px"><svg viewBox="0 0 24 24" width="12" height="12" fill="#F2F3F7"><path d="M7 6h2v12H7zM20 6.5v11L10 12z"/></svg></div>
+      <div class="hit rb play" style="left:248px;top:90px;width:28px;height:28px"><svg viewBox="0 0 24 24" width="12" height="12" fill="#C77DFF"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></div>
+      <div class="hit rb" style="left:286px;top:92px;width:24px;height:24px"><svg viewBox="0 0 24 24" width="12" height="12" fill="#F2F3F7"><path d="M17 6h-2v12h2zM4 6.5v11L14 12z"/></svg></div>
+      <!-- nav cards -->
+      <div class="nav on hit" style="left:6px;top:130px;width:58px;height:36px"><span class="hitlbl">播放</span><svg viewBox="0 0 24 24" fill="none" stroke="#C77DFF" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M10 8l6 4-6 4z" fill="#C77DFF" stroke="none"/></svg><span>播放</span></div>
+      <div class="nav hit" style="left:69px;top:130px;width:58px;height:36px"><svg viewBox="0 0 24 24" fill="none" stroke="#9AA0B4" stroke-width="2"><rect x="3" y="8" width="18" height="12" rx="2"/><circle cx="8" cy="14" r="2.2"/><path d="M14 4l5 4"/></svg><span>电台</span></div>
+      <div class="nav hit" style="left:132px;top:130px;width:58px;height:36px"><svg viewBox="0 0 24 24" fill="none" stroke="#9AA0B4" stroke-width="2"><path d="M4 6v12M4 8l16-4v12M20 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0M4 18a3 3 0 1 1-6 0"/></svg><span>解码</span></div>
+      <div class="nav hit" style="left:195px;top:130px;width:58px;height:36px"><svg viewBox="0 0 24 24" fill="none" stroke="#9AA0B4" stroke-width="2"><path d="M4 15a4 4 0 0 1 1-7 5 5 0 0 1 9.5-1A4 4 0 0 1 18 15z"/><circle cx="17" cy="7" r="2.5"/></svg><span>天气</span></div>
+      <div class="nav hit" style="left:258px;top:130px;width:56px;height:36px"><svg viewBox="0 0 24 24" fill="none" stroke="#9AA0B4" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M5 19l2-2M17 7l2-2"/></svg><span>设置</span></div>
+    </div></div></div>
+  </figure>
+
+  <!-- ================= NOW PLAYING ================= -->
+  <figure>
+    <figcaption><b>正在播放 Now Playing</b><span>转动黑胶 + 圆形封面 + 音量随声跳 · 音效/收藏 · 播放控制</span></figcaption>
+    <div class="bezel"><div class="stage"><div class="px">
+      <div class="sb">
+        <span class="t mono">12:30</span>
+        <svg class="wifi" viewBox="0 0 24 24" fill="none" stroke="#F2F3F7" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.2" fill="#F2F3F7" stroke="none"/></svg>
+        <span class="dac">DAC</span><span class="rate mono">PCM 44.1k</span>
+        <span class="sepv"></span><span class="amp"><svg viewBox="0 0 24 24" fill="none" stroke="#34D399" stroke-width="2"><path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="3" y="12" width="4" height="6" rx="1.5"/><rect x="17" y="12" width="4" height="6" rx="1.5"/></svg>ON</span><span class="sepv"></span><span class="gain">高增益</span><div class="volgrp hit"><span class="hitlbl">音量</span><svg viewBox="0 0 24 24" fill="#9AA0B4"><path d="M3 9v6h4l5 4V5L7 9z"/></svg><span class="n">20%</span><span class="bars"><i style="height:4px"></i><i style="height:7px"></i><i style="height:9px"></i><i style="height:6px"></i><i style="height:4px;background:#565C70"></i></span></div>
+      </div>
+      <!-- back -->
+      <div class="hit rb" style="left:6px;top:24px;width:40px;height:26px;border-radius:8px;background:none;border:1px solid transparent"><span class="hitlbl">返回</span><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#C77DFF" stroke-width="2.4"><path d="M15 5l-7 7 7 7"/></svg></div>
+      <!-- vinyl -->
+      <div id="ring" style="left:20px;top:34px;width:110px;height:110px"></div>
+      <!-- text block -->
+      <span class="title" style="left:132px;top:40px;width:182px;font-size:15px">夜空中最亮的星</span>
+      <span class="sub" style="left:132px;top:60px;width:182px;font-size:11px">逃跑计划</span>
+      <span class="tech mono" style="left:132px;top:78px;font-size:9px">MP3 320k ｜ 44.1kHz ｜ 16bit</span>
+      <div class="pbar" style="left:132px;top:96px;width:182px;height:4px"><i style="width:47%"></i></div>
+      <span class="mono" style="left:132px;top:104px;font-size:9px;color:var(--ink-dim)">02:18</span>
+      <span class="mono" style="right:8px;top:104px;font-size:9px;color:var(--ink-dim)">04:35</span>
+      <!-- control bar -->
+      <div style="left:0;top:126px;width:320px;height:1px;background:var(--line)"></div>
+      <div class="hit" style="left:6px;top:128px;width:48px;height:40px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#9AA0B4" stroke-width="2"><path d="M4 21v-5M4 12V3M12 21v-8M12 8V3M20 21v-4M20 13V3M1 16h6M9 8h6M17 12h6"/></svg><span style="position:static;font-size:8px;color:var(--ink-faint)">音效</span></div>
+      <div class="hit rb" style="left:112px;top:132px;width:30px;height:30px"><svg viewBox="0 0 24 24" width="14" height="14" fill="#F2F3F7"><path d="M7 6h2v12H7zM20 6.5v11L10 12z"/></svg></div>
+      <div class="hit rb play" style="left:150px;top:129px;width:38px;height:38px"><svg viewBox="0 0 24 24" width="15" height="15" fill="#C77DFF"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></div>
+      <div class="hit rb" style="left:196px;top:132px;width:30px;height:30px"><svg viewBox="0 0 24 24" width="14" height="14" fill="#F2F3F7"><path d="M17 6h-2v12h2zM4 6.5v11L14 12z"/></svg></div>
+      <div class="hit" style="right:6px;top:128px;width:48px;height:40px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px"><svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#C77DFF" stroke-width="2"><path d="M12 21S3 14.5 3 8.5A4.4 4.4 0 0 1 12 6a4.4 4.4 0 0 1 9 2.5C21 14.5 12 21 12 21z"/></svg><span style="position:static;font-size:8px;color:var(--ink-faint)">收藏</span></div>
+      <!-- volume overlay (appears on tap of the vol group) -->
+      <div style="right:8px;top:23px;width:170px;height:40px;border-radius:11px;background:linear-gradient(#1d1733,#120c22);border:1px solid var(--accent);box-shadow:0 0 20px -3px var(--glow)">
+        <div class="hit rb" style="left:6px;top:6px;width:28px;height:28px"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#C77DFF" stroke-width="2.6"><path d="M5 12h14"/></svg></div>
+        <svg viewBox="0 0 24 24" style="left:42px;top:8px;width:13px;height:13px" fill="#C77DFF"><path d="M3 9v6h4l5 4V5L7 9z"/></svg>
+        <span style="left:59px;top:7px;font-size:12px;font-weight:700;color:#fff">20</span>
+        <div class="pbar" style="left:42px;top:26px;width:86px;height:5px"><i style="width:66%"></i></div>
+        <div class="hit rb" style="right:6px;top:6px;width:28px;height:28px"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#C77DFF" stroke-width="2.6"><path d="M12 5v14M5 12h14"/></svg></div>
+      </div>
+    </div></div></div>
+  </figure>
+
+  <!-- ================= AUDIO / EQ ================= -->
+  <figure>
+    <figcaption><b>音频设置 / EQ</b><span>替换原"闹钟" · 输出/增益/滤波/声道 · 5 段均衡</span></figcaption>
+    <div class="bezel"><div class="stage"><div class="px">
+      <div class="sb">
+        <span class="t mono">12:30</span>
+        <svg class="wifi" viewBox="0 0 24 24" fill="none" stroke="#F2F3F7" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.2" fill="#F2F3F7" stroke="none"/></svg>
+        <span class="dac">DAC</span><span class="rate mono">44.1k/16</span>
+        <span class="sepv"></span><span class="amp"><svg viewBox="0 0 24 24" fill="none" stroke="#34D399" stroke-width="2"><path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="3" y="12" width="4" height="6" rx="1.5"/><rect x="17" y="12" width="4" height="6" rx="1.5"/></svg>ON</span><span class="sepv"></span><span class="gain">高增益</span><div class="volgrp hit"><svg viewBox="0 0 24 24" fill="#9AA0B4"><path d="M3 9v6h4l5 4V5L7 9z"/></svg><span class="n">20%</span><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:9px"></i><i style="height:6px"></i><i style="height:4px;background:#565C70"></i></span></div>
+      </div>
+      <div class="hit rb" style="left:6px;top:24px;width:38px;height:26px;border-radius:8px;background:none;border:1px solid transparent"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#C77DFF" stroke-width="2.4"><path d="M15 5l-7 7 7 7"/></svg></div>
+      <span style="left:48px;top:29px;font-size:14px;font-weight:700;color:#fff">音频设置</span>
+      <div class="panel" style="left:6px;top:52px;width:152px;height:112px"></div>
+      <div id="setL" style="left:6px;top:52px;width:152px;height:112px"></div>
+      <div class="panel" style="left:162px;top:52px;width:152px;height:112px"></div>
+      <span style="left:172px;top:58px;font-size:11px;font-weight:600;color:var(--ink)">5 段均衡器</span>
+      <span style="right:10px;top:57px;font-size:9px;color:var(--accent-bright);border:1px solid var(--accent);border-radius:4px;padding:1px 5px">EQ 直通</span>
+      <div id="eqbands" style="left:170px;top:78px;width:136px;height:56px"></div>
+      <div id="presets" style="left:170px;top:146px;width:136px;height:14px;display:flex;gap:4px"></div>
+    </div></div></div>
+  </figure>
+
+  <!-- ================= LOCAL MUSIC ================= -->
+  <figure>
+    <figcaption><b>本地音乐 Local Music</b><span>分类 tab · 列表 · 底部迷你播放器（电台列表同款式）</span></figcaption>
+    <div class="bezel"><div class="stage"><div class="px">
+      <div class="sb">
+        <span class="t mono">12:30</span>
+        <svg class="wifi" viewBox="0 0 24 24" fill="none" stroke="#F2F3F7" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.2" fill="#F2F3F7" stroke="none"/></svg>
+        <span class="dac">DAC</span><span class="rate mono">96k/24</span>
+        <span class="sepv"></span><span class="amp"><svg viewBox="0 0 24 24" fill="none" stroke="#34D399" stroke-width="2"><path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="3" y="12" width="4" height="6" rx="1.5"/><rect x="17" y="12" width="4" height="6" rx="1.5"/></svg>ON</span><span class="sepv"></span><span class="gain">高增益</span><div class="volgrp hit"><svg viewBox="0 0 24 24" fill="#9AA0B4"><path d="M3 9v6h4l5 4V5L7 9z"/></svg><span class="n">20%</span><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:9px"></i><i style="height:7px"></i><i style="height:5px"></i></span></div>
+      </div>
+      <div class="hit rb" style="left:6px;top:23px;width:36px;height:24px;border-radius:8px;background:none;border:1px solid transparent"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="#C77DFF" stroke-width="2.4"><path d="M15 5l-7 7 7 7"/></svg></div>
+      <div class="hit" style="left:48px;top:24px;width:52px;height:22px;display:flex;align-items:center;justify-content:center;border-bottom:2px solid var(--accent)"><span style="position:static;font-size:11px;font-weight:700;color:#fff;text-shadow:0 0 8px var(--glow)">歌曲</span></div>
+      <div class="hit" style="left:108px;top:24px;width:52px;height:22px;display:flex;align-items:center;justify-content:center"><span style="position:static;font-size:11px;color:var(--ink-dim)">专辑</span></div>
+      <div class="hit" style="left:168px;top:24px;width:56px;height:22px;display:flex;align-items:center;justify-content:center"><span style="position:static;font-size:11px;color:var(--ink-dim)">艺术家</span></div>
+      <div class="hit" style="left:230px;top:24px;width:56px;height:22px;display:flex;align-items:center;justify-content:center"><span style="position:static;font-size:11px;color:var(--ink-dim)">文件夹</span></div>
+      <!-- rows -->
+      <div class="hit" style="left:6px;top:50px;width:308px;height:30px;border-radius:9px;border:1px solid var(--accent);box-shadow:0 0 10px -3px var(--glow);background:linear-gradient(#1a1330,#120c22)"><div style="left:5px;top:5px;width:20px;height:20px;border-radius:5px;background:linear-gradient(135deg,#5a4a90,#1a1030)"></div><span class="title" style="left:32px;top:4px;width:230px;font-size:11px">夜空中最亮的星</span><span class="sub" style="left:32px;top:18px;width:230px;font-size:9px">逃跑计划 · FLAC · 04:35</span><svg viewBox="0 0 24 24" style="right:8px;top:8px;width:14px;height:14px" fill="var(--accent-bright)"><path d="M8 5v14l11-7z"/></svg></div>
+      <div class="hit" style="left:6px;top:84px;width:308px;height:30px;border-radius:9px;background:linear-gradient(#101019,#0b0b12)"><div style="left:5px;top:5px;width:20px;height:20px;border-radius:5px;background:linear-gradient(135deg,#2b3358,#141024)"></div><span class="title" style="left:32px;top:4px;width:250px;font-size:11px;color:var(--ink)">Hotel California</span><span class="sub" style="left:32px;top:18px;width:250px;font-size:9px">Eagles · FLAC · 06:31</span><svg viewBox="0 0 24 24" style="right:8px;top:9px;width:12px;height:12px" fill="none" stroke="#565C70" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></div>
+      <div class="hit" style="left:6px;top:118px;width:308px;height:30px;border-radius:9px;background:linear-gradient(#101019,#0b0b12)"><div style="left:5px;top:5px;width:20px;height:20px;border-radius:5px;background:linear-gradient(135deg,#3a2b58,#241024)"></div><span class="title" style="left:32px;top:4px;width:250px;font-size:11px;color:var(--ink)">渡口</span><span class="sub" style="left:32px;top:18px;width:250px;font-size:9px">蔡琴 · WAV · 03:47</span><svg viewBox="0 0 24 24" style="right:8px;top:9px;width:12px;height:12px" fill="none" stroke="#565C70" stroke-width="2"><path d="M9 6l6 6-6 6"/></svg></div>
+      <!-- mini player -->
+      <div style="left:0;top:152px;width:320px;height:18px;background:linear-gradient(#12101f,#0a0913);border-top:1px solid var(--line)"></div>
+      <div class="disc" style="left:5px;top:153px;width:16px;height:16px"></div>
+      <span class="title" style="left:26px;top:153px;width:150px;font-size:9px">夜空中最亮的星</span>
+      <span class="mono" style="left:26px;top:161px;font-size:8px;color:var(--accent-bright)">02:18 / 04:35</span>
+      <div class="hit rb play" style="right:40px;top:153px;width:16px;height:16px"><svg viewBox="0 0 24 24" width="8" height="8" fill="#C77DFF"><rect x="6" y="5" width="4" height="14"/><rect x="14" y="5" width="4" height="14"/></svg></div>
+      <div class="hit rb" style="right:6px;top:153px;width:22px;height:16px;border-radius:5px"><svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="#9AA0B4" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h13"/></svg></div>
+    </div></div></div>
+  </figure>
+
+  <!-- ================= SYSTEM SETTINGS ================= -->
+  <figure>
+    <figcaption><b>功能设置 System Settings</b><span>Wi-Fi/蓝牙/亮度/背景/语言… 可滚动列表（对应"设置"卡）</span></figcaption>
+    <div class="bezel"><div class="stage"><div class="px">
+      <div class="sb">
+        <span class="t mono">12:30</span>
+        <svg class="wifi" viewBox="0 0 24 24" fill="none" stroke="#F2F3F7" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.2" fill="#F2F3F7" stroke="none"/></svg>
+        <span class="sepv"></span>
+        <span class="grp"><span class="dac">DAC</span><span class="rate mono">PCM 44.1k</span></span>
+        <span class="sepv"></span>
+        <span class="amp"><svg viewBox="0 0 24 24" fill="none" stroke="#34D399" stroke-width="2"><path d="M4 13v-1a8 8 0 0 1 16 0v1"/><rect x="3" y="12" width="4" height="6" rx="1.5"/><rect x="17" y="12" width="4" height="6" rx="1.5"/></svg>ON</span>
+        <span class="sepv"></span>
+        <span class="gain">高增益</span>
+        <div class="volgrp hit"><svg viewBox="0 0 24 24" fill="#9AA0B4"><path d="M3 9v6h4l5 4V5L7 9z"/></svg><span class="n">20%</span><span class="bars"><i style="height:4px"></i><i style="height:6px"></i><i style="height:9px"></i><i style="height:6px"></i><i style="height:8px"></i></span></div>
+      </div>
+      <div class="hit rb" style="left:6px;top:24px;width:36px;height:24px;border-radius:8px;background:none;border:1px solid transparent"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="#C77DFF" stroke-width="2.4"><path d="M15 5l-7 7 7 7"/></svg></div>
+      <span style="left:48px;top:28px;font-size:14px;font-weight:700;color:#fff">功能设置</span>
+      <div class="srow hit" style="top:47px"><svg class="si" viewBox="0 0 24 24" fill="none" stroke="#C77DFF" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.2" fill="#C77DFF" stroke="none"/></svg><span class="sl">Wi-Fi 网络</span><span class="sv">HiFi_5G</span><span class="tg on"><b></b></span></div>
+      <div class="srow hit" style="top:73px"><svg class="si" viewBox="0 0 24 24" fill="none" stroke="#C77DFF" stroke-width="2"><path d="M7 7l10 10-5 4V3l5 4L7 17"/></svg><span class="sl">蓝牙</span><span class="sv">HiFi Player</span><span class="tg on"><b></b></span></div>
+      <div class="srow hit" style="top:99px"><svg class="si" viewBox="0 0 24 24" fill="none" stroke="#C77DFF" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.4 1.4M17.6 17.6L19 19M5 19l1.4-1.4M17.6 6.4L19 5"/></svg><span class="sl">屏幕亮度</span><span style="margin-left:auto;width:66px;height:4px;background:#2a2440;border-radius:2px;position:relative"><span style="position:absolute;left:0;top:0;width:70%;height:100%;background:linear-gradient(90deg,var(--accent-deep),var(--accent));border-radius:2px"></span><span style="position:absolute;left:64%;top:-2.5px;width:9px;height:9px;border-radius:50%;background:#fff;box-shadow:0 0 5px var(--glow)"></span></span><span class="sv" style="margin-left:6px">70%</span></div>
+      <div class="srow hit" style="top:125px"><svg class="si" viewBox="0 0 24 24" fill="none" stroke="#C77DFF" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="8.5" cy="9.5" r="1.4"/><path d="M4 18l5-5 4 4 3-3 4 4"/></svg><span class="sl">背景图</span><span class="sv">星空紫</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg></div>
+      <div class="srow hit" style="top:151px"><svg class="si" viewBox="0 0 24 24" fill="none" stroke="#C77DFF" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="8" cy="10" r="1.2" fill="#C77DFF" stroke="none"/><circle cx="12" cy="7.6" r="1.2" fill="#C77DFF" stroke="none"/><circle cx="16" cy="10" r="1.2" fill="#C77DFF" stroke="none"/></svg><span class="sl">主题色</span><span class="sv">紫色霓虹</span><svg class="chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M9 6l6 6-6 6"/></svg></div>
+      <div class="sbar" style="top:48px;height:38px"></div>
+    </div></div></div>
+  </figure>
+
+  </div>
+
+  <div class="notes">
+    <div><h3>布局纪律</h3><p>整屏用<b>统一设备像素</b>绘制、4× 展示，修掉上一版的比例错位/重叠。文字单行裁切、图标与文字留间距、面板只嵌一层。</p></div>
+    <div><h3>触摸易用性</h3><p>主控放<b>下方与四角</b>（拇指易达）；导航卡 58×36、列表行整行、播放键最大且独立；返回键在左上角。开热区叠层可核对。</p></div>
+    <div><h3>黑胶 = 环 + 动态封面</h3><p>外圈黑胶纹理+光晕烘焙成图；中心<b>圆形封面</b>（本地内嵌封面 / 电台联网 logo），盘面缓转，频谱随真实音量跳。</p></div>
+    <div><h3>待落地</h3><p>中文字库裁剪、黑胶环资源、封面/logo 解码缩圆、逐屏 LVGL、页面滑入/频谱/翻页钟动画。</p></div>
+  </div>
+</div>
+
+<script>
+  // touch-target overlay toggle
+  const btn=document.getElementById('btnHit');
+  btn.addEventListener('click',()=>{
+    const on=btn.getAttribute('aria-pressed')!=='true';
+    btn.setAttribute('aria-pressed',on);
+    document.querySelectorAll('.stage').forEach(s=>s.classList.toggle('showhit',on));
+  });
+
+  // Now Playing spectrum ring + rotating disc + circular cover
+  (function(){
+    const host=document.getElementById('ring'); if(!host) return;
+    const S=110, cx=S/2, ringR=48, discD=84, coverD=50;
+    const disc=document.createElement('div'); disc.className='disc';
+    disc.style.cssText=`left:${(S-discD)/2}px;top:${(S-discD)/2}px;width:${discD}px;height:${discD}px`;
+    const cov=document.createElement('div'); cov.className='cover';
+    cov.style.cssText=`left:${(S-coverD)/2}px;top:${(S-coverD)/2}px;width:${coverD}px;height:${coverD}px`;
+    const hole=document.createElement('div');
+    hole.style.cssText=`left:${cx-3}px;top:${cx-3}px;width:6px;height:6px;border-radius:50%;background:#0a0a12;box-shadow:0 0 0 1.5px #2a2340;z-index:3`;
+    const glow=document.createElement('div'); glow.className='glowring';
+    glow.style.cssText=`left:2px;top:2px;width:${S-4}px;height:${S-4}px`;
+    host.appendChild(glow); host.appendChild(disc); host.appendChild(cov); host.appendChild(hole);
+    const N=44, bars=[];
+    for(let i=0;i<N;i++){
+      const a=(i/N)*Math.PI*2, b=document.createElement('div'); b.className='rbar';
+      const hue=205+(i/N)*100;
+      b.style.cssText=`left:${cx}px;top:${cx}px;width:1.6px;background:hsl(${hue},85%,63%);box-shadow:0 0 3px hsl(${hue},90%,60%)`;
+      b.dataset.a=a; host.appendChild(b); bars.push(b);
+    }
+    let t=0;
+    (function loop(){ t+=0.08;
+      bars.forEach((b,i)=>{ const a=+b.dataset.a; const len=3+Math.abs(Math.sin(t+i*0.5))*6.5;
+        b.style.height=len+'px'; b.style.transform=`rotate(${a}rad) translateY(-${ringR}px)`; });
+      requestAnimationFrame(loop);
+    })();
+  })();
+
+  // Audio settings left column
+  (function(){
+    const host=document.getElementById('setL'); if(!host) return;
+    const rows=[['输出模式',['耳放','线路'],0],['增益',['低','高增益'],1],['数字滤波',['慢速','快速'],0]];
+    let y=10;
+    rows.forEach(([label,opts,sel])=>{
+      const l=document.createElement('span'); l.textContent=label;
+      l.style.cssText=`left:10px;top:${y+4}px;font-size:11px;color:var(--ink)`; host.appendChild(l);
+      let x=142; for(let k=opts.length-1;k>=0;k--){ // right aligned
+        const w=opts[k].length>1?30:22; x-=w+(k<opts.length-1?0:0);
+      }
+      // simpler: place two segs from right
+      let rx=144;
+      for(let k=opts.length-1;k>=0;k--){
+        const seg=document.createElement('span'); seg.textContent=opts[k];
+        const w=opts[k].length>=2?30:22; rx-=w+4;
+        const on=(k===sel);
+        seg.style.cssText=`left:${rx}px;top:${y}px;width:${w}px;height:18px;display:flex;align-items:center;justify-content:center;font-size:10px;border-radius:6px;`+
+          (on?`color:#fff;border:1px solid var(--accent);background:rgba(168,85,247,.16);box-shadow:0 0 8px -2px var(--glow)`:`color:var(--ink-dim);border:1px solid rgba(255,255,255,.1)`);
+        seg.classList.add('hit'); host.appendChild(seg);
+      }
+      y+=28;
+    });
+    // channel balance
+    const lab=document.createElement('span'); lab.textContent='声道';
+    lab.style.cssText=`left:10px;top:${y+3}px;font-size:11px;color:var(--ink)`; host.appendChild(lab);
+    const L=document.createElement('span'); L.textContent='L'; L.style.cssText=`left:44px;top:${y+3}px;font-size:9px;color:var(--ink-faint)`; host.appendChild(L);
+    const track=document.createElement('div'); track.className='hit'; track.style.cssText=`left:56px;top:${y+6}px;width:76px;height:4px;background:#2a2440;border-radius:2px`; host.appendChild(track);
+    const dot=document.createElement('div'); dot.style.cssText=`left:90px;top:${y+2}px;width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 6px var(--glow)`; host.appendChild(dot);
+    const R=document.createElement('span'); R.textContent='R'; R.style.cssText=`left:136px;top:${y+3}px;font-size:9px;color:var(--ink-faint)`; host.appendChild(R);
+  })();
+
+  // EQ bands + presets
+  (function(){
+    const host=document.getElementById('eqbands'); if(host){
+      const labels=['60','250','1K','4K','12K'], vals=[.55,.62,.5,.44,.6], W=136, n=5, step=W/n;
+      labels.forEach((l,i)=>{
+        const cx=i*step+step/2;
+        const lab=document.createElement('span'); lab.textContent=l; lab.style.cssText=`left:${cx-10}px;top:0;width:20px;text-align:center;font-size:9px;color:var(--ink-dim)`;
+        const track=document.createElement('div'); track.style.cssText=`left:${cx-1}px;top:12px;width:2px;height:36px;background:#2a2440;border-radius:1px`;
+        const h=vals[i]*32;
+        const fill=document.createElement('div'); fill.style.cssText=`left:${cx-1}px;top:${12+ (36-h)}px;width:2px;height:${h}px;background:linear-gradient(var(--magenta),var(--accent));border-radius:1px`;
+        const dot=document.createElement('div'); dot.className='hit'; dot.style.cssText=`left:${cx-5}px;top:${12+(36-h)-4}px;width:10px;height:10px;border-radius:50%;background:#0e0f16;border:2px solid var(--accent);box-shadow:0 0 6px var(--glow)`;
+        [lab,track,fill,dot].forEach(e=>host.appendChild(e));
+      });
+    }
+    const ph=document.getElementById('presets'); if(ph){
+      ['关闭','流行','摇滚','爵士'].forEach((p,i)=>{
+        const s=document.createElement('span'); s.textContent=p; s.className='hit';
+        s.style.cssText=`position:relative;flex:1;text-align:center;font-size:9px;border-radius:6px;padding:2px 0;`+
+          (i===0?`color:#fff;border:1px solid var(--accent);background:rgba(168,85,247,.16)`:`color:var(--ink-dim);border:1px solid rgba(255,255,255,.1)`);
+        ph.appendChild(s);
+      });
+    }
+  })();
+</script>
