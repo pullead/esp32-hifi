@@ -1,0 +1,261 @@
+<title>HiFi Player — 320×170 UI Spec</title>
+<style>
+:root{
+  --page-bg:#f5f3ef;
+  --page-ink:#1b1c1e;
+  --page-dim:#6b6d72;
+  --page-line:#dedad2;
+  --page-accent:#a8632f;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --page-bg:#121214; --page-ink:#e9e8e6; --page-dim:#8d8f94; --page-line:#2a2b2e; --page-accent:#d99a5c; }
+}
+:root[data-theme="dark"]{ --page-bg:#121214; --page-ink:#e9e8e6; --page-dim:#8d8f94; --page-line:#2a2b2e; --page-accent:#d99a5c; }
+:root[data-theme="light"]{ --page-bg:#f5f3ef; --page-ink:#1b1c1e; --page-dim:#6b6d72; --page-line:#dedad2; --page-accent:#a8632f; }
+
+*{box-sizing:border-box;}
+body{
+  margin:0; padding:40px clamp(16px,4vw,56px) 80px;
+  background:var(--page-bg); color:var(--page-ink);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+}
+.masthead{ max-width:1280px; margin:0 auto 28px; }
+.eyebrow{ font-size:11px; letter-spacing:.12em; text-transform:uppercase; color:var(--page-accent); font-weight:700; }
+h1{ font-size:clamp(22px,3vw,30px); margin:6px 0 8px; text-wrap:balance; letter-spacing:-.01em; }
+.sub{ color:var(--page-dim); font-size:14px; max-width:64ch; line-height:1.55; }
+
+.toolbar{
+  max-width:1280px; margin:22px auto 30px; display:flex; gap:10px; align-items:center;
+  flex-wrap:wrap;
+}
+button.toggle{
+  font:inherit; font-size:12px; font-weight:600; letter-spacing:.02em;
+  padding:8px 14px; border-radius:3px; border:1px solid var(--page-line);
+  background:transparent; color:var(--page-ink); cursor:pointer;
+}
+button.toggle[aria-pressed="true"]{ background:var(--page-accent); border-color:var(--page-accent); color:#141414; }
+button.toggle:focus-visible{ outline:2px solid var(--page-accent); outline-offset:2px; }
+
+.stage{
+  max-width:1280px; margin:0 auto; display:flex; gap:clamp(20px,4vw,48px);
+  flex-wrap:wrap; align-items:flex-start;
+}
+figure{ margin:0; flex:0 0 auto; }
+figcaption{ font-size:12px; color:var(--page-dim); margin-top:12px; display:flex; justify-content:space-between; }
+figcaption b{ color:var(--page-ink); font-weight:600; }
+
+/* ---- device screen, 4x scale of the real 320x170 canvas ---- */
+.bezel{
+  width:1296px; max-width:calc(100vw - 32px); padding:8px;
+  background:#0b0b0c; border-radius:10px;
+  box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 20px 40px -24px rgba(0,0,0,.5);
+}
+.screen{
+  position:relative; width:1280px; max-width:100%; aspect-ratio:320/170;
+  background:#14161A; overflow:hidden; font-family:-apple-system,Helvetica,Arial,sans-serif;
+  --u: calc(100% / 320); /* 1 device px, horizontal */
+  --uv: calc(100% / 170); /* 1 device px, vertical */
+}
+.mono{ font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-variant-numeric:tabular-nums; }
+
+.statusbar{
+  position:absolute; left:0; top:0; width:100%; height:calc(var(--uv) * 20);
+  background:#1B1E24; display:flex; align-items:center; justify-content:space-between;
+  padding:0 calc(var(--u) * 8); border-bottom:1px solid rgba(86,91,102,.35);
+}
+.sb-group{ display:flex; align-items:center; gap:6px; color:#868C99; font-size:13px; }
+.sb-tag{ color:#ECEDEF; font-size:12.5px; letter-spacing:.02em; }
+.sb-live .sb-tag{ color:#4FC7CF; }
+.sb-mute .sb-tag{ color:#C24949; }
+.vu-bars{ display:flex; align-items:flex-end; gap:2px; height:12px; }
+.vu-bars i{ width:4px; background:#565B66; display:block; border-radius:1px; }
+.vu-bars i.on{ background:#868C99; }
+.wifi svg{ width:16px; height:16px; }
+
+.content{
+  position:absolute; left:0; top:calc(var(--uv) * 20); width:100%; height:calc(var(--uv) * 104);
+}
+.cover{
+  position:absolute; left:calc(var(--u) * 10); top:calc(var(--uv) * 10);
+  width:calc(var(--u) * 84); height:calc(var(--u) * 84);
+  border:1px solid rgba(86,91,102,.6); overflow:hidden; background:#1B1E24;
+}
+.cover img, .cover .art{ width:100%; height:100%; object-fit:cover; display:block; }
+.logo-mark{
+  width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+  color:#CE9159; font-size:15px; font-weight:700; letter-spacing:.04em; text-align:center;
+  background:radial-gradient(circle at 30% 20%, #23262e, #14161A 70%);
+}
+.text-col{
+  position:absolute; left:calc(var(--u) * 104); top:calc(var(--uv) * 4); width:calc(var(--u) * 206);
+}
+.title{ color:#ECEDEF; font-size:17px; font-weight:600; letter-spacing:-.2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.subtitle{ color:#868C99; font-size:12.5px; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.techline{ color:#565B66; font-size:11px; margin-top:5px; letter-spacing:.02em; }
+.progress-row{ position:absolute; left:calc(var(--u) * 104); top:calc(var(--uv) * 66); width:calc(var(--u) * 206); }
+.bar-track{ height:4px; background:#565B66; position:relative; }
+.bar-fill{ position:absolute; left:0; top:0; height:100%; background:#CE9159; }
+.bar-fill.live{ background:#4FC7CF; }
+.time-row{ display:flex; justify-content:space-between; margin-top:6px; font-size:11px; color:#8A8F9C; }
+.time-row .live-tag{ color:#4FC7CF; font-weight:700; letter-spacing:.06em; }
+
+.controlbar{
+  position:absolute; left:0; top:calc(var(--uv) * 124); width:100%; height:calc(var(--uv) * 46);
+  display:flex; border-top:1px solid rgba(86,91,102,.35);
+}
+.slot{ flex:1 1 0; display:flex; align-items:center; justify-content:center; position:relative; color:#868C99; }
+.slot svg{ width:20px; height:20px; }
+.slot.primary{ color:#ECEDEF; }
+.slot.primary .ring{
+  width:40px; height:40px; border-radius:50%; border:1.5px solid #CE9159;
+  display:flex; align-items:center; justify-content:center;
+}
+.slot.primary svg{ width:16px; height:16px; fill:#CE9159; }
+.slot .fav-on{ color:#CE9159; }
+
+/* hit-target guide overlay */
+.hitguide .slot::after{
+  content:""; position:absolute; inset:1px; border:1px dashed rgba(79,199,212,.55); pointer-events:none;
+}
+.hitguide .vu-bars::after,
+.hitguide .cover::after{ content:none; }
+.gridguide .screen::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background-image:
+    repeating-linear-gradient(to right, rgba(79,199,212,.35) 0 1px, transparent 1px calc(var(--u) * 10)),
+    repeating-linear-gradient(to bottom, rgba(79,199,212,.35) 0 1px, transparent 1px calc(var(--uv) * 10));
+}
+
+.legend{
+  max-width:1280px; margin:44px auto 0; display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr));
+  gap:18px 28px; padding-top:24px; border-top:1px solid var(--page-line);
+}
+.legend h3{ font-size:11px; text-transform:uppercase; letter-spacing:.1em; color:var(--page-dim); margin:0 0 8px; font-weight:700; }
+.legend p{ margin:0; font-size:13px; line-height:1.5; color:var(--page-ink); }
+.swatches{ display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+.sw{ display:flex; align-items:center; gap:6px; font-size:11px; color:var(--page-dim); }
+.sw i{ width:14px; height:14px; border-radius:2px; display:block; }
+</style>
+
+<div class="masthead">
+  <div class="eyebrow">HiFi Player · Design Spec v1</div>
+  <h1>320×170 Now Playing / Radio — pixel reference</h1>
+  <p class="sub">Rendered at 4× scale, exact pixel ratios from <code>docs/UI_DESIGN_SPEC.md</code>. Every measurement here is what <code>hifi_ui.cpp</code> should implement — this is a spec, not a mood board. Toggle the grid/hit-target overlays below to check alignment.</p>
+</div>
+
+<div class="toolbar">
+  <button class="toggle" id="toggleGrid" aria-pressed="false">显示 10px 网格</button>
+  <button class="toggle" id="toggleHit" aria-pressed="false">显示控制栏热区</button>
+</div>
+
+<div class="stage" id="stage">
+  <figure>
+    <div class="bezel"><div class="screen" id="screenMusic">
+      <div class="statusbar">
+        <div class="sb-group wifi">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#ECEDEF" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.3" fill="#ECEDEF" stroke="none"/></svg>
+        </div>
+        <div class="sb-group"><span class="sb-tag mono">I2S 44.1k/16 · AMP ON</span></div>
+        <div class="vu-bars">
+          <i class="on" style="height:5px"></i><i class="on" style="height:7px"></i><i class="on" style="height:9px"></i><i class="on" style="height:11px"></i><i style="height:12px"></i>
+        </div>
+      </div>
+      <div class="content">
+        <div class="cover"><div class="art" style="background:linear-gradient(160deg,#2a3040,#12151c 55%,#1a1f2b); display:flex; align-items:flex-end; justify-content:center;">
+          <svg width="70%" height="70%" viewBox="0 0 100 100"><circle cx="50" cy="50" r="46" fill="#0e1016" stroke="#333846" stroke-width="1.5"/><circle cx="50" cy="50" r="46" fill="none" stroke="#CE9159" stroke-width="1" stroke-dasharray="2 6" opacity=".6"/><circle cx="50" cy="50" r="7" fill="#1c2028" stroke="#565B66" stroke-width="1.5"/></svg>
+        </div></div>
+        <div class="text-col">
+          <div class="title">夜空中最亮的星</div>
+          <div class="subtitle">逃跑计划 · Time</div>
+          <div class="techline mono">MP3 320k · 44.1kHz · 16bit</div>
+          <div class="progress-row" style="margin-top:6px">
+            <div class="bar-track"><div class="bar-fill" style="width:47%"></div></div>
+            <div class="time-row mono"><span>02:18</span><span>04:35</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="controlbar">
+        <div class="slot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 21v-4M4 13V3M12 21v-8M12 9V3M20 21v-6M20 11V3M2 17h4M10 13h4M18 15h4"/></svg></div>
+        <div class="slot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM19 6.5v11L9 12z"/></svg></div>
+        <div class="slot primary"><div class="ring"><svg viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></div></div>
+        <div class="slot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 6h-2v12h2zM5 6.5v11L15 12z"/></svg></div>
+        <div class="slot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h7"/></svg></div>
+      </div>
+    </div></div>
+    <figcaption><b>Now Playing</b><span>SdCard / OnlineMusic</span></figcaption>
+  </figure>
+
+  <figure>
+    <div class="bezel"><div class="screen" id="screenRadio">
+      <div class="statusbar">
+        <div class="sb-group wifi">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#ECEDEF" stroke-width="2"><path d="M2 8.5c5.5-5 14.5-5 20 0M5.5 12c3.6-3.2 9.4-3.2 13 0M9 15.5c1.8-1.5 4.2-1.5 6 0"/><circle cx="12" cy="19" r="1.3" fill="#ECEDEF" stroke="none"/></svg>
+        </div>
+        <div class="sb-group sb-live"><span class="sb-tag mono">BUFFERING 78%</span></div>
+        <div class="vu-bars">
+          <i class="on" style="height:5px"></i><i class="on" style="height:7px"></i><i class="on" style="height:9px"></i><i style="height:11px"></i><i style="height:12px"></i>
+        </div>
+      </div>
+      <div class="content">
+        <div class="cover"><div class="logo-mark">TOKYO<br>JAZZ</div></div>
+        <div class="text-col">
+          <div class="title">Late Night Session</div>
+          <div class="subtitle">Tokyo Jazz Radio</div>
+          <div class="techline mono">AAC 128k · Japan · Jazz</div>
+          <div class="progress-row" style="margin-top:6px">
+            <div class="bar-track"><div class="bar-fill live" style="width:78%"></div></div>
+            <div class="time-row mono"><span>00:42:18</span><span class="live-tag">● LIVE</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="controlbar">
+        <div class="slot fav-on"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 21s-7.5-4.7-10-9.3C.4 8.4 2.2 5 5.6 5 8 5 9.7 6.3 12 8.8 14.3 6.3 16 5 18.4 5c3.4 0 5.2 3.4 3.6 6.7C19.5 16.3 12 21 12 21z"/></svg></div>
+        <div class="slot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM19 6.5v11L9 12z"/></svg></div>
+        <div class="slot primary"><div class="ring"><svg viewBox="0 0 24 24"><rect x="7" y="6" width="10" height="12" rx="1"/></svg></div></div>
+        <div class="slot"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18 6h-2v12h2zM5 6.5v11L15 12z"/></svg></div>
+        <div class="slot"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg></div>
+      </div>
+    </div></div>
+    <figcaption><b>Radio</b><span>SourceType::Radio</span></figcaption>
+  </figure>
+</div>
+
+<div class="legend">
+  <div>
+    <h3>Color</h3>
+    <p>Graphite ground, copper accent (not the old purple/blue glow), teal reserved only for live/streaming semantics.</p>
+    <div class="swatches">
+      <div class="sw"><i style="background:#14161A"></i>bg</div>
+      <div class="sw"><i style="background:#1B1E24"></i>panel</div>
+      <div class="sw"><i style="background:#CE9159"></i>accent</div>
+      <div class="sw"><i style="background:#4FC7CF"></i>live</div>
+      <div class="sw"><i style="background:#C24949"></i>mute</div>
+    </div>
+  </div>
+  <div>
+    <h3>Status bar</h3>
+    <p>3 groups only: Wi-Fi icon, one confirmable audio-state tag (I2S/AMP/BUFFERING/MUTE), volume bars. No clock, no SSID, no separate DAC chip — down from 6 chips in the previous UI.</p>
+  </div>
+  <div>
+    <h3>Control bar</h3>
+    <p>5 equal 64×46 columns, same slots in both modes (EQ↔Favorite, list↔station list) — one shared grid for Music and Radio, per handoff §7/8.</p>
+  </div>
+  <div>
+    <h3>Not shown here</h3>
+    <p>Sd / Clock / Settings screens (still placeholders in code), volume popup, EQ page, station list page — out of scope for this pass.</p>
+  </div>
+</div>
+
+<script>
+const stage = document.getElementById('stage');
+const gridBtn = document.getElementById('toggleGrid');
+const hitBtn = document.getElementById('toggleHit');
+gridBtn.addEventListener('click', () => {
+  const on = stage.classList.toggle('gridguide');
+  gridBtn.setAttribute('aria-pressed', on);
+});
+hitBtn.addEventListener('click', () => {
+  const on = stage.classList.toggle('hitguide');
+  hitBtn.setAttribute('aria-pressed', on);
+});
+</script>
