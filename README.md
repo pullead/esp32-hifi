@@ -37,6 +37,61 @@ this section covers what's specific to this fork.
   `docs/DEV_LOG_2026-07-28.md` for the full root-cause writeup of why
   WiFi/audio/LVGL couldn't all initialize together before this.
 
+#### Build workflow for this fork
+
+Use the checked-in wrapper scripts instead of running PlatformIO directly
+from a path with spaces. PlatformIO/ESP-IDF has failed on Windows when the
+project path contains whitespace, so the Windows script automatically builds
+through a no-space junction path.
+
+Windows:
+
+```powershell
+.\scripts\build_windows.ps1
+```
+
+The default target is `esp32s3_OTA`, and the default no-space build path is
+`C:\mwr-src`. If that path is already in use:
+
+```powershell
+.\scripts\build_windows.ps1 -BuildPath C:\mwr-src-work
+```
+
+There is also an explicit `subst` fallback:
+
+```powershell
+.\scripts\build_windows.ps1 -UseSubst -BuildDrive Q:
+```
+
+To verify the resolved build path and PlatformIO executable without starting
+a compile:
+
+```powershell
+.\scripts\build_windows.ps1 -CheckOnly
+```
+
+macOS/Linux:
+
+```bash
+./scripts/build_mac.sh
+```
+
+If the macOS/Linux path contains spaces, the script builds through
+`/tmp/mwr-src` by default. Override that with `MWR_BUILD_LINK=/tmp/other-path`
+if needed.
+
+Both scripts default to `-j 1`. This is slower, but avoids the Windows
+parallel-compile hang observed during the ESP-IDF full rebuild on this
+machine. To override it:
+
+```powershell
+.\scripts\build_windows.ps1 -Jobs 4
+```
+
+```bash
+JOBS=4 ./scripts/build_mac.sh
+```
+
 #### Dev logs (chronological, most recent last)
 
 - `docs/DEV_LOG_2026-07-28.md` — WiFi/audio/LVGL memory root cause, radio

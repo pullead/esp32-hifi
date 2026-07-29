@@ -19,4 +19,7 @@ Content_on_SD_Card.zip
 .pio-core/
 pio-build*.log
 pio-upload*.log
+pio-*.log
+*.err.log
+*.map
 sdkconfig.waveshare-s3-touch-lcd-1_9-pico-audio
