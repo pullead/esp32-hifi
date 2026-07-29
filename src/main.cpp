@@ -10,6 +10,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <algorithm>
+#include <cstring>
 #include <freertos/queue.h>
 #include <esp_heap_caps.h>
 #include <esp_wifi.h>
@@ -801,6 +802,29 @@ const char* wifiPrefKey(uint8_t i) {
     return keys[i < kWifiSlotCount ? i : kWifiSlotCount - 1];
 }
 
+// _SSID/_PW get seeded into slot 0 by connectToWiFi() whenever it's empty.
+// Only the literal, unconfigured PlatformIO defaults ("SSID"/"PASSWORD") are
+// placeholders. If platformio_override.ini supplies real build-time
+// credentials, slot 0 is a real saved network and must be shown in the WiFi
+// list; otherwise the device can connect successfully while Settings > WiFi
+// still appears empty.
+bool playerCoreWifiIsPlaceholder(const char* line) {
+    if (!line) return false;
+    if (strcmp(_SSID, "SSID") != 0 || strcmp(_PW, "PASSWORD") != 0) return false;
+    ps_ptr<char> placeholder(64);
+    placeholder = _SSID;
+    placeholder += "\t";
+    placeholder += _PW;
+    return strcmp(line, placeholder.c_get()) == 0;
+}
+
+bool playerCoreWifiLineIsSavedNetwork(const char* line) {
+    if (!line || line[0] == '\0') return false;
+    if (playerCoreWifiIsPlaceholder(line)) return false;
+    const char* tab = strchr(line, '\t');
+    return tab && tab != line;
+}
+
 bool connectToWiFi() {
 
     MWR_LOG_DEBUG("Connecting to WiFi...");
@@ -837,9 +861,8 @@ bool connectToWiFi() {
     for (int i = 0; i < kWifiSlotCount; i++) {
         line.clear();
         line = pref.getString(wifiPrefKey(i)).c_str();
-        if (line.strlen() == 0) continue;  // line is empty
+        if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) continue;
         int pos = line.index_of("\t", 0); // find first tab
-        if (pos < 0) continue;            // no tab found
         line[pos] = '\0';                 // terminate ssid
         char* ssid = line.get();          // ssid is the first part
         char* pw = line.get() + pos + 1;  // password is the second part
@@ -921,7 +944,7 @@ void setWiFiCredentials(ps_ptr<char> ssid, ps_ptr<char> password) {
                 goto exit;
             }
             if (password.strlen() == 0) {
-                credentials = "\t"; // delete ssid and password
+                credentials = ""; // delete ssid and password
             } else {                // update password
                 credentials = ssid;
                 credentials += "\t";
@@ -935,7 +958,7 @@ void setWiFiCredentials(ps_ptr<char> ssid, ps_ptr<char> password) {
     for (i = 1; i < kWifiSlotCount; i++) {
         line.clear();
         line = pref.getString(wifiPrefKey(i)).c_str();
-        if (line.strlen() == 0) { // line is empty
+        if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) { // empty or stale-invalid slot
             credentials = ssid;
             credentials += "\t";
             credentials += password;
@@ -2460,28 +2483,11 @@ static void onWifiNetworkReady() {
 // only /wifi_manage page below, which does its own on-demand
 // WiFi.scanNetworks() when loaded rather than something running at boot.
 
-// _SSID/_PW ("SSID"/"PASSWORD" unless overridden in platformio_override.ini)
-// get seeded into slot 0 by connectToWiFi() whenever it's empty -- on a
-// device with no real network configured yet (e.g. right after an NVS
-// wipe), that leaves exactly one "saved" entry that can never actually
-// connect. Counting it as real here would make loopLvglRuntime()'s retry
-// guard keep calling wifiMulti.run() every second forever, and each call
-// does a full blocking WiFi.scanNetworks() when nothing matches -- long
-// enough to starve LVGL's touch polling and spectrum redraw on the same
-// loop. So it's excluded from the count on purpose.
-bool playerCoreWifiIsPlaceholder(const char* line) {
-    ps_ptr<char> placeholder(64);
-    placeholder = _SSID;
-    placeholder += "\t";
-    placeholder += _PW;
-    return strcmp(line, placeholder.c_get()) == 0;
-}
-
 uint8_t playerCoreWifiSavedCount() {
     uint8_t count = 0;
     for (uint8_t i = 0; i < kWifiSlotCount; ++i) {
         ps_ptr<char> line = pref.getString(wifiPrefKey(i)).c_str();
-        if (line.strlen() > 0 && !playerCoreWifiIsPlaceholder(line.c_get())) ++count;
+        if (playerCoreWifiLineIsSavedNetwork(line.c_get())) ++count;
     }
     return count;
 }
@@ -2490,7 +2496,7 @@ bool playerCoreWifiSavedInfo(uint8_t index, char* outSsid, size_t ssidSize, bool
     uint8_t seen = 0;
     for (uint8_t i = 0; i < kWifiSlotCount; ++i) {
         ps_ptr<char> line = pref.getString(wifiPrefKey(i)).c_str();
-        if (line.strlen() == 0) continue;
+        if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) continue;
         if (seen == index) {
             const int pos = line.index_of("\t", 0);
             if (pos > 0) line[pos] = '\0';
@@ -5353,9 +5359,8 @@ static void serveWifiSavedJson() {
     bool first = true;
     for (uint8_t i = 0; i < kWifiSlotCount; ++i) {
         ps_ptr<char> line = pref.getString(wifiPrefKey(i)).c_str();
-        if (line.strlen() == 0) continue; // empty slot
+        if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) continue;
         const int pos = line.index_of("\t", 0);
-        if (pos <= 0) continue;
         line[pos] = '\0';
         ps_ptr<char> ssidEsc;
         jsonEscapeAppend(ssidEsc, line.get());
