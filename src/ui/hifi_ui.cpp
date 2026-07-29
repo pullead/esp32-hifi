@@ -76,6 +76,34 @@ void addPressFx(lv_obj_t* obj) {
     lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_PRESSED);
 }
 
+lv_obj_t* addFontPreviewLabel(lv_obj_t* parent, const char* text, const lv_font_t* font,
+                              lv_color_t color, int16_t x, int16_t y, int16_t width,
+                              lv_label_long_mode_t longMode = LV_LABEL_LONG_DOT) {
+    lv_obj_t* label = lv_label_create(parent);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, color, 0);
+    lv_obj_set_style_text_opa(label, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_letter_space(label, 0, 0);
+    lv_obj_set_style_text_line_space(label, 0, 0);
+    lv_label_set_long_mode(label, longMode);
+    lv_obj_set_width(label, width);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_SCROLLABLE);
+    return label;
+}
+
+void addFontPreviewRow(lv_obj_t* parent, int16_t y, const char* name, const lv_font_t* font,
+                       lv_color_t color, const char* sample, bool fauxBold = false,
+                       lv_label_long_mode_t longMode = LV_LABEL_LONG_DOT) {
+    addFontPreviewLabel(parent, name, &lv_font_montserrat_10, kInkDim, 10, y + 2, 72);
+    addFontPreviewLabel(parent, sample, font, color, 84, y, 222, longMode);
+    if (fauxBold) {
+        addFontPreviewLabel(parent, sample, font, color, 85, y, 222, longMode);
+    }
+}
+
 // Draws one Local Now Playing spectrum "LED" cell into the canvas pixel
 // buffer -- shared by buildLocalNowPlaying()'s initial all-unlit fill and
 // refreshLocalNowPlaying()'s per-tick column updates, see both for why this
@@ -630,6 +658,7 @@ void HifiUi::show(Page page) {
     else if (page == Page::Clock) buildPlaceholder("CLOCK", "NTP time, alarm and sleep timer");
     else if (page == Page::Settings) buildSettings();
     else if (page == Page::SettingsWifi) buildSettingsWifi();
+    else if (page == Page::FontPreview) buildFontPreview();
     else buildPlaceholder("SETTINGS / EQ", "Audio, EQ, network and sleep");
 }
 
@@ -1848,9 +1877,28 @@ void HifiUi::buildSettings() {
 
     lv_obj_t* wifiCard = makeCard(screen, LV_SYMBOL_WIFI, "WiFi", Page::SettingsWifi, 16, 56, 90, 76);
     (void)wifiCard;
+    lv_obj_t* fontCard = makeCard(screen, LV_SYMBOL_EYE_OPEN, "字体", Page::FontPreview, 116, 56, 90, 76);
+    (void)fontCard;
     // EQ/audio/sleep settings aren't built yet -- see Page::Settings's
     // buildPlaceholder fallback history; this hub only has WiFi so far,
     // more cards land here as those features are implemented.
+}
+
+void HifiUi::buildFontPreview() {
+    lv_obj_t* screen = lv_scr_act();
+    buildStatusBar(screen);
+
+    addFontPreviewLabel(screen, "字体清晰度预览", &lv_font_cjk_13, kInk, 10, 25, 180);
+    addFontPreviewLabel(screen, "看边缘锐度/灰雾/滚动残影", &lv_font_cjk_13, kInkDim, 168, 25, 144);
+
+    addFontPreviewRow(screen, 48, "CJK13", &lv_font_cjk_13, kInk, "中文歌词 ABC 123");
+    addFontPreviewRow(screen, 68, "CJK13+B", &lv_font_cjk_13, kInk, "中文歌词 ABC 123", true);
+    addFontPreviewRow(screen, 88, "DIM", &lv_font_cjk_13, kInkDim, "歌曲标题 / 歌手 / 专辑");
+    addFontPreviewRow(screen, 108, "PURPLE", &lv_font_cjk_13, kAccentBright, "同步歌词正在显示");
+    addFontPreviewRow(screen, 128, "SCROLL", &lv_font_cjk_13, kInk,
+                      "很长的本地音乐标题 - Artist / Album / Lyrics 123",
+                      false, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    addFontPreviewRow(screen, 148, "CJK16", &lv_font_cjk_16, kInk, "设置 选择网络 ABC 123");
 }
 
 void HifiUi::buildSettingsWifi() {

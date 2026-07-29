@@ -1,26 +1,79 @@
-# CJK fonts (LVGL 8, subsetted)
+# CJK fonts for the LVGL UI
 
-`lv_font_cjk_16.c` / `lv_font_cjk_13.c` are Noto Sans SC subsetted to the
-**GB2312 common set (~6763 hanzi) + ASCII + fullwidth forms** (7444 glyphs),
-2bpp, uncompressed. Declared in `../hifi_fonts.h`. Compiled size ≈ 380 KB
-total (both sizes). Covers ~99.7% of modern Chinese; rare glyphs fall back
-to `.notdef`.
+The firmware currently ships two generated LVGL 8 fonts:
 
-## Regenerate
+- `lv_font_cjk_13.c`: broad dynamic CJK/ASCII/fullwidth subset for labels,
+  lists, station names, track titles, lyrics, and WiFi SSIDs.
+- `lv_font_cjk_16.c`: small fixed-glyph subset for stable UI titles. Do not
+  regenerate this with the full `cjk_symbols.txt` set unless
+  `LV_FONT_FMT_TXT_LARGE` is intentionally enabled and tested.
 
-```bash
-npm install -g lv_font_conv           # v1.5.3 used
-# GB2312 charset -> cjk_symbols.txt (see the python snippet in git history / DEV notes)
-TTF=../../../DDClockPort/phase4_music_ui/tools/fonts/NotoSansSC-wght.ttf
-for SZ in 16 13; do
-  lv_font_conv --font "$TTF" --size $SZ --bpp 2 --format lvgl \
-    --lv-include lvgl.h --no-compress -o lv_font_cjk_$SZ.c \
-    --range 0x20-0x7F --symbols "$(cat cjk_symbols.txt)"
-done
+Both fonts are generated as **4bpp, uncompressed** bitmaps. This costs more
+flash than 2bpp, but gives sharper antialiasing on the 320x170 ST7789 panel.
+
+## On-device preview
+
+The Settings screen contains a `字体` card that opens a font clarity preview.
+Use it before changing the global font mapping. The preview compares:
+
+- normal `lv_font_cjk_13`
+- faux-bold `lv_font_cjk_13` drawn twice with a 1 px offset
+- low-contrast text
+- purple lyric text
+- LVGL circular scrolling title text
+- fixed-glyph `lv_font_cjk_16`
+
+The goal is to identify whether the blur is mainly from the font bitmap,
+contrast, or scrolling behavior before replacing fonts globally.
+
+## Regenerate on Windows
+
+Install `lv_font_conv` once:
+
+```powershell
+npm install -g lv_font_conv@1.5.3
 ```
 
-Note: these are multi-MB C arrays, so the **first** build after adding/changing
-them is slow (~9 min). Subsequent builds reuse the cached `.o` and are fast.
+Then run from the project root:
 
-Upgrade path for full coverage: load a full CJK font from SD via FreeType /
-`lv_font_load` instead of subsetting. See `docs/UI_DESIGN_SPEC.md`.
+```powershell
+.\scripts\gen_fonts_windows.ps1
+```
+
+By default the script uses `tools\fonts\NotoSansSC-VF.ttf` when present, then
+falls back to `C:\Windows\Fonts\NotoSansSC-VF.ttf`. To test a heavier font:
+
+```powershell
+.\scripts\gen_fonts_windows.ps1 -FontPath C:\Windows\Fonts\msyhbd.ttc
+```
+
+## Regenerate on macOS
+
+Install `lv_font_conv` once:
+
+```bash
+npm install -g lv_font_conv@1.5.3
+```
+
+Then run from the project root:
+
+```bash
+./scripts/gen_fonts_mac.sh ./tools/fonts/NotoSansSC-VF.ttf
+```
+
+`LV_FONT_CONV` and `BPP` can be overridden:
+
+```bash
+LV_FONT_CONV=/path/to/lv_font_conv BPP=4 ./scripts/gen_fonts_mac.sh ./tools/fonts/NotoSansSC-VF.ttf
+```
+
+## Known constraints
+
+- The 16 px full dynamic CJK font overflowed LVGL 8's default font bitmap
+  index field in earlier testing. Keep 16 px as a fixed UI-title subset until
+  a separate `LV_FONT_FMT_TXT_LARGE` experiment is built and flash impact is
+  measured.
+- Font source files are not committed here yet. If a font is vendored under
+  `tools/fonts/`, verify its license before committing it.
+- The first build after changing generated font C files can be slow because
+  `lv_font_cjk_13.c` is multi-megabyte source.

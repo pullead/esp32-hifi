@@ -2,11 +2,20 @@
 
 #include "lvgl.h"
 
-// Subsetted Noto Sans SC fonts (GB2312 common set + ASCII), generated with
-// lv_font_conv into src/ui/fonts/. 2bpp, uncompressed (faster render).
-//   lv_font_cjk_16 — titles / headers
-//   lv_font_cjk_13 — body, labels, list rows, settings
-// Rare glyphs outside GB2312 fall back to .notdef; upgrade to an on-SD font
-// later if arbitrary track titles need full coverage. See docs/UI_DESIGN_SPEC.md.
+// Subsetted Noto Sans SC fonts, generated with lv_font_conv into src/ui/fonts/.
+// Both current fonts are 4bpp and uncompressed for sharper edges on the
+// 320x170 ST7789 panel. lv_font_cjk_13 carries the broad dynamic charset;
+// lv_font_cjk_16 is intentionally limited to fixed UI title glyphs to avoid
+// LVGL 8 font bitmap-index overflow.
 LV_FONT_DECLARE(lv_font_cjk_16);
 LV_FONT_DECLARE(lv_font_cjk_13);
+
+// Semantic aliases for new UI work. Existing screens still contain many direct
+// font references; keep these names as the migration target for the global
+// readability pass after the on-device font preview is reviewed.
+#define HIFI_FONT_TITLE (&lv_font_cjk_16)
+#define HIFI_FONT_BODY (&lv_font_cjk_13)
+#define HIFI_FONT_CAPTION (&lv_font_cjk_13)
+#define HIFI_FONT_DYNAMIC_TEXT (&lv_font_cjk_13)
+#define HIFI_FONT_STATUS (&lv_font_montserrat_10)
+#define HIFI_FONT_ICON (&lv_font_montserrat_16)

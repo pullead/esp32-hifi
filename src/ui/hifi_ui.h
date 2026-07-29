@@ -12,7 +12,7 @@ class HifiUi {
     // 320x170 design spec: docs/UI_DESIGN_SPEC.md. RadioList is the station
     // browser reached from the Radio page's List slot; NowPlaying/Radio
     // themselves share one skeleton (buildMediaPage) per that spec.
-    enum class Page : uint8_t { Home, NowPlaying, Radio, RadioList, Sd, LocalNowPlaying, Clock, Settings, SettingsWifi };
+    enum class Page : uint8_t { Home, NowPlaying, Radio, RadioList, Sd, LocalNowPlaying, Clock, Settings, SettingsWifi, FontPreview };
     // Cycled by tapping the play-mode button: 顺序播放 (stop at the end of
     // the filtered list) -> 列表循环 (wrap back to the start) -> 单曲循环
     // (replay the same track) -> 随机播放 (genuine random pick) -> back to
@@ -60,6 +60,7 @@ class HifiUi {
     void buildPlaceholder(const char* title, const char* detail);
     void buildSettings();
     void buildSettingsWifi();
+    void buildFontPreview();
     void refreshSettingsWifi(const struct PlayerSnapshot& state);
     void buildStatusBar(lv_obj_t* screen);
     void buildQuickPanel();
