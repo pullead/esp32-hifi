@@ -9,6 +9,14 @@ dependencies.lock
 
 lib/lvgl/
 lib/lvgl9/
+lib/Arduino_GFX/
 .cache/
 .dummy/
 Content_on_SD_Card.zip
+
+; per-machine leftovers, not project files
+.git-upstream-shallow/
+.pio-core/
+pio-build*.log
+pio-upload*.log
+sdkconfig.waveshare-s3-touch-lcd-1_9-pico-audio
