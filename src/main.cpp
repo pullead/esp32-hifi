@@ -274,6 +274,8 @@ stationManagement staMgnt(&s_cur_station);
 
 SemaphoreHandle_t mutex_rtc;
 SemaphoreHandle_t mutex_display;
+static SemaphoreHandle_t s_prefMutex = nullptr;
+static SemaphoreHandle_t s_wifiOpMutex = nullptr;
 
 /*  ╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗
     ║                                                     D E F A U L T S E T T I N G S                                                         ║
@@ -802,6 +804,34 @@ const char* wifiPrefKey(uint8_t i) {
     return keys[i < kWifiSlotCount ? i : kWifiSlotCount - 1];
 }
 
+static bool lockPreferences(TickType_t timeout = pdMS_TO_TICKS(250)) {
+    return !s_prefMutex || xSemaphoreTake(s_prefMutex, timeout) == pdTRUE;
+}
+
+static void unlockPreferences() {
+    if (s_prefMutex) xSemaphoreGive(s_prefMutex);
+}
+
+static ps_ptr<char> wifiPrefGet(uint8_t i) {
+    ps_ptr<char> line;
+    if (!lockPreferences()) {
+        MWR_LOG_WARN("Preferences busy while reading {}", wifiPrefKey(i));
+        line = "";
+        return line;
+    }
+    line = pref.getString(wifiPrefKey(i)).c_str();
+    unlockPreferences();
+    return line;
+}
+
+static bool lockWifiOps(TickType_t timeout = pdMS_TO_TICKS(100)) {
+    return !s_wifiOpMutex || xSemaphoreTake(s_wifiOpMutex, timeout) == pdTRUE;
+}
+
+static void unlockWifiOps() {
+    if (s_wifiOpMutex) xSemaphoreGive(s_wifiOpMutex);
+}
+
 // _SSID/_PW get seeded into slot 0 by connectToWiFi() whenever it's empty.
 // Only the literal, unconfigured PlatformIO defaults ("SSID"/"PASSWORD") are
 // placeholders. If platformio_override.ini supplies real build-time
@@ -831,22 +861,27 @@ bool connectToWiFi() {
     ps_ptr<char> line(512);
 
     // create nvs entries if they do not exist
-    for (uint8_t i = 0; i < kWifiSlotCount; i++) {
-        if (!pref.isKey(wifiPrefKey(i))) pref.putString(wifiPrefKey(i), ""); // SSID + \t + PW
-    }
+    if (lockPreferences(pdMS_TO_TICKS(1000))) {
+        for (uint8_t i = 0; i < kWifiSlotCount; i++) {
+            if (!pref.isKey(wifiPrefKey(i))) pref.putString(wifiPrefKey(i), ""); // SSID + \t + PW
+        }
 
-    // Seed slot 0 with the build-flag default credentials, but only the
-    // first time (slot 0 still empty) -- this used to run unconditionally,
-    // clobbering slot 0 on every boot even after the user saved a real
-    // network there via the Settings UI.
-    line = pref.getString(wifiPrefKey(0)).c_str();
-    if (line.strlen() == 0) {
-        const char* SSID = _SSID;
-        const char* PW = _PW;
-        line = SSID;
-        line += "\t";
-        line += PW;
-        pref.putString(wifiPrefKey(0), line.c_get());
+        // Seed slot 0 with the build-flag default credentials, but only the
+        // first time (slot 0 still empty) -- this used to run unconditionally,
+        // clobbering slot 0 on every boot even after the user saved a real
+        // network there via the Settings UI.
+        line = pref.getString(wifiPrefKey(0)).c_str();
+        if (line.strlen() == 0) {
+            const char* SSID = _SSID;
+            const char* PW = _PW;
+            line = SSID;
+            line += "\t";
+            line += PW;
+            pref.putString(wifiPrefKey(0), line.c_get());
+        }
+        unlockPreferences();
+    } else {
+        MWR_LOG_WARN("Preferences busy while initializing WiFi slots");
     }
     printfln(s_tag.wifi_info, "free heap right before WiFi.mode(): " ANSI_ESC_CYAN "{}" ANSI_ESC_RESET ", largest internal block: " ANSI_ESC_CYAN "{}",
              ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
@@ -860,7 +895,7 @@ bool connectToWiFi() {
 
     for (int i = 0; i < kWifiSlotCount; i++) {
         line.clear();
-        line = pref.getString(wifiPrefKey(i)).c_str();
+        line = wifiPrefGet(i).c_get();
         if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) continue;
         int pos = line.index_of("\t", 0); // find first tab
         line[pos] = '\0';                 // terminate ssid
@@ -900,7 +935,12 @@ bool connectToWiFi() {
     wifiMulti.setStrictMode(false); // Allow opportunistic connections while maintaining known APs in priority
     printfln(s_tag.wifi_info, ANSI_ESC_GREEN "Connecting WiFi...");
 
-    wifiMulti.run();
+    if (lockWifiOps(pdMS_TO_TICKS(1000))) {
+        wifiMulti.run();
+        unlockWifiOps();
+    } else {
+        MWR_LOG_WARN("WiFi operation busy during initial connect");
+    }
     int i = 0;
     while (WiFi.status() != WL_CONNECTED) {
         vTaskDelay(1000);
@@ -929,11 +969,16 @@ void setWiFiCredentials(ps_ptr<char> ssid, ps_ptr<char> password) {
     // on-device UI alike just saw the request go nowhere).
     if (ssid.strlen() == 0) return;
 
-    MWR_LOG_ERROR("ssid {} pw {}", ssid.c_get(), password.c_get());
+    MWR_LOG_ERROR("ssid {}", ssid.c_get());
 
     ps_ptr<char> line = "";
     ps_ptr<char> credentials;
     int          i = 0, state = 0;
+
+    if (!lockPreferences(pdMS_TO_TICKS(1000))) {
+        printfln(s_tag.wifi_info, ANSI_ESC_RED "Preferences busy; could not save WiFi credentials for: {}", ssid.c_get());
+        return;
+    }
 
     for (i = 0; i < kWifiSlotCount; i++) {
         line = pref.getString(wifiPrefKey(i)).c_str();
@@ -970,6 +1015,7 @@ void setWiFiCredentials(ps_ptr<char> ssid, ps_ptr<char> password) {
     state = 3;
 
 exit:
+    unlockPreferences();
     if (state == 0) { printfln(s_tag.wifi_info, ANSI_ESC_RED "SSID: {} password can't changed, it is hard coded", ssid.c_get()); }
     if (state == 1) { printfln(s_tag.wifi_info, ANSI_ESC_GREEN "The passord \"{}\" for the SSID: {} has been changed", password.c_get(), ssid.c_get()); }
     if (state == 2) { printfln(s_tag.wifi_info, ANSI_ESC_GREEN "The SSID: {} has been added", ssid.c_get()); }
@@ -2461,7 +2507,7 @@ static void onWifiNetworkReady() {
     s_f_dlnaSeekServer = true;
     s_lvglNetworkReady = true;
     if (!s_weatherMutex) s_weatherMutex = xSemaphoreCreateMutex();
-    xTaskCreate(weatherTask, "weather", 10240, nullptr, 1, nullptr);
+    if (xTaskCreate(weatherTask, "weather", 10240, nullptr, 1, nullptr) != pdPASS) MWR_LOG_ERROR("Failed to create weather task");
 }
 
 // startWifiApFallback() (WiFi.mode(WIFI_AP_STA) + softAP + DNSServer) is
@@ -2486,7 +2532,7 @@ static void onWifiNetworkReady() {
 uint8_t playerCoreWifiSavedCount() {
     uint8_t count = 0;
     for (uint8_t i = 0; i < kWifiSlotCount; ++i) {
-        ps_ptr<char> line = pref.getString(wifiPrefKey(i)).c_str();
+        ps_ptr<char> line = wifiPrefGet(i);
         if (playerCoreWifiLineIsSavedNetwork(line.c_get())) ++count;
     }
     return count;
@@ -2495,7 +2541,7 @@ uint8_t playerCoreWifiSavedCount() {
 bool playerCoreWifiSavedInfo(uint8_t index, char* outSsid, size_t ssidSize, bool* outIsDefault) {
     uint8_t seen = 0;
     for (uint8_t i = 0; i < kWifiSlotCount; ++i) {
-        ps_ptr<char> line = pref.getString(wifiPrefKey(i)).c_str();
+        ps_ptr<char> line = wifiPrefGet(i);
         if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) continue;
         if (seen == index) {
             const int pos = line.index_of("\t", 0);
@@ -2512,7 +2558,46 @@ bool playerCoreWifiSavedInfo(uint8_t index, char* outSsid, size_t ssidSize, bool
 // wifiMulti already has every saved AP added (see connectToWiFi() at boot);
 // tapping a saved row just asks it to retry right now instead of waiting
 // for loopLvglRuntime()'s once-a-second opportunistic run().
-void playerCoreWifiReconnect() { wifiMulti.run(); }
+static volatile bool s_wifiReconnectInProgress = false;
+static uint32_t s_wifiRetryBackoffSec = 1;
+static uint32_t s_wifiNextRetryAtSec = 0;
+
+static bool runWifiMultiOnce(const char* reason, TickType_t lockTimeout = pdMS_TO_TICKS(1000)) {
+    if (!lockWifiOps(lockTimeout)) {
+        MWR_LOG_WARN("WiFi operation busy; skipped {}", reason ? reason : "wifiMulti.run()");
+        return false;
+    }
+    wifiMulti.setStrictMode(false);
+    wifiMulti.run();
+    unlockWifiOps();
+    return true;
+}
+
+static void wifiReconnectTask(void*) {
+    const bool ran = runWifiMultiOnce("reconnect", pdMS_TO_TICKS(15000));
+    if (ran && WiFi.status() == WL_CONNECTED) {
+        s_f_isWiFiConnected = true;
+        s_wifiRetryBackoffSec = 1;
+        s_wifiNextRetryAtSec = s_totalRuntime + 1;
+        onWifiNetworkReady();
+    }
+    s_wifiReconnectInProgress = false;
+    vTaskDelete(nullptr);
+}
+
+static bool startWifiReconnectTask() {
+    if (s_wifiReconnectInProgress) return false;
+    s_wifiReconnectInProgress = true;
+    const BaseType_t created = xTaskCreate(wifiReconnectTask, "wifiReconn", 4096, nullptr, 1, nullptr);
+    if (created != pdPASS) {
+        s_wifiReconnectInProgress = false;
+        MWR_LOG_ERROR("Failed to create WiFi reconnect task");
+        return false;
+    }
+    return true;
+}
+
+void playerCoreWifiReconnect() { startWifiReconnectTask(); }
 
 struct WifiAddRequest {
     char ssid[33]{};
@@ -2526,8 +2611,7 @@ static void wifiAddTask(void* param) {
     ps_ptr<char> pwPtr = request->password;
     setWiFiCredentials(ssidPtr, pwPtr); // persists to the next free slot (or updates a matching one)
     wifiMulti.addAP(request->ssid, request->password);
-    wifiMulti.setStrictMode(false);
-    wifiMulti.run();
+    runWifiMultiOnce("wifi add", pdMS_TO_TICKS(15000));
     bool connected = false;
     for (uint8_t i = 0; i < 30; ++i) { // up to 15s, same ballpark as connectToWiFi()'s own retry window
         if (WiFi.status() == WL_CONNECTED) {
@@ -2556,7 +2640,12 @@ void playerCoreWifiAddNetwork(const char* ssid, const char* password) {
     strlcpy(request->ssid, ssid, sizeof(request->ssid));
     if (password) strlcpy(request->password, password, sizeof(request->password));
     s_wifiAddInProgress = true;
-    xTaskCreate(wifiAddTask, "wifiAdd", 6144, request, 1, nullptr);
+    const BaseType_t created = xTaskCreate(wifiAddTask, "wifiAdd", 6144, request, 1, nullptr);
+    if (created != pdPASS) {
+        s_wifiAddInProgress = false;
+        free(request);
+        MWR_LOG_ERROR("Failed to create WiFi add task");
+    }
 }
 
 // On-demand only (see WifiScanItem's comment), and asynchronous: an earlier
@@ -2572,25 +2661,31 @@ static uint8_t s_wifiScanResultCount = 0;
 static volatile bool s_wifiScanInProgress = false;
 
 static void wifiScanTask(void*) {
-    const int16_t n = WiFi.scanNetworks();
+    int16_t n = 0;
     uint8_t count = 0;
-    for (int16_t i = 0; i < n && count < kWifiScanMaxItems; ++i) {
-        const String ssid = WiFi.SSID(i);
-        if (ssid.length() == 0) continue; // hidden network -- nothing to show/select
-        bool dup = false;
-        for (uint8_t j = 0; j < count; ++j) {
-            if (strcmp(s_wifiScanResults[j].ssid, ssid.c_str()) == 0) {
-                dup = true;
-                if (WiFi.RSSI(i) > s_wifiScanResults[j].rssi) s_wifiScanResults[j].rssi = WiFi.RSSI(i);
-                break;
+    if (lockWifiOps(pdMS_TO_TICKS(15000))) {
+        n = WiFi.scanNetworks();
+        for (int16_t i = 0; i < n && count < kWifiScanMaxItems; ++i) {
+            const String ssid = WiFi.SSID(i);
+            if (ssid.length() == 0) continue; // hidden network -- nothing to show/select
+            bool dup = false;
+            for (uint8_t j = 0; j < count; ++j) {
+                if (strcmp(s_wifiScanResults[j].ssid, ssid.c_str()) == 0) {
+                    dup = true;
+                    if (WiFi.RSSI(i) > s_wifiScanResults[j].rssi) s_wifiScanResults[j].rssi = WiFi.RSSI(i);
+                    break;
+                }
             }
+            if (dup) continue;
+            strlcpy(s_wifiScanResults[count].ssid, ssid.c_str(), sizeof(s_wifiScanResults[count].ssid));
+            s_wifiScanResults[count].rssi = WiFi.RSSI(i);
+            ++count;
         }
-        if (dup) continue;
-        strlcpy(s_wifiScanResults[count].ssid, ssid.c_str(), sizeof(s_wifiScanResults[count].ssid));
-        s_wifiScanResults[count].rssi = WiFi.RSSI(i);
-        ++count;
+        WiFi.scanDelete();
+        unlockWifiOps();
+    } else {
+        MWR_LOG_WARN("WiFi operation busy; skipped async scan");
     }
-    WiFi.scanDelete();
     // Strongest signal first -- simple insertion sort, count is tiny (<= kWifiScanMaxItems).
     for (uint8_t i = 1; i < count; ++i) {
         WifiScanItem key = s_wifiScanResults[i];
@@ -2606,7 +2701,12 @@ static void wifiScanTask(void*) {
 void playerCoreWifiScanStart() {
     if (s_wifiScanInProgress) return;
     s_wifiScanInProgress = true;
-    xTaskCreate(wifiScanTask, "wifiScan", 4096, nullptr, 1, nullptr);
+    const BaseType_t created = xTaskCreate(wifiScanTask, "wifiScan", 4096, nullptr, 1, nullptr);
+    if (created != pdPASS) {
+        s_wifiScanInProgress = false;
+        s_wifiScanResultCount = 0;
+        MWR_LOG_ERROR("Failed to create WiFi scan task");
+    }
 }
 
 bool playerCoreWifiScanInProgress() { return s_wifiScanInProgress; }
@@ -2626,7 +2726,7 @@ static bool setupLvglRuntime() {
 
     logMemoryState("runtime_start");
     if (!init_SD_card()) return false;
-    xTaskCreate(localMusicScanTask, "musicScan", 8192, nullptr, 1, nullptr);
+    if (xTaskCreate(localMusicScanTask, "musicScan", 8192, nullptr, 1, nullptr) != pdPASS) MWR_LOG_ERROR("Failed to create local music scan task");
     if (!defaultsettings()) return false;
     if (ESP.getFlashChipSize() > 80000000) FFat.begin();
     logMemoryState("after_sd_init");
@@ -2753,16 +2853,11 @@ static void loopLvglRuntime() {
             // unreachable. Back off after repeated failures (capped at 16s)
             // and reset to retrying every second as soon as one succeeds,
             // so a normally-reachable network still reconnects quickly.
-            static uint32_t s_wifiRetryBackoffSec = 1;
-            static uint32_t s_wifiNextRetryAtSec = 0;
             if (playerCoreWifiSavedCount() > 0 && s_totalRuntime >= s_wifiNextRetryAtSec) {
-                wifiMulti.run();
-                if (WiFi.isConnected()) {
-                    s_wifiRetryBackoffSec = 1;
-                } else {
+                if (startWifiReconnectTask()) {
+                    s_wifiNextRetryAtSec = s_totalRuntime + s_wifiRetryBackoffSec;
                     s_wifiRetryBackoffSec = std::min<uint32_t>(s_wifiRetryBackoffSec * 2, 16);
                 }
-                s_wifiNextRetryAtSec = s_totalRuntime + s_wifiRetryBackoffSec;
             }
         }
         if (s_f_stationsChanged) {
@@ -2791,13 +2886,17 @@ void setup() {
 
     mutex_rtc = xSemaphoreCreateMutex();
     mutex_display = xSemaphoreCreateMutex();
+    s_prefMutex = xSemaphoreCreateMutex();
+    s_wifiOpMutex = xSemaphoreCreateMutex();
+    if (!s_prefMutex) MWR_LOG_ERROR("Failed to create Preferences mutex");
+    if (!s_wifiOpMutex) MWR_LOG_ERROR("Failed to create WiFi operation mutex");
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting
     // like weatherTask) since local playback -- and playerCoreLoadLyrics()'s
     // mutex-guarded cache -- can happen with WiFi never up. fetchLyricsOnline()
     // itself checks WiFi.isConnected() and returns immediately if it's down.
     s_lyricsMutex = xSemaphoreCreateMutex();
     s_lyricsFetchQueue = xQueueCreate(1, sizeof(uint16_t));
-    xTaskCreate(lyricsFetchTask, "lyricsFetch", 8192, nullptr, 1, nullptr);
+    if (xTaskCreate(lyricsFetchTask, "lyricsFetch", 8192, nullptr, 1, nullptr) != pdPASS) MWR_LOG_ERROR("Failed to create lyrics fetch task");
     Audio::audio_info_callback = my_audio_info; // audio callback
     dlna.dlna_client_callbak(on_dlna_client);   // dlna callback
     bt_emitter.kcx_bt_emitter_callback(on_kcx_bt_emitter);
@@ -2959,8 +3058,11 @@ void setup() {
 
     rec_buffer.alloc_array(REC_BUFFER_SIZE, "rec_buffer");                             // allocate in PSRAM
     writeBuffer.alloc_array(WRITE_CHUNK_SIZE, "writeBuffer");                          // allocate in PSRAM
-    xTaskCreatePinnedToCore(wavWriterTask, "wavWriter", 4096, nullptr, 1, nullptr, 0); // start recorder task
-    printfln(s_tag.setup, "Recorder task started, free heap: " ANSI_ESC_CYAN "{}", ESP.getFreeHeap());
+    if (xTaskCreatePinnedToCore(wavWriterTask, "wavWriter", 4096, nullptr, 1, nullptr, 0) == pdPASS) { // start recorder task
+        printfln(s_tag.setup, "Recorder task started, free heap: " ANSI_ESC_CYAN "{}", ESP.getFreeHeap());
+    } else {
+        MWR_LOG_ERROR("Failed to create recorder task");
+    }
 
     drawImage("/common/Wallpaper.jpg", 0, 0);                                                                     // Wallpaper
     getTFT().copyFramebuffer(FB_VISIBLE, FB_BACKGROUND, 0, 0, displayConfig.dispWidth, displayConfig.dispHeight); // copy wallpaper to background
@@ -3788,13 +3890,22 @@ void changeState(int8_t state, int8_t subState) {
             cls_wifiSettings.clearText();
             cls_wifiSettings.setFontSize(displayConfig.listFontSize);
             {
-                int16_t n = WiFi.scanNetworks();
-                printfln(s_tag.wifi_info, ANSI_ESC_CYAN "{}" ANSI_ESC_RESET " WiFi networks found", n);
-                if(n <= 0) break;
-                for (int i = 0; i < n; i++) {
-                    printfln(s_tag.wifi_info, ANSI_ESC_GREEN"{} ({})", WiFi.SSID(i).c_str(), (int16_t)WiFi.RSSI(i));
-                    ps_ptr<char> pw = get_WiFi_PW(WiFi.SSID(i).c_str());
-                    cls_wifiSettings.add_WiFi_Items(WiFi.SSID(i).c_str(), pw.c_get());
+                if (lockWifiOps(pdMS_TO_TICKS(15000))) {
+                    int16_t n = WiFi.scanNetworks();
+                    printfln(s_tag.wifi_info, ANSI_ESC_CYAN "{}" ANSI_ESC_RESET " WiFi networks found", n);
+                    if(n <= 0) {
+                        unlockWifiOps();
+                        break;
+                    }
+                    for (int i = 0; i < n; i++) {
+                        printfln(s_tag.wifi_info, ANSI_ESC_GREEN"{} ({})", WiFi.SSID(i).c_str(), (int16_t)WiFi.RSSI(i));
+                        ps_ptr<char> pw = get_WiFi_PW(WiFi.SSID(i).c_str());
+                        cls_wifiSettings.add_WiFi_Items(WiFi.SSID(i).c_str(), pw.c_get());
+                    }
+                    WiFi.scanDelete();
+                    unlockWifiOps();
+                } else {
+                    MWR_LOG_WARN("WiFi operation busy while opening WiFi settings");
                 }
             }
             cls_wifiSettings.show();
@@ -3822,13 +3933,8 @@ ps_ptr<char> get_WiFi_PW(const char* ssid) {
     ps_ptr<char> line;
     ps_ptr<char> password = "";
 
-    for (int j = 0; j < 6; j++) {
-        if (j == 0) line = pref.getString("wifiStr0").c_str();
-        if (j == 1) line = pref.getString("wifiStr1").c_str();
-        if (j == 2) line = pref.getString("wifiStr2").c_str();
-        if (j == 3) line = pref.getString("wifiStr3").c_str();
-        if (j == 4) line = pref.getString("wifiStr4").c_str();
-        if (j == 5) line = pref.getString("wifiStr5").c_str();
+    for (int j = 0; j < kWifiSlotCount; j++) {
+        line = wifiPrefGet(j);
         if (line.starts_with(ssid) && line[strlen(ssid)] == '\t') {
             int idx = line.index_of("\t", 0);
             password = line.substr(idx + 1);
@@ -5181,22 +5287,28 @@ void ir_short_key(int8_t key) {
 // at request time) rather than an async JS fetch, to keep the page trivial.
 static void serveWifiSetupPage() {
     ps_ptr<char> options(2048);
-    const int16_t n = WiFi.scanNetworks();
-    for (int16_t i = 0; i < n && i < 24; ++i) {
-        ps_ptr<char> ssidEsc(64);
-        const char* raw = WiFi.SSID(i).c_str();
-        // Escape '"' and '<' so a crafted SSID can't break out of the
-        // attribute/tag it's placed into (WiFi.SSID() is untrusted input).
-        size_t o = 0;
-        for (const char* p = raw; *p && o < 60; ++p) {
-            if (*p == '"') { strlcpy(ssidEsc.get() + o, "&quot;", 64 - o); o += 6; }
-            else if (*p == '<') { strlcpy(ssidEsc.get() + o, "&lt;", 64 - o); o += 4; }
-            else ssidEsc.get()[o++] = *p;
+    if (lockWifiOps(pdMS_TO_TICKS(15000))) {
+        const int16_t n = WiFi.scanNetworks();
+        for (int16_t i = 0; i < n && i < 24; ++i) {
+            ps_ptr<char> ssidEsc(64);
+            const char* raw = WiFi.SSID(i).c_str();
+            // Escape '"' and '<' so a crafted SSID can't break out of the
+            // attribute/tag it's placed into (WiFi.SSID() is untrusted input).
+            size_t o = 0;
+            for (const char* p = raw; *p && o < 60; ++p) {
+                if (*p == '"') { strlcpy(ssidEsc.get() + o, "&quot;", 64 - o); o += 6; }
+                else if (*p == '<') { strlcpy(ssidEsc.get() + o, "&lt;", 64 - o); o += 4; }
+                else ssidEsc.get()[o++] = *p;
+            }
+            ssidEsc.get()[o] = '\0';
+            char opt[160];
+            snprintf(opt, sizeof(opt), "<option value=\"%s\">%s (%d dBm)</option>", ssidEsc.c_get(), ssidEsc.c_get(), static_cast<int>(WiFi.RSSI(i)));
+            options += opt;
         }
-        ssidEsc.get()[o] = '\0';
-        char opt[160];
-        snprintf(opt, sizeof(opt), "<option value=\"%s\">%s (%d dBm)</option>", ssidEsc.c_get(), ssidEsc.c_get(), static_cast<int>(WiFi.RSSI(i)));
-        options += opt;
+        WiFi.scanDelete();
+        unlockWifiOps();
+    } else {
+        MWR_LOG_WARN("WiFi operation busy while serving setup page");
     }
 
     ps_ptr<char> page(2560 + options.strlen());
@@ -5337,19 +5449,24 @@ static void serveWifiStatusJson() {
 // through the LVGL side's background wifiScanTask, and this page is only
 // loaded on demand (or "刷新" tapped), not polled.
 static void serveWifiScanJson() {
-    const int16_t n = WiFi.scanNetworks();
     ps_ptr<char> json(2048);
     json = "[";
-    for (int16_t i = 0; i < n && i < 24; ++i) {
-        ps_ptr<char> ssidEsc;
-        jsonEscapeAppend(ssidEsc, WiFi.SSID(i).c_str());
-        char entry[192];
-        snprintf(entry, sizeof(entry), "%s{\"ssid\":\"%s\",\"rssi\":%d,\"encrypted\":%s}", i ? "," : "", ssidEsc.c_get(),
-                 static_cast<int>(WiFi.RSSI(i)), WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
-        json += entry;
+    if (lockWifiOps(pdMS_TO_TICKS(15000))) {
+        const int16_t n = WiFi.scanNetworks();
+        for (int16_t i = 0; i < n && i < 24; ++i) {
+            ps_ptr<char> ssidEsc;
+            jsonEscapeAppend(ssidEsc, WiFi.SSID(i).c_str());
+            char entry[192];
+            snprintf(entry, sizeof(entry), "%s{\"ssid\":\"%s\",\"rssi\":%d,\"encrypted\":%s}", i ? "," : "", ssidEsc.c_get(),
+                     static_cast<int>(WiFi.RSSI(i)), WiFi.encryptionType(i) != WIFI_AUTH_OPEN ? "true" : "false");
+            json += entry;
+        }
+        WiFi.scanDelete();
+        unlockWifiOps();
+    } else {
+        MWR_LOG_WARN("WiFi operation busy while serving scan json");
     }
     json += "]";
-    WiFi.scanDelete();
     webSrv.show(json.c_get(), webSrv.JSON);
 }
 
@@ -5358,7 +5475,7 @@ static void serveWifiSavedJson() {
     json = "[";
     bool first = true;
     for (uint8_t i = 0; i < kWifiSlotCount; ++i) {
-        ps_ptr<char> line = pref.getString(wifiPrefKey(i)).c_str();
+        ps_ptr<char> line = wifiPrefGet(i);
         if (!playerCoreWifiLineIsSavedNetwork(line.c_get())) continue;
         const int pos = line.index_of("\t", 0);
         line[pos] = '\0';
