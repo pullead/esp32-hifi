@@ -13,6 +13,7 @@ lib/Arduino_GFX/
 .cache/
 .dummy/
 Content_on_SD_Card.zip
+backups/
 
 ; per-machine leftovers, not project files
 .git-upstream-shallow/

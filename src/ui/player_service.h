@@ -78,6 +78,13 @@ struct LocalTrackItem {
     bool hasArt = false;
 };
 
+struct AudioToneSettings {
+    int8_t low = 0;
+    int8_t mid = 0;
+    int8_t high = 0;
+    int8_t balance = 0;
+};
+
 // Small, stable API used by LVGL and deliberately independent from its widgets.
 class PlayerService {
   public:
@@ -93,6 +100,9 @@ class PlayerService {
     void setMuted(bool muted);
     // 3-band EQ, -12..+12 dB each (clamped by Audio::setTone() itself).
     void setTone(int8_t low, int8_t mid, int8_t high);
+    AudioToneSettings toneSettings() const;
+    void setToneSettings(const AudioToneSettings& settings, bool persist);
+    void saveToneSettings();
 
     // Settings > WiFi screen: saved-network list only (from NVS) -- no
     // on-device scanning, see hifi_ui.cpp's buildSettingsWifi() comment.
