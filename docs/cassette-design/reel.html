@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  /* Square, no CSS-level circular clip -- opaque all the way to the
+     corners, filled with the SAME dark radial gradient as the cassette
+     body's reel window (cassette_body.html .reel). At runtime this image
+     sits inside an LVGL wrapper obj with clip_corner (circular) that does
+     the actual clipping while the image itself rotates -- lv_img rotation
+     is a properly-supported LVGL8 path (unlike rotating a composite object
+     tree, which is what broke the first version of this view). */
+  html,body { margin:0; padding:0; width:60px; height:60px; background:#0a0a0b; }
+  .wrap { position:relative; width:60px; height:60px;
+    background: radial-gradient(circle at 35% 30%, #201f22, #0a0a0b 70%); }
+  .spoke { position:absolute; left:50%; top:50%; width:38px; height:5px; margin-left:-19px; margin-top:-2.5px;
+    background:#d8d8d8; border-radius:2px; }
+  .spoke.v { transform:rotate(90deg); }
+  .spoke.d1 { transform:rotate(45deg); }
+  .spoke.d2 { transform:rotate(-45deg); }
+  .hub { position:absolute; left:50%; top:50%; width:18px; height:18px; margin-left:-9px; margin-top:-9px;
+    border-radius:50%; background: radial-gradient(circle at 35% 30%, #e8b04a,#a5691a 70%); box-shadow:0 0 3px rgba(0,0,0,0.6); }
+  .center { position:absolute; left:50%; top:50%; width:4px; height:4px; margin-left:-2px; margin-top:-2px;
+    border-radius:50%; background:#3a2c14; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="spoke"></div>
+    <div class="spoke v"></div>
+    <div class="spoke d1"></div>
+    <div class="spoke d2"></div>
+    <div class="hub"></div>
+    <div class="center"></div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  html,body { margin:0; padding:0; width:320px; height:170px; overflow:hidden; background:#0A0B12; }
+  .cassette {
+    position:relative; width:300px; height:150px; margin:10px;
+    background: linear-gradient(180deg,#f2ede2 0%, #e8e0cf 55%, #ddd3bd 100%);
+    border-radius:14px;
+    box-shadow: inset 0 1px 2px rgba(255,255,255,0.6), inset 0 -3px 6px rgba(0,0,0,0.15), 0 3px 10px rgba(0,0,0,0.5);
+  }
+  .screw { position:absolute; width:10px; height:10px; border-radius:50%;
+    background: radial-gradient(circle at 35% 30%, #cfcfcf, #6b6b6b 60%, #3a3a3a);
+    box-shadow: 0 1px 1px rgba(0,0,0,0.5);
+  }
+  .screw::after { content:""; position:absolute; left:2px; top:4.5px; width:6px; height:1px; background:#222; }
+  .s1 { left:10px; top:10px; } .s2 { right:10px; top:10px; }
+  .s3 { left:10px; bottom:10px; } .s4 { right:10px; bottom:10px; }
+
+  .label {
+    position:absolute; left:26px; top:24px; width:248px; height:78px;
+    background: linear-gradient(180deg,#fbf9f4,#efe9db);
+    border-radius:8px;
+    border:1px solid rgba(0,0,0,0.15);
+    box-shadow: inset 0 1px 1px rgba(255,255,255,0.8);
+  }
+
+  .window { position:absolute; left:34px; top:40px; width:180px; height:34px;
+    background: linear-gradient(180deg,#181818,#050505);
+    border-radius:5px; border:1px solid #000;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.8);
+  }
+  /* No baked-in needle -- it's a real LVGL bar overlaid at runtime and
+     moved by actual playback level (see refreshLocalNowPlaying), not a
+     static painted line. */
+  .tapeline { position:absolute; left:6px; right:6px; top:16px; height:1px; background:repeating-linear-gradient(90deg,#3a3a3a 0 3px, transparent 3px 6px); }
+
+  /* Reel WINDOWS only -- just the dark recessed circle, no spokes baked in.
+     The rotating spoke graphic is a separate small image overlaid at
+     runtime (see reel.html) so it can actually spin via lv_img rotation. */
+  .reel { position:absolute; top:30px; width:52px; height:52px; border-radius:50%;
+    background: radial-gradient(circle at 35% 30%, #201f22, #0a0a0b 70%);
+    border: 2px solid #050505;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.7);
+  }
+  .reelL { left:8px; } .reelR { right:8px; }
+
+  .brand { position:absolute; left:0; right:0; bottom:5px; text-align:center; font-family:'Helvetica Neue',Arial,sans-serif; font-size:7px; color:#a89d86; letter-spacing:0.5px; }
+  .side { position:absolute; left:14px; top:16px; font-family:'Helvetica Neue',Arial,sans-serif; font-size:9px; font-weight:700; color:#a3987d; letter-spacing:1px; }
+
+  .ridge { position:absolute; left:60px; right:60px; bottom:6px; height:16px;
+    background: repeating-linear-gradient(90deg, rgba(0,0,0,0.08) 0 2px, transparent 2px 5px);
+    border-radius:0 0 10px 10px;
+  }
+  .hole { position:absolute; bottom:10px; width:6px; height:6px; border-radius:50%; background:#3a3428; box-shadow:inset 0 1px 1px rgba(0,0,0,0.6); }
+  .h1{left:96px;} .h2{left:126px;} .h3{left:156px;} .h4{left:186px;}
+</style>
+</head>
+<body>
+  <div class="cassette">
+    <div class="screw s1"></div><div class="screw s2"></div><div class="screw s3"></div><div class="screw s4"></div>
+    <div class="side">SIDE A</div>
+    <div class="label">
+      <div class="window">
+        <div class="tapeline"></div>
+        <div class="needle"></div>
+      </div>
+    </div>
+    <div class="reel reelL"></div>
+    <div class="reel reelR"></div>
+    <div class="ridge"></div>
+    <div class="hole h1"></div><div class="hole h2"></div><div class="hole h3"></div><div class="hole h4"></div>
+    <div class="brand">HI-FI STUDIO &middot; CHROME TAPE</div>
+  </div>
+</body>
+</html>
