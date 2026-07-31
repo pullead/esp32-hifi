@@ -13,6 +13,8 @@ extern void playerCoreSetTone(int8_t low, int8_t mid, int8_t high);
 extern AudioToneSettings playerCoreToneSettings();
 extern void playerCoreSetToneSettings(const AudioToneSettings& settings, bool persist);
 extern void playerCoreSaveSettings();
+extern AudioOutputPolicy playerCoreOutputPolicy();
+extern void playerCoreSetOutputPolicy(AudioOutputPolicy policy, bool persist);
 extern uint8_t playerCoreWifiSavedCount();
 extern bool playerCoreWifiSavedInfo(uint8_t index, char* outSsid, size_t ssidSize, bool* outIsDefault);
 extern void playerCoreWifiReconnect();
@@ -30,6 +32,9 @@ extern bool playerCoreLocalLibraryScanning();
 extern uint16_t playerCoreLocalLibraryCount();
 extern bool playerCoreLocalTrack(uint16_t index, LocalTrackItem* item);
 extern bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight);
+extern UsbStorageState playerCoreUsbStorageState();
+extern bool playerCoreUsbStorageMount();
+extern bool playerCoreUsbStorageUnmount();
 extern void playerCoreRadioIconSyncStart();
 extern bool playerCoreRadioIconSyncInProgress();
 extern bool playerCoreDecodeRadioIcon(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight);
@@ -113,6 +118,12 @@ void PlayerService::setToneSettings(const AudioToneSettings& settings, bool pers
 
 void PlayerService::saveToneSettings() { playerCoreSaveSettings(); }
 
+AudioOutputPolicy PlayerService::outputPolicy() const { return playerCoreOutputPolicy(); }
+
+void PlayerService::setOutputPolicy(AudioOutputPolicy policy, bool persist) {
+    playerCoreSetOutputPolicy(policy, persist);
+}
+
 uint8_t PlayerService::wifiSavedCount() const { return playerCoreWifiSavedCount(); }
 
 bool PlayerService::wifiSavedInfo(uint8_t index, char* outSsid, size_t ssidSize, bool* outIsDefault) const {
@@ -166,6 +177,12 @@ bool PlayerService::localLibraryScanning() const { return playerCoreLocalLibrary
 uint16_t PlayerService::localLibraryCount() const { return playerCoreLocalLibraryCount(); }
 
 bool PlayerService::localTrack(uint16_t index, LocalTrackItem* item) const { return playerCoreLocalTrack(index, item); }
+
+UsbStorageState PlayerService::usbStorageState() const { return playerCoreUsbStorageState(); }
+
+bool PlayerService::usbStorageMount() { return playerCoreUsbStorageMount(); }
+
+bool PlayerService::usbStorageUnmount() { return playerCoreUsbStorageUnmount(); }
 
 bool PlayerService::playLocalTrack(uint16_t index) {
     LocalTrackItem item;

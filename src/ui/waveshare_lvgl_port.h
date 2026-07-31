@@ -36,6 +36,7 @@ class WaveshareLvglPort {
     lv_disp_drv_t m_displayDriver{};
     lv_disp_t* m_display = nullptr;
     lv_indev_drv_t m_touchDriver{};
+    lv_indev_t* m_touchIndev = nullptr;
     lv_color_t* m_bufferA = nullptr;
     lv_color_t* m_bufferB = nullptr;
     uint16_t m_lastX = 0;
@@ -47,6 +48,7 @@ class WaveshareLvglPort {
     uint8_t m_touchMisses = 0;
     uint32_t m_lastTick = 0;
     uint32_t m_touchStartMs = 0;
+    uint32_t m_touchSuppressUntilMs = 0;
     uint32_t m_lastImuPoll = 0;
     uint32_t m_lastGyroMs = 0;
     uint32_t m_orientationSince = 0;
@@ -58,6 +60,7 @@ class WaveshareLvglPort {
     void* m_panel = nullptr;
     bool m_touchWasPressed = false;
     bool m_touchGestureFired = false;
+    bool m_touchSuppressingGesture = false;
     bool m_imuReady = false;
     bool m_imuBaselineReady = false;
     bool m_autoRotation = true;

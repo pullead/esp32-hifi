@@ -22,6 +22,7 @@ class HifiUi {
         Clock,
         Settings,
         SettingsWifi,
+        UsbStorage,
         FontPreview,
         AudioHome,
         AudioDecode,
@@ -60,6 +61,7 @@ class HifiUi {
     static void onWifiAddBackAction(lv_event_t* event);
     static void onWifiScanRowAction(lv_event_t* event);
     static void onWifiAddSaveAction(lv_event_t* event);
+    static void onUsbStorageAction(lv_event_t* event);
     static void onQuickVolumeAction(lv_event_t* event);
     static void onQuickBrightnessAction(lv_event_t* event);
     static void onQuickEqAction(lv_event_t* event);
@@ -67,8 +69,10 @@ class HifiUi {
     static void onAudioEqSliderAction(lv_event_t* event);
     static void onAudioEqBandOpenAction(lv_event_t* event);
     static void onAudioEqBandAdjustAction(lv_event_t* event);
+    static void onAudioOutputPolicyAction(lv_event_t* event);
 
     void show(Page page);
+    void navigateBack();
     void buildHome();
     void buildMediaPage(bool isRadio);
     void buildRadioList();
@@ -89,6 +93,8 @@ class HifiUi {
     void buildPlaceholder(const char* title, const char* detail);
     void buildSettings();
     void buildSettingsWifi();
+    void buildUsbStorage();
+    void refreshUsbStorage();
     void buildFontPreview();
     void buildAudioHome();
     void buildAudioDecode();
@@ -98,7 +104,7 @@ class HifiUi {
     void buildAudioEqBand();
     void buildAudioEffects();
     void buildAudioDac();
-    void buildAudioTopBar(const char* title, const char* rightText = nullptr);
+    void buildAudioTopBar(const char* title, const char* rightText = nullptr, bool rightOk = false, const char* rightIcon = nullptr);
     lv_obj_t* makeAudioRow(lv_obj_t* parent, int16_t y, const char* icon, const char* label, const char* value, Page page);
     lv_obj_t* makeAudioNavTile(lv_obj_t* parent, int16_t x, int16_t y, int16_t width, const char* icon, const char* title,
                                const char* subtitle, Page page, bool selected = false);
@@ -123,7 +129,10 @@ class HifiUi {
     WaveshareLvglPort m_port;
     static HifiUi* s_instance;
     Page m_page = Page::Home;
-    Page m_returnPage = Page::Home;
+    static constexpr uint8_t kPageStackCapacity = 8;
+    Page m_pageStack[kPageStackCapacity]{};
+    uint8_t m_pageStackDepth = 0;
+    bool m_navigatingBack = false;
     bool m_mediaPageIsRadio = false;
     lv_obj_t* m_title = nullptr;
     lv_obj_t* m_detail = nullptr;
@@ -327,6 +336,11 @@ class HifiUi {
     lv_obj_t* m_wifiStatusText = nullptr;
     lv_obj_t* m_wifiHintText = nullptr;
     char m_wifiQrLastContent[128]{};
+    lv_obj_t* m_usbStorageStatus = nullptr;
+    lv_obj_t* m_usbStorageDetail = nullptr;
+    lv_obj_t* m_usbStorageButton = nullptr;
+    lv_obj_t* m_usbStorageButtonLabel = nullptr;
+    UsbStorageState m_lastUsbStorageState = UsbStorageState::Unsupported;
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to

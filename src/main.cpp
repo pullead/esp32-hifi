@@ -16,6 +16,14 @@
 #include <esp_wifi.h>
 #include <cctype>
 
+#if SOC_USB_OTG_SUPPORTED && CONFIG_TINYUSB_ENABLED && CONFIG_TINYUSB_MSC_ENABLED && !ARDUINO_USB_MODE
+#include <USB.h>
+#include <USBMSC.h>
+#define MWR_USB_MSC_SUPPORTED 1
+#else
+#define MWR_USB_MSC_SUPPORTED 0
+#endif
+
 // Unified memory snapshot for the LVGL-96KB-to-PSRAM A/B test (see
 // src/lv_conf.h's LV_ATTRIBUTE_LARGE_RAM_ARRAY comment) -- ESP.getFreeHeap()
 // alone can't distinguish internal vs PSRAM, and doesn't capture largest-
@@ -179,6 +187,7 @@ uint8_t  s_cur_Codec = 0;
 uint8_t  s_numServers = 0; //
 uint8_t  s_level = 0;
 uint8_t  s_sleepMode = 1; // 0 display off, 1 show the clock
+AudioOutputPolicy s_audioOutputPolicy = AudioOutputPolicy::Source;
 uint8_t  s_staListPos = 0;
 uint8_t  s_cthFailCounter = 0; // connecttohost fail
 uint8_t  s_itemListPos = 0;    // DLNA items
@@ -373,6 +382,12 @@ boolean defaultsettings() {
     s_tone.BP = atoi(parseJson("\"toneBP\":"));
     s_tone.HP = atoi(parseJson("\"toneHP\":"));
     s_tone.BAL = atoi(parseJson("\"balance\":"));
+    {
+        const int outputSampleRate = atoi(parseJson("\"outputSampleRate\":"));
+        if (outputSampleRate == 44100) s_audioOutputPolicy = AudioOutputPolicy::Fixed44100;
+        else if (outputSampleRate == 48000) s_audioOutputPolicy = AudioOutputPolicy::Fixed48000;
+        else s_audioOutputPolicy = AudioOutputPolicy::Source;
+    }
     s_TZName = parseJson("\"Timezone_Name\":");
     s_TZString = parseJson("\"Timezone_String\":");
     s_settings.lastconnectedhost.copy_from(parseJson("\"lastconnectedhost\":"));
@@ -442,6 +457,9 @@ void updateSettings() {
     jO.appendf(",\n  \"toneBP\":{}", s_tone.BP);
     jO.appendf(",\n  \"toneHP\":{}", s_tone.HP);
     jO.appendf(",\n  \"balance\":{}", s_tone.BAL);
+    const uint32_t outputSampleRate = s_audioOutputPolicy == AudioOutputPolicy::Fixed44100 ? 44100 :
+                                      s_audioOutputPolicy == AudioOutputPolicy::Fixed48000 ? 48000 : 0;
+    jO.appendf(",\n  \"outputSampleRate\":{}", outputSampleRate);
     jO.appendf(",\n  \"state\":{}", s_state);
     jO.appendf(",\n  \"sleepMode\":{}\n}", s_sleepMode);
 
@@ -1175,6 +1193,7 @@ bool playerCoreRadioStation(uint16_t index, RadioStationItem* item) {
 bool playerCorePlayRadioStation(uint16_t index) { return playerCorePlayStationNumber(index); }
 
 bool playerCorePlaySdFile(const char* path, uint32_t positionSeconds) {
+    if (s_usbStorageState != UsbStorageState::Idle) return false;
     if (!path || !path[0]) return false;
     connecttoFS("SD_MMC", path, positionSeconds);
     if (s_f_isFSConnected) s_memLogLocalAtSec = s_totalRuntime + 5; // see loopLvglRuntime()'s s_f_1sec block
@@ -1218,6 +1237,16 @@ void playerCoreSetToneSettings(const AudioToneSettings& settings, bool persist) 
 }
 
 void playerCoreSaveSettings() { updateSettings(); }
+
+AudioOutputPolicy playerCoreOutputPolicy() { return s_audioOutputPolicy; }
+
+void playerCoreSetOutputPolicy(AudioOutputPolicy policy, bool persist) {
+    s_audioOutputPolicy = policy;
+    if (policy == AudioOutputPolicy::Fixed44100) audio.setOutputSampleRate(Audio::SR_44100);
+    else if (policy == AudioOutputPolicy::Fixed48000) audio.setOutputSampleRate(Audio::SR_48000);
+    else audio.setOutputSampleRate(Audio::SR_ORIGIN);
+    if (persist) updateSettings();
+}
 
 // Legacy quick-EQ compatibility path; full audio settings keep balance too.
 void playerCoreSetTone(int8_t low, int8_t mid, int8_t high) {
@@ -1380,6 +1409,22 @@ constexpr uint16_t kMaxLocalTracks = 300;
 static LocalTrackItem* s_localTracks = nullptr;
 static uint16_t s_localTrackCount = 0;
 static volatile bool s_localLibraryScanning = false;
+static volatile UsbStorageState s_usbStorageState = MWR_USB_MSC_SUPPORTED ? UsbStorageState::Idle : UsbStorageState::Unsupported;
+static volatile bool s_usbStorageBusy = false;
+static volatile bool s_usbStorageHostEjected = false;
+static volatile uint32_t s_usbStorageLastAccessMs = 0;
+
+#if MWR_USB_MSC_SUPPORTED
+static USBMSC s_usbMsc;
+static bool s_usbMscConfigured = false;
+static bool s_usbStarted = false;
+#endif
+
+static bool usbStorageBlocksSdAppAccess() {
+    return s_usbStorageState == UsbStorageState::Mounting ||
+           s_usbStorageState == UsbStorageState::Mounted ||
+           s_usbStorageState == UsbStorageState::Restoring;
+}
 
 static bool containsIcase(const char* haystack, const char* needle) {
     if (!haystack || !needle || !needle[0]) return false;
@@ -1667,6 +1712,7 @@ static bool extractId3Picture(const char* path, uint8_t** outData, size_t* outLe
 }
 
 static void scanMusicDir(const char* path, uint8_t depth) {
+    if (usbStorageBlocksSdAppAccess()) return;
     if (!s_localTracks || s_localTrackCount >= kMaxLocalTracks || depth > 6) return;
     File dir = SD_MMC.open(path);
     if (!dir || !dir.isDirectory()) {
@@ -1704,7 +1750,11 @@ static void scanMusicDir(const char* path, uint8_t depth) {
 }
 
 static void localMusicScanTask(void*) {
-    s_localLibraryScanning = true;
+    if (s_localTracks) {
+        free(s_localTracks);
+        s_localTracks = nullptr;
+    }
+    s_localTrackCount = 0;
     s_localTracks = static_cast<LocalTrackItem*>(ps_calloc(kMaxLocalTracks, sizeof(LocalTrackItem)));
     if (s_localTracks) scanMusicDir("/", 0);
     printf("[MUSIC] scan done, %u tracks\n", s_localTrackCount);
@@ -1712,10 +1762,23 @@ static void localMusicScanTask(void*) {
     vTaskDelete(nullptr);
 }
 
+static bool startLocalMusicScan() {
+    if (s_localLibraryScanning || usbStorageBlocksSdAppAccess()) return false;
+    s_localLibraryScanning = true;
+    const BaseType_t created = xTaskCreate(localMusicScanTask, "musicScan", 8192, nullptr, 1, nullptr);
+    if (created != pdPASS) {
+        s_localLibraryScanning = false;
+        MWR_LOG_ERROR("Failed to create local music scan task");
+        return false;
+    }
+    return true;
+}
+
 bool playerCoreLocalLibraryScanning() { return s_localLibraryScanning; }
 uint16_t playerCoreLocalLibraryCount() { return s_localTrackCount; }
 
 bool playerCoreLocalTrack(uint16_t index, LocalTrackItem* item) {
+    if (s_localLibraryScanning || usbStorageBlocksSdAppAccess()) return false;
     if (!s_localTracks || index >= s_localTrackCount || !item) return false;
     *item = s_localTracks[index];
     return true;
@@ -1725,6 +1788,7 @@ bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16
     *outPixels = nullptr;
     *outWidth = 0;
     *outHeight = 0;
+    if (s_localLibraryScanning || usbStorageBlocksSdAppAccess()) return false;
     if (!s_localTracks || index >= s_localTrackCount) {
         printf("[COVER] idx=%u out of range (count=%u)\n", index, s_localTrackCount);
         return false;
@@ -1744,6 +1808,206 @@ bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16
     if (!ok) printf("[COVER] idx=%u decodeJpgFromMemory failed\n", index);
     free(jpegData);
     return ok;
+}
+
+#if MWR_USB_MSC_SUPPORTED
+static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
+    if (s_usbStorageState != UsbStorageState::Mounted || !buffer) return -1;
+    const uint32_t secSize = SD_MMC.sectorSize();
+    if (!secSize) return -1;
+    s_usbStorageLastAccessMs = millis();
+
+    if (offset == 0 && (bufsize % secSize) == 0) {
+        for (uint32_t done = 0; done < bufsize; done += secSize) {
+            if (!SD_MMC.readRAW(static_cast<uint8_t*>(buffer) + done, lba + done / secSize)) return -1;
+        }
+        return static_cast<int32_t>(bufsize);
+    }
+
+    uint8_t sector[512];
+    if (secSize > sizeof(sector)) return -1;
+    uint32_t done = 0;
+    while (done < bufsize) {
+        const uint32_t absolute = offset + done;
+        const uint32_t sectorLba = lba + absolute / secSize;
+        const uint32_t inSector = absolute % secSize;
+        const uint32_t chunk = std::min<uint32_t>(bufsize - done, secSize - inSector);
+        if (!SD_MMC.readRAW(sector, sectorLba)) return -1;
+        memcpy(static_cast<uint8_t*>(buffer) + done, sector + inSector, chunk);
+        done += chunk;
+    }
+    return static_cast<int32_t>(bufsize);
+}
+
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+    if (s_usbStorageState != UsbStorageState::Mounted || !buffer) return -1;
+    const uint32_t secSize = SD_MMC.sectorSize();
+    if (!secSize) return -1;
+    s_usbStorageLastAccessMs = millis();
+
+    if (offset == 0 && (bufsize % secSize) == 0) {
+        for (uint32_t done = 0; done < bufsize; done += secSize) {
+            if (!SD_MMC.writeRAW(buffer + done, lba + done / secSize)) return -1;
+        }
+        return static_cast<int32_t>(bufsize);
+    }
+
+    uint8_t sector[512];
+    if (secSize > sizeof(sector)) return -1;
+    uint32_t done = 0;
+    while (done < bufsize) {
+        const uint32_t absolute = offset + done;
+        const uint32_t sectorLba = lba + absolute / secSize;
+        const uint32_t inSector = absolute % secSize;
+        const uint32_t chunk = std::min<uint32_t>(bufsize - done, secSize - inSector);
+        if (!SD_MMC.readRAW(sector, sectorLba)) return -1;
+        memcpy(sector + inSector, buffer + done, chunk);
+        if (!SD_MMC.writeRAW(sector, sectorLba)) return -1;
+        done += chunk;
+    }
+    return static_cast<int32_t>(bufsize);
+}
+
+static bool usbMscStartStop(uint8_t powerCondition, bool start, bool loadEject) {
+    printf("[USBMSC] start_stop power=%u start=%u eject=%u\n", powerCondition, start, loadEject);
+    if (loadEject && !start) s_usbStorageHostEjected = true;
+    return true;
+}
+
+static void usbStorageMountTask(void*) {
+    s_usbStorageState = UsbStorageState::Mounting;
+    stopSong();
+    s_memLogLocalAtSec = 0;
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    const int sectorSize = SD_MMC.sectorSize();
+    const int sectorCount = SD_MMC.numSectors();
+    if (sectorSize <= 0 || sectorCount <= 0) {
+        MWR_LOG_ERROR("USB MSC mount failed: invalid SD sector geometry");
+        s_usbStorageState = UsbStorageState::Error;
+        s_usbStorageBusy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (!s_usbMscConfigured) {
+        s_usbMsc.vendorID("ESP32S3");
+        s_usbMsc.productID("HiFi SD");
+        s_usbMsc.productRevision("1.0");
+        s_usbMsc.onRead(usbMscRead);
+        s_usbMsc.onWrite(usbMscWrite);
+        s_usbMsc.onStartStop(usbMscStartStop);
+        s_usbMscConfigured = true;
+    }
+    s_usbStorageHostEjected = false;
+    s_usbStorageLastAccessMs = millis();
+    s_usbMsc.isWritable(true);
+    s_usbMsc.mediaPresent(true);
+    if (!s_usbMsc.begin(static_cast<uint32_t>(sectorCount), static_cast<uint16_t>(sectorSize))) {
+        MWR_LOG_ERROR("USB MSC begin failed");
+        s_usbMsc.mediaPresent(false);
+        s_usbStorageState = UsbStorageState::Error;
+        s_usbStorageBusy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (!s_usbStarted) {
+        USB.manufacturerName("ESP32-S3 HiFi");
+        USB.productName("HiFi SD Card");
+        s_usbStarted = USB.begin();
+        if (!s_usbStarted) {
+            MWR_LOG_ERROR("USB begin failed");
+            s_usbMsc.mediaPresent(false);
+            s_usbMsc.end();
+            s_usbMscConfigured = false;
+            s_usbStorageState = UsbStorageState::Error;
+            s_usbStorageBusy = false;
+            vTaskDelete(nullptr);
+            return;
+        }
+    }
+
+    printf("[USBMSC] mounted sectors=%d sectorSize=%d\n", sectorCount, sectorSize);
+    s_usbStorageState = UsbStorageState::Mounted;
+    s_usbStorageBusy = false;
+    vTaskDelete(nullptr);
+}
+
+static void usbStorageUnmountTask(void*) {
+    s_usbStorageState = UsbStorageState::Restoring;
+    const uint32_t waitStart = millis();
+    while (millis() - s_usbStorageLastAccessMs < 1000 && millis() - waitStart < 3000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    s_usbMsc.mediaPresent(false);
+    s_usbMsc.end();
+    s_usbMscConfigured = false;
+    vTaskDelay(pdMS_TO_TICKS(500));
+
+    SD_MMC.end();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    if (!init_SD_card()) {
+        s_usbStorageState = UsbStorageState::Error;
+        s_usbStorageBusy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    if (startLocalMusicScan()) s_usbStorageState = UsbStorageState::Scanning;
+    else s_usbStorageState = UsbStorageState::Idle;
+    s_usbStorageBusy = false;
+    vTaskDelete(nullptr);
+}
+#endif
+
+UsbStorageState playerCoreUsbStorageState() { return s_usbStorageState; }
+
+bool playerCoreUsbStorageMount() {
+#if MWR_USB_MSC_SUPPORTED
+    if ((s_usbStorageState != UsbStorageState::Idle && s_usbStorageState != UsbStorageState::Error) || s_usbStorageBusy) return false;
+    s_usbStorageBusy = true;
+    const BaseType_t created = xTaskCreate(usbStorageMountTask, "usbMscOn", 4096, nullptr, 2, nullptr);
+    if (created != pdPASS) {
+        s_usbStorageBusy = false;
+        s_usbStorageState = UsbStorageState::Error;
+        MWR_LOG_ERROR("Failed to create USB MSC mount task");
+        return false;
+    }
+    return true;
+#else
+    s_usbStorageState = UsbStorageState::Unsupported;
+    return false;
+#endif
+}
+
+bool playerCoreUsbStorageUnmount() {
+#if MWR_USB_MSC_SUPPORTED
+    if (s_usbStorageState != UsbStorageState::Mounted || s_usbStorageBusy) return false;
+    s_usbStorageBusy = true;
+    const BaseType_t created = xTaskCreate(usbStorageUnmountTask, "usbMscOff", 6144, nullptr, 2, nullptr);
+    if (created != pdPASS) {
+        s_usbStorageBusy = false;
+        MWR_LOG_ERROR("Failed to create USB MSC unmount task");
+        return false;
+    }
+    return true;
+#else
+    s_usbStorageState = UsbStorageState::Unsupported;
+    return false;
+#endif
+}
+
+static void processUsbStorage() {
+#if MWR_USB_MSC_SUPPORTED
+    if (s_usbStorageState == UsbStorageState::Mounted && s_usbStorageHostEjected && !s_usbStorageBusy) {
+        playerCoreUsbStorageUnmount();
+    }
+#endif
+    if (s_usbStorageState == UsbStorageState::Scanning && !s_localLibraryScanning) {
+        s_usbStorageState = UsbStorageState::Idle;
+    }
 }
 
 // ---- Synchronized lyrics (ID3v2 SYLT frame) ------------------------------
@@ -3020,7 +3284,7 @@ static bool setupLvglRuntime() {
 
     logMemoryState("runtime_start");
     if (!init_SD_card()) return false;
-    if (xTaskCreate(localMusicScanTask, "musicScan", 8192, nullptr, 1, nullptr) != pdPASS) MWR_LOG_ERROR("Failed to create local music scan task");
+    startLocalMusicScan();
     if (!defaultsettings()) return false;
     if (ESP.getFlashChipSize() > 80000000) FFat.begin();
     logMemoryState("after_sd_init");
@@ -3061,6 +3325,7 @@ static bool setupLvglRuntime() {
     audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
     audio.setI2SCommFMT_LSB(I2S_COMM_FMT);
     setI2STone();
+    playerCoreSetOutputPolicy(s_audioOutputPolicy, false);
     audio.settings.SPECTRUM = true; // real per-band FFT for the LVGL spectrum UI, see getSpectrumBands()
     logMemoryState("after_audio_set_pinout");
 
@@ -3087,9 +3352,10 @@ static bool setupLvglRuntime() {
 }
 
 static void loopLvglRuntime() {
+    processUsbStorage();
     dlna.loop();
     audio.loop();
-    if (s_lvglNetworkReady) {
+    if (s_lvglNetworkReady && !usbStorageBlocksSdAppAccess()) {
         webSrv.loop();
         ftpSrv.handleFTP();
     }
@@ -3319,6 +3585,7 @@ void setup() {
 
     if (s_f_mute) { printfln(s_tag.setup, "volume is muted: (from " ANSI_ESC_CYAN "{}" ANSI_ESC_RESET ")", s_volume.cur_volume); }
     setI2STone();
+    playerCoreSetOutputPolicy(s_audioOutputPolicy, false);
 
     ticker100ms.attach(0.1, timer100ms);
 
@@ -4247,10 +4514,13 @@ void loop() {
     loopLvglRuntime();
     return;
 #endif
+    processUsbStorage();
     dlna.loop();
     audio.loop();
-    webSrv.loop();
-    ftpSrv.handleFTP();
+    if (!usbStorageBlocksSdAppAccess()) {
+        webSrv.loop();
+        ftpSrv.handleFTP();
+    }
     if (IR_PIN >= 0) ir.loop();
     getTP().loop();
     ArduinoOTA.handle();

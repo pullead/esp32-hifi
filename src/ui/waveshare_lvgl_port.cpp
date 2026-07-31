@@ -36,9 +36,11 @@ constexpr uint16_t kEdgeBackPx = 54;
 constexpr uint16_t kEdgeTopPx = 24; // matches the status bar height
 constexpr uint16_t kEdgeBottomPx = 24;
 constexpr uint16_t kGestureMinPx = 38;
+constexpr uint16_t kGesturePreclaimPx = 10;
 constexpr uint16_t kGestureCrossMaxPx = 86;
 constexpr uint8_t kTouchReleaseGraceReads = 4;
 constexpr uint32_t kGestureMaxMs = 1400;
+constexpr uint32_t kPostGestureClickSuppressMs = 450;
 constexpr uint32_t kImuPollMs = 50;
 constexpr uint32_t kOrientationDebounceMs = 1200;
 constexpr int32_t kImuMinHorizontalMagnitudeSquared = 4800L * 4800L;
@@ -228,7 +230,7 @@ bool WaveshareLvglPort::begin() {
     m_touchDriver.scroll_throw = 10;
     m_touchDriver.gesture_limit = 56;
     m_touchDriver.long_press_time = 450;
-    lv_indev_drv_register(&m_touchDriver);
+    m_touchIndev = lv_indev_drv_register(&m_touchDriver);
     s_instance = this;
     m_lastTick = millis();
     printf("[LVGL] port ready\n");
@@ -450,6 +452,16 @@ void WaveshareLvglPort::updateGesture(bool pressed, uint16_t x, uint16_t y) {
         const int16_t dx = static_cast<int16_t>(m_touchCurrentX) - static_cast<int16_t>(m_touchStartX);
         const int16_t dy = static_cast<int16_t>(m_touchCurrentY) - static_cast<int16_t>(m_touchStartY);
         const uint32_t duration = now - m_touchStartMs;
+        if (!m_touchSuppressingGesture && duration <= kGestureMaxMs) {
+            const bool edgeBackCandidate = m_touchStartX <= kEdgeBackPx && dx >= kGesturePreclaimPx && abs(dy) <= kGestureCrossMaxPx;
+            const bool edgeTopCandidate = m_touchStartY <= kEdgeTopPx && dy >= kGesturePreclaimPx && abs(dx) <= kGestureCrossMaxPx;
+            const bool edgeBottomCandidate = m_touchStartY >= kHeight - kEdgeBottomPx && -dy >= kGesturePreclaimPx && abs(dx) <= kGestureCrossMaxPx;
+            if (edgeBackCandidate || edgeTopCandidate || edgeBottomCandidate) {
+                m_touchSuppressingGesture = true;
+                m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+                if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
+            }
+        }
         // Only the horizontal edge-back swipe is a real gesture. A prior
         // vertical-motion branch here matched on dy alone and set
         // m_touchGestureFired with no action -- any natural finger tremor
@@ -461,6 +473,9 @@ void WaveshareLvglPort::updateGesture(bool pressed, uint16_t x, uint16_t y) {
             if (m_touchStartX <= kEdgeBackPx && dx > 0) {
                 m_pendingGesture = TouchGesture::EdgeBack;
                 m_touchGestureFired = true;
+                m_touchSuppressingGesture = true;
+                m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+                if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
             }
         }
         // Quick-settings panel: swipe down starting within kEdgeTopPx of the
@@ -472,30 +487,52 @@ void WaveshareLvglPort::updateGesture(bool pressed, uint16_t x, uint16_t y) {
             if (m_touchStartY <= kEdgeTopPx && dy > 0) {
                 m_pendingGesture = TouchGesture::EdgeTopOpen;
                 m_touchGestureFired = true;
+                m_touchSuppressingGesture = true;
+                m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+                if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
             } else if (m_touchStartY >= kHeight - kEdgeBottomPx && dy < 0) {
                 m_pendingGesture = TouchGesture::EdgeBottomClose;
                 m_touchGestureFired = true;
+                m_touchSuppressingGesture = true;
+                m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+                if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
             }
         }
         return;
     }
     if (!m_touchWasPressed) return;
     m_touchWasPressed = false;
+    if (m_touchSuppressingGesture) {
+        m_touchSuppressingGesture = false;
+        m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+    }
     const int16_t dx = static_cast<int16_t>(m_touchCurrentX) - static_cast<int16_t>(m_touchStartX);
     const int16_t dy = static_cast<int16_t>(m_touchCurrentY) - static_cast<int16_t>(m_touchStartY);
     const uint32_t duration = now - m_touchStartMs;
     if (duration > kGestureMaxMs || m_touchGestureFired) return;
 
     if (abs(dx) >= kGestureMinPx && abs(dy) <= kGestureCrossMaxPx) {
-        if (m_touchStartX <= kEdgeBackPx && dx > 0) m_pendingGesture = TouchGesture::EdgeBack;
+        if (m_touchStartX <= kEdgeBackPx && dx > 0) {
+            m_pendingGesture = TouchGesture::EdgeBack;
+            m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+            if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
+        }
     } else if (abs(dy) >= kGestureMinPx && abs(dx) <= kGestureCrossMaxPx) {
-        if (m_touchStartY <= kEdgeTopPx && dy > 0) m_pendingGesture = TouchGesture::EdgeTopOpen;
-        else if (m_touchStartY >= kHeight - kEdgeBottomPx && dy < 0) m_pendingGesture = TouchGesture::EdgeBottomClose;
+        if (m_touchStartY <= kEdgeTopPx && dy > 0) {
+            m_pendingGesture = TouchGesture::EdgeTopOpen;
+            m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+            if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
+        } else if (m_touchStartY >= kHeight - kEdgeBottomPx && dy < 0) {
+            m_pendingGesture = TouchGesture::EdgeBottomClose;
+            m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
+            if (m_touchIndev) lv_indev_reset(m_touchIndev, nullptr);
+        }
     }
 }
 
 void WaveshareLvglPort::readTouch(lv_indev_drv_t*, lv_indev_data_t* data) {
     auto* self = s_instance;
+    const uint32_t now = millis();
     uint16_t x = 0;
     uint16_t y = 0;
     if (self && self->readTouchPoint(&x, &y)) {
@@ -503,12 +540,14 @@ void WaveshareLvglPort::readTouch(lv_indev_drv_t*, lv_indev_data_t* data) {
         self->m_lastX = x;
         self->m_lastY = y;
         self->updateGesture(true, x, y);
-        data->state = LV_INDEV_STATE_PRESSED;
+        const bool suppressClick = self->m_touchSuppressingGesture || static_cast<int32_t>(now - self->m_touchSuppressUntilMs) < 0;
+        data->state = suppressClick ? LV_INDEV_STATE_RELEASED : LV_INDEV_STATE_PRESSED;
     } else {
         if (self && self->m_touchWasPressed && self->m_touchMisses < kTouchReleaseGraceReads) {
             ++self->m_touchMisses;
             self->updateGesture(true, self->m_lastX, self->m_lastY);
-            data->state = LV_INDEV_STATE_PRESSED;
+            const bool suppressClick = self->m_touchSuppressingGesture || static_cast<int32_t>(now - self->m_touchSuppressUntilMs) < 0;
+            data->state = suppressClick ? LV_INDEV_STATE_RELEASED : LV_INDEV_STATE_PRESSED;
         } else {
             if (self) {
                 self->m_touchMisses = 0;

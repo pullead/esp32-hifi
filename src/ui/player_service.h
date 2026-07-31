@@ -11,6 +11,7 @@ enum class PlayerTransport : uint8_t { Stopped, Buffering, Playing, Paused, Erro
 // PlayerService::lyricsFetchState() to show "查询中"/"点击重试" instead of a
 // blanket "没有歌词信息".
 enum class LyricFetchState : uint8_t { Idle, Pending, Found, NotFound };
+enum class UsbStorageState : uint8_t { Idle, Mounting, Mounted, Restoring, Scanning, Error, Unsupported };
 
 struct PlayerSnapshot {
     PlayerSource source = PlayerSource::None;
@@ -87,6 +88,8 @@ struct AudioToneSettings {
     int8_t balance = 0;
 };
 
+enum class AudioOutputPolicy : uint8_t { Source = 0, Fixed44100 = 1, Fixed48000 = 2 };
+
 // Small, stable API used by LVGL and deliberately independent from its widgets.
 class PlayerService {
   public:
@@ -105,6 +108,8 @@ class PlayerService {
     AudioToneSettings toneSettings() const;
     void setToneSettings(const AudioToneSettings& settings, bool persist);
     void saveToneSettings();
+    AudioOutputPolicy outputPolicy() const;
+    void setOutputPolicy(AudioOutputPolicy policy, bool persist);
 
     // Settings > WiFi screen: saved-network list only (from NVS) -- no
     // on-device scanning, see hifi_ui.cpp's buildSettingsWifi() comment.
@@ -159,6 +164,9 @@ class PlayerService {
     uint16_t localLibraryCount() const;
     bool localTrack(uint16_t index, LocalTrackItem* item) const;
     bool playLocalTrack(uint16_t index);
+    UsbStorageState usbStorageState() const;
+    bool usbStorageMount();
+    bool usbStorageUnmount();
     bool seekTo(uint32_t positionSeconds);
     // Synchronized lyrics (ID3 SYLT, milliseconds format only). Loaded
     // lazily per track like cover art; currentLyricLine() returns "" if
