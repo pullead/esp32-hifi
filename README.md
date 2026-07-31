@@ -92,6 +92,19 @@ machine. To override it:
 JOBS=4 ./scripts/build_mac.sh
 ```
 
+On Windows the wrapper builds the firmware with PlatformIO's `buildprog`
+target by default. This still produces `.pio/build/<env>/firmware.bin` and
+prints the normal PlatformIO RAM/Flash summary, but avoids the ESP-IDF CMake
+`esp_idf_size` target that can fail on this machine because the PlatformIO
+ESP-IDF helper Python environment and size-tool arguments are out of sync.
+Use `-FullBuild` only when specifically debugging the default ESP-IDF size
+target:
+
+```powershell
+.\scripts\build_windows.ps1 -Environment esp32s3 -Jobs 4
+.\scripts\build_windows.ps1 -Environment esp32s3 -Jobs 4 -FullBuild
+```
+
 #### Dev logs (chronological, most recent last)
 
 - `docs/DEV_LOG_2026-07-28.md` — WiFi/audio/LVGL memory root cause, radio

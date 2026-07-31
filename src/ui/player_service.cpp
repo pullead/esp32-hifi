@@ -10,6 +10,9 @@ extern bool playerCoreTogglePause();
 extern void playerCoreSetVolume(uint8_t volume);
 extern void playerCoreSetMuted(bool muted);
 extern void playerCoreSetTone(int8_t low, int8_t mid, int8_t high);
+extern AudioToneSettings playerCoreToneSettings();
+extern void playerCoreSetToneSettings(const AudioToneSettings& settings, bool persist);
+extern void playerCoreSaveSettings();
 extern uint8_t playerCoreWifiSavedCount();
 extern bool playerCoreWifiSavedInfo(uint8_t index, char* outSsid, size_t ssidSize, bool* outIsDefault);
 extern void playerCoreWifiReconnect();
@@ -101,6 +104,14 @@ void PlayerService::setVolume(uint8_t volume) { playerCoreSetVolume(volume); }
 void PlayerService::setMuted(bool muted) { playerCoreSetMuted(muted); }
 
 void PlayerService::setTone(int8_t low, int8_t mid, int8_t high) { playerCoreSetTone(low, mid, high); }
+
+AudioToneSettings PlayerService::toneSettings() const { return playerCoreToneSettings(); }
+
+void PlayerService::setToneSettings(const AudioToneSettings& settings, bool persist) {
+    playerCoreSetToneSettings(settings, persist);
+}
+
+void PlayerService::saveToneSettings() { playerCoreSaveSettings(); }
 
 uint8_t PlayerService::wifiSavedCount() const { return playerCoreWifiSavedCount(); }
 

@@ -1199,9 +1199,33 @@ void playerCoreSetMuted(bool muted) {
     muteChanged(muted);
 }
 
-// 3-band EQ, -12..+12 dB each (audio.setTone()'s own clamp range).
+AudioToneSettings playerCoreToneSettings() {
+    AudioToneSettings settings;
+    settings.low = static_cast<int8_t>(std::clamp(static_cast<int>(s_tone.LP), -12, 12));
+    settings.mid = static_cast<int8_t>(std::clamp(static_cast<int>(s_tone.BP), -12, 12));
+    settings.high = static_cast<int8_t>(std::clamp(static_cast<int>(s_tone.HP), -12, 12));
+    settings.balance = static_cast<int8_t>(std::clamp(static_cast<int>(s_tone.BAL), -16, 16));
+    return settings;
+}
+
+void playerCoreSetToneSettings(const AudioToneSettings& settings, bool persist) {
+    s_tone.LP = std::clamp(static_cast<int>(settings.low), -12, 12);
+    s_tone.BP = std::clamp(static_cast<int>(settings.mid), -12, 12);
+    s_tone.HP = std::clamp(static_cast<int>(settings.high), -12, 12);
+    s_tone.BAL = std::clamp(static_cast<int>(settings.balance), -16, 16);
+    setI2STone();
+    if (persist) updateSettings();
+}
+
+void playerCoreSaveSettings() { updateSettings(); }
+
+// Legacy quick-EQ compatibility path; full audio settings keep balance too.
 void playerCoreSetTone(int8_t low, int8_t mid, int8_t high) {
-    audio.setTone(static_cast<float>(low), static_cast<float>(mid), static_cast<float>(high));
+    AudioToneSettings settings = playerCoreToneSettings();
+    settings.low = low;
+    settings.mid = mid;
+    settings.high = high;
+    playerCoreSetToneSettings(settings, false);
 }
 
 void playerCoreNextStation() {

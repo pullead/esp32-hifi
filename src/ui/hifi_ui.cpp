@@ -402,6 +402,7 @@ bool HifiUi::begin() {
     if (!m_port.begin()) return false;
     s_instance = this;
     playerService.begin();
+    syncAudioToneFromService();
     buildQuickPanel(); // on lv_layer_top(), built once, outlives every show() screen swap
     show(Page::Home);
     lv_obj_invalidate(lv_scr_act());
@@ -418,6 +419,7 @@ void HifiUi::tick() {
     m_port.tick();
     TouchGesture gesture = TouchGesture::None;
     while (m_port.consumeGesture(&gesture)) handleGesture(gesture);
+    processDeferredAudioTone();
     if (millis() - m_lastRefresh >= 60) { // was 100ms; faster for a smoother-looking spectrum
         m_lastRefresh = millis();
         playerService.tick();
@@ -714,6 +716,9 @@ void HifiUi::show(Page page) {
     m_wifiQrLastContent[0] = '\0'; // force a fresh lv_qrcode_update on rebuild
     m_wifiNetworkList = nullptr;
     m_wifiAddPwField = m_wifiAddKeyboard = nullptr;
+    for (auto& slider : m_audioEqSliders) slider = nullptr;
+    for (auto& label : m_audioEqValueLabels) label = nullptr;
+    for (auto& button : m_audioEqPresetButtons) button = nullptr;
     lv_obj_t* screen = lv_obj_create(nullptr);
     lv_obj_set_style_bg_color(screen, kBg, 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
@@ -740,6 +745,14 @@ void HifiUi::show(Page page) {
     else if (page == Page::Settings) buildSettings();
     else if (page == Page::SettingsWifi) buildSettingsWifi();
     else if (page == Page::FontPreview) buildFontPreview();
+    else if (page == Page::AudioHome) buildAudioHome();
+    else if (page == Page::AudioDecode) buildAudioDecode();
+    else if (page == Page::AudioOutputDetails) buildAudioOutputDetails();
+    else if (page == Page::AudioOutputPolicy) buildAudioOutputPolicy();
+    else if (page == Page::AudioEq) buildAudioEq();
+    else if (page == Page::AudioEqBand) buildAudioEqBand();
+    else if (page == Page::AudioEffects) buildAudioEffects();
+    else if (page == Page::AudioDac) buildAudioDac();
     else buildPlaceholder("SETTINGS / EQ", "Audio, EQ, network and sleep");
 }
 
@@ -1011,7 +1024,7 @@ void HifiUi::buildHome() {
         {LV_SYMBOL_PLAY, "音乐", Page::LocalNowPlaying},
         {LV_SYMBOL_AUDIO, "电台", Page::Radio},
         {LV_SYMBOL_SD_CARD, "本地", Page::Sd},
-        {LV_SYMBOL_LIST, "解码", Page::Clock},
+        {LV_SYMBOL_LIST, "解码", Page::AudioDecode},
         {LV_SYMBOL_SETTINGS, "设置", Page::Settings},
     };
     constexpr int16_t kNavSlotW = 304 / 5;
@@ -2650,13 +2663,384 @@ void HifiUi::buildSettings() {
     buildStatusBar(screen);
     makeText(screen, "设置", &lv_font_cjk_16, kInk, LV_ALIGN_TOP_LEFT, 12, 28);
 
-    lv_obj_t* wifiCard = makeCard(screen, LV_SYMBOL_WIFI, "WiFi", Page::SettingsWifi, 16, 56, 90, 76);
+    lv_obj_t* wifiCard = makeCard(screen, LV_SYMBOL_WIFI, "WiFi", Page::SettingsWifi, 10, 56, 72, 76);
     (void)wifiCard;
-    lv_obj_t* fontCard = makeCard(screen, LV_SYMBOL_EYE_OPEN, "字体", Page::FontPreview, 116, 56, 90, 76);
+    lv_obj_t* fontCard = makeCard(screen, LV_SYMBOL_EYE_OPEN, "字体", Page::FontPreview, 90, 56, 72, 76);
     (void)fontCard;
-    // EQ/audio/sleep settings aren't built yet -- see Page::Settings's
-    // buildPlaceholder fallback history; this hub only has WiFi so far,
-    // more cards land here as those features are implemented.
+    lv_obj_t* audioCard = makeCard(screen, LV_SYMBOL_AUDIO, "音频", Page::AudioHome, 170, 56, 72, 76);
+    (void)audioCard;
+}
+
+void HifiUi::buildAudioTopBar(const char* title, const char* rightText) {
+    lv_obj_t* screen = lv_scr_act();
+    lv_obj_t* bar = lv_obj_create(screen);
+    lv_obj_set_pos(bar, 0, 0);
+    lv_obj_set_size(bar, 320, 24);
+    lv_obj_set_style_bg_color(bar, kStatusBar, 0);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(bar, 1, 0);
+    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_color(bar, lv_color_hex(0x222744), 0);
+    lv_obj_set_style_pad_all(bar, 0, 0);
+    lv_obj_set_style_radius(bar, 0, 0);
+    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* back = lv_btn_create(bar);
+    lv_obj_set_pos(back, 0, 0);
+    lv_obj_set_size(back, 30, 24);
+    lv_obj_set_style_bg_opa(back, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_shadow_width(back, 0, 0);
+    lv_obj_set_style_border_width(back, 0, 0);
+    lv_obj_set_style_pad_all(back, 0, 0);
+    lv_obj_clear_flag(back, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(back);
+    lv_obj_add_event_cb(back, onTransportAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(kActionBack));
+    makeText(back, LV_SYMBOL_LEFT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_CENTER, 0, 0);
+
+    makeText(bar, title, &lv_font_cjk_16, kInk, LV_ALIGN_CENTER, 0, 0);
+    if (rightText && rightText[0]) {
+        lv_obj_t* right = makeText(bar, rightText, &lv_font_montserrat_10, kInkDim, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_set_width(right, 92);
+        lv_label_set_long_mode(right, LV_LABEL_LONG_DOT);
+    }
+}
+
+lv_obj_t* HifiUi::makeAudioRow(lv_obj_t* parent, int16_t y, const char* icon, const char* label, const char* value, Page page) {
+    lv_obj_t* row = lv_btn_create(parent);
+    lv_obj_set_pos(row, 10, y);
+    lv_obj_set_size(row, 300, 30);
+    lv_obj_set_style_radius(row, 7, 0);
+    lv_obj_set_style_bg_color(row, kPanel, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(row, kInkFaint, 0);
+    lv_obj_set_style_border_width(row, 1, 0);
+    lv_obj_set_style_shadow_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(row);
+    if (page != m_page) lv_obj_add_event_cb(row, onHomeAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(page)));
+
+    makeText(row, icon, &lv_font_montserrat_14, kAccentBright, LV_ALIGN_LEFT_MID, 9, 0);
+    makeText(row, label, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 33, 0);
+    if (value && value[0]) {
+        lv_obj_t* v = makeText(row, value, &lv_font_cjk_13, kInkDim, LV_ALIGN_RIGHT_MID, page != m_page ? -24 : -10, 0);
+        lv_obj_set_width(v, 130);
+        lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
+    }
+    if (page != m_page) makeText(row, LV_SYMBOL_RIGHT, &lv_font_montserrat_12, kInkFaint, LV_ALIGN_RIGHT_MID, -7, 0);
+    return row;
+}
+
+lv_obj_t* HifiUi::makeAudioNavTile(lv_obj_t* parent, int16_t x, int16_t y, int16_t width, const char* icon, const char* title,
+                                   const char* subtitle, Page page, bool selected) {
+    lv_obj_t* tile = lv_btn_create(parent);
+    lv_obj_set_pos(tile, x, y);
+    lv_obj_set_size(tile, width, 64);
+    lv_obj_set_style_radius(tile, 7, 0);
+    lv_obj_set_style_bg_color(tile, selected ? kAccentDeep : kPanel, 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(tile, selected ? kAccentBright : kInkFaint, 0);
+    lv_obj_set_style_border_width(tile, 1, 0);
+    lv_obj_set_style_shadow_width(tile, 0, 0);
+    lv_obj_set_style_pad_all(tile, 0, 0);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(tile);
+    if (page != m_page) lv_obj_add_event_cb(tile, onHomeAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(page)));
+    makeText(tile, icon, &lv_font_montserrat_16, selected ? kInk : kAccentBright, LV_ALIGN_TOP_MID, 0, 8);
+    makeText(tile, title, &lv_font_cjk_13, kInk, LV_ALIGN_CENTER, 0, 8);
+    if (subtitle && subtitle[0]) makeText(tile, subtitle, &lv_font_cjk_13, selected ? kInkDim : kInkFaint, LV_ALIGN_BOTTOM_MID, 0, -6);
+    return tile;
+}
+
+void HifiUi::buildAudioHome() {
+    lv_obj_t* screen = lv_scr_act();
+    buildAudioTopBar("音频");
+    makeAudioNavTile(screen, 10, 34, 94, LV_SYMBOL_AUDIO, "解码与输出", "格式 / 策略", Page::AudioDecode);
+    makeAudioNavTile(screen, 113, 34, 94, LV_SYMBOL_SETTINGS, "EQ 与音效", "三段 / 平衡", Page::AudioEq);
+    makeAudioNavTile(screen, 216, 34, 94, LV_SYMBOL_VOLUME_MAX, "DAC / 耳放", "PCM5100A", Page::AudioDac);
+
+    const PlayerSnapshot state = playerService.snapshot();
+    char line[64];
+    snprintf(line, sizeof(line), "%s · %luk · %ubit", state.codec[0] ? state.codec : "--",
+             static_cast<unsigned long>(state.sampleRate ? state.sampleRate / 1000 : 0), static_cast<unsigned>(state.bitsPerSample));
+    makeAudioRow(screen, 112, LV_SYMBOL_PLAY, "当前输出", line, Page::AudioOutputDetails);
+}
+
+void HifiUi::buildAudioDecode() {
+    lv_obj_t* screen = lv_scr_act();
+    const PlayerSnapshot state = playerService.snapshot();
+    char right[32];
+    snprintf(right, sizeof(right), "%s · %luk", state.codec[0] ? state.codec : "--",
+             static_cast<unsigned long>(state.sampleRate ? state.sampleRate / 1000 : 0));
+    buildAudioTopBar("解码与输出", right);
+
+    char current[64];
+    snprintf(current, sizeof(current), "%luk · %ubit · 立体声",
+             static_cast<unsigned long>(state.sampleRate ? state.sampleRate / 1000 : 0), static_cast<unsigned>(state.bitsPerSample));
+    makeAudioRow(screen, 32, LV_SYMBOL_PLAY, "当前输出", current, Page::AudioOutputDetails);
+    makeAudioRow(screen, 66, LV_SYMBOL_REFRESH, "输出策略", "自动匹配", Page::AudioOutputPolicy);
+    makeAudioRow(screen, 100, LV_SYMBOL_VOLUME_MAX, "响度统一", "关闭", Page::AudioEffects);
+    makeAudioRow(screen, 134, LV_SYMBOL_LOOP, "无缝播放", "未接入", Page::AudioDecode);
+}
+
+void HifiUi::buildAudioOutputDetails() {
+    lv_obj_t* screen = lv_scr_act();
+    const PlayerSnapshot state = playerService.snapshot();
+    buildAudioTopBar("当前输出");
+
+    const char* labels[6] = {"输入格式", "输入采样率", "输入位深", "输出采样率", "输出声道", "码率"};
+    char values[6][24];
+    snprintf(values[0], sizeof(values[0]), "%s", state.codec[0] ? state.codec : "--");
+    snprintf(values[1], sizeof(values[1]), "%lu kHz", static_cast<unsigned long>(state.sampleRate ? state.sampleRate / 1000 : 0));
+    snprintf(values[2], sizeof(values[2]), "%u bit", static_cast<unsigned>(state.bitsPerSample));
+    snprintf(values[3], sizeof(values[3]), "48 kHz");
+    snprintf(values[4], sizeof(values[4]), "立体声");
+    if (state.bitRate) snprintf(values[5], sizeof(values[5]), "%lu kbps", static_cast<unsigned long>(state.bitRate / 1000));
+    else snprintf(values[5], sizeof(values[5]), "--");
+
+    for (uint8_t i = 0; i < 6; ++i) {
+        const int16_t x = 12 + (i % 3) * 102;
+        const int16_t y = 36 + (i / 3) * 58;
+        lv_obj_t* cell = lv_obj_create(screen);
+        lv_obj_set_pos(cell, x, y);
+        lv_obj_set_size(cell, 92, 48);
+        lv_obj_set_style_bg_opa(cell, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(cell, 0, 0);
+        lv_obj_set_style_pad_all(cell, 0, 0);
+        lv_obj_clear_flag(cell, LV_OBJ_FLAG_SCROLLABLE);
+        makeText(cell, LV_SYMBOL_AUDIO, &lv_font_montserrat_16, kAccentBright, LV_ALIGN_TOP_MID, 0, 0);
+        makeText(cell, labels[i], &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 5);
+        makeText(cell, values[i], &lv_font_cjk_13, kInk, LV_ALIGN_BOTTOM_MID, 0, -1);
+    }
+}
+
+void HifiUi::buildAudioOutputPolicy() {
+    lv_obj_t* screen = lv_scr_act();
+    buildAudioTopBar("输出策略");
+    makeAudioNavTile(screen, 14, 50, 90, "A", "自动匹配", "智能选择", Page::AudioOutputPolicy, true);
+    makeAudioNavTile(screen, 115, 50, 90, "O", "原始输出", "保持源格式", Page::AudioOutputPolicy);
+    makeAudioNavTile(screen, 216, 50, 90, "48", "固定48k", "所有转48k", Page::AudioOutputPolicy);
+
+    lv_obj_t* hint = lv_obj_create(screen);
+    lv_obj_set_pos(hint, 14, 130);
+    lv_obj_set_size(hint, 292, 26);
+    lv_obj_set_style_radius(hint, 7, 0);
+    lv_obj_set_style_bg_color(hint, kPanelDeep, 0);
+    lv_obj_set_style_bg_opa(hint, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(hint, 0, 0);
+    lv_obj_set_style_pad_all(hint, 0, 0);
+    lv_obj_clear_flag(hint, LV_OBJ_FLAG_SCROLLABLE);
+    makeText(hint, "i", &lv_font_montserrat_12, kAccentBright, LV_ALIGN_LEFT_MID, 10, 0);
+    makeText(hint, "自动匹配：当前后端固定使用已验证 I2S 输出", &lv_font_cjk_13, kInkDim, LV_ALIGN_LEFT_MID, 30, 0);
+}
+
+void HifiUi::syncAudioToneFromService() {
+    m_audioTone = playerService.toneSettings();
+}
+
+void HifiUi::applyAudioTone(bool force) {
+    const uint32_t now = millis();
+    if (!force && now - m_audioToneLastApplyMs < 80) {
+        m_audioTonePendingApply = true;
+        return;
+    }
+    playerService.setToneSettings(m_audioTone, false);
+    m_audioToneLastApplyMs = now;
+    m_audioTonePendingApply = false;
+}
+
+void HifiUi::scheduleAudioToneSave() {
+    m_audioToneSaveDueMs = millis() + 900;
+}
+
+void HifiUi::processDeferredAudioTone() {
+    const uint32_t now = millis();
+    if (m_audioTonePendingApply && now - m_audioToneLastApplyMs >= 80) applyAudioTone(true);
+    if (m_audioToneSaveDueMs && static_cast<int32_t>(now - m_audioToneSaveDueMs) >= 0) {
+        m_audioToneSaveDueMs = 0;
+        playerService.saveToneSettings();
+    }
+}
+
+void HifiUi::refreshAudioEqControls() {
+    m_audioEqRefreshing = true;
+    const int8_t values[4] = {m_audioTone.low, m_audioTone.mid, m_audioTone.high, m_audioTone.balance};
+    for (uint8_t i = 0; i < 4; ++i) {
+        if (m_audioEqSliders[i]) lv_slider_set_value(m_audioEqSliders[i], values[i], LV_ANIM_OFF);
+        if (m_audioEqValueLabels[i]) {
+            char buf[12];
+            if (m_page == Page::AudioEqBand && i == m_audioEqBandIndex && i != 3) snprintf(buf, sizeof(buf), "%+d dB", static_cast<int>(values[i]));
+            else snprintf(buf, sizeof(buf), "%+d", static_cast<int>(values[i]));
+            lv_label_set_text(m_audioEqValueLabels[i], buf);
+        }
+    }
+    static const int8_t presets[5][3] = {
+        {0, 0, 0}, {1, 2, 1}, {2, 1, 2}, {3, 0, 3}, {4, 0, 1},
+    };
+    for (uint8_t i = 0; i < 5; ++i) {
+        if (!m_audioEqPresetButtons[i]) continue;
+        const bool selected = m_audioTone.low == presets[i][0] && m_audioTone.mid == presets[i][1] && m_audioTone.high == presets[i][2];
+        lv_obj_set_style_bg_color(m_audioEqPresetButtons[i], selected ? kAccentDeep : kPanel, 0);
+        lv_obj_set_style_border_color(m_audioEqPresetButtons[i], selected ? kAccentBright : kInkFaint, 0);
+    }
+    m_audioEqRefreshing = false;
+}
+
+void HifiUi::buildAudioEq() {
+    lv_obj_t* screen = lv_scr_act();
+    syncAudioToneFromService();
+    buildAudioTopBar("EQ 与音效", "ON");
+
+    static const char* presetNames[5] = {"平直", "人声", "流行", "摇滚", "低音"};
+    for (uint8_t i = 0; i < 5; ++i) {
+        lv_obj_t* btn = lv_btn_create(screen);
+        lv_obj_set_pos(btn, 10 + i * 61, 30);
+        lv_obj_set_size(btn, 56, 21);
+        lv_obj_set_style_radius(btn, 5, 0);
+        lv_obj_set_style_bg_color(btn, kPanel, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(btn, kInkFaint, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(btn);
+        lv_obj_add_event_cb(btn, onAudioEqPresetAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+        makeText(btn, presetNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_CENTER, 0, 0);
+        m_audioEqPresetButtons[i] = btn;
+    }
+
+    static const char* bandNames[4] = {"低音", "中音", "高音", "平衡"};
+    static const char* bandSub[4] = {"LOW", "MID", "HIGH", "L/R"};
+    for (uint8_t i = 0; i < 4; ++i) {
+        const int16_t x = 25 + i * 74;
+        lv_obj_t* open = lv_btn_create(screen);
+        lv_obj_set_pos(open, x - 20, 58);
+        lv_obj_set_size(open, 54, 18);
+        lv_obj_set_style_bg_opa(open, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(open, 0, 0);
+        lv_obj_set_style_shadow_width(open, 0, 0);
+        lv_obj_set_style_pad_all(open, 0, 0);
+        lv_obj_clear_flag(open, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(open);
+        lv_obj_add_event_cb(open, onAudioEqBandOpenAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+        m_audioEqValueLabels[i] = makeText(open, "", &lv_font_montserrat_10, kAccentBright, LV_ALIGN_TOP_MID, 0, 0);
+
+        lv_obj_t* slider = lv_slider_create(screen);
+        lv_obj_set_pos(slider, x, 80);
+        lv_obj_set_size(slider, 6, 46);
+        lv_slider_set_range(slider, i == 3 ? -16 : -12, i == 3 ? 16 : 12);
+        lv_obj_set_style_bg_color(slider, kInkFaint, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(slider, LV_OPA_60, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(slider, kAccentBright, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(slider, kAccentBright, LV_PART_KNOB);
+        lv_obj_set_style_pad_all(slider, 4, LV_PART_KNOB);
+        lv_obj_set_style_radius(slider, 3, LV_PART_MAIN);
+        lv_obj_set_style_radius(slider, 3, LV_PART_INDICATOR);
+        lv_obj_add_event_cb(slider, onAudioEqSliderAction, LV_EVENT_VALUE_CHANGED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+        m_audioEqSliders[i] = slider;
+
+        makeText(screen, bandNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, x - 20, 130);
+        makeText(screen, bandSub[i], &lv_font_montserrat_10, kInkFaint, LV_ALIGN_TOP_LEFT, x - 16, 146);
+    }
+
+    lv_obj_t* reset = lv_btn_create(screen);
+    lv_obj_set_pos(reset, 10, 146);
+    lv_obj_set_size(reset, 56, 20);
+    lv_obj_set_style_radius(reset, 6, 0);
+    lv_obj_set_style_bg_color(reset, kPanel, 0);
+    lv_obj_set_style_bg_opa(reset, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(reset, 0, 0);
+    lv_obj_set_style_shadow_width(reset, 0, 0);
+    lv_obj_set_style_pad_all(reset, 0, 0);
+    addPressFx(reset);
+    lv_obj_add_event_cb(reset, onAudioEqPresetAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(0)));
+    makeText(reset, "重置", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t* fx = lv_btn_create(screen);
+    lv_obj_set_pos(fx, 254, 146);
+    lv_obj_set_size(fx, 56, 20);
+    lv_obj_set_style_radius(fx, 6, 0);
+    lv_obj_set_style_bg_color(fx, kPanel, 0);
+    lv_obj_set_style_bg_opa(fx, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(fx, 0, 0);
+    lv_obj_set_style_shadow_width(fx, 0, 0);
+    lv_obj_set_style_pad_all(fx, 0, 0);
+    addPressFx(fx);
+    lv_obj_add_event_cb(fx, onHomeAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(Page::AudioEffects)));
+    makeText(fx, "音效", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
+
+    refreshAudioEqControls();
+}
+
+void HifiUi::buildAudioEqBand() {
+    lv_obj_t* screen = lv_scr_act();
+    syncAudioToneFromService();
+    static const char* names[4] = {"低音", "中音", "高音", "左右平衡"};
+    m_audioEqBandIndex = std::min<uint8_t>(m_audioEqBandIndex, 3);
+    const int8_t values[4] = {m_audioTone.low, m_audioTone.mid, m_audioTone.high, m_audioTone.balance};
+    char right[12];
+    if (m_audioEqBandIndex == 3) snprintf(right, sizeof(right), "%+d", static_cast<int>(values[m_audioEqBandIndex]));
+    else snprintf(right, sizeof(right), "%+d dB", static_cast<int>(values[m_audioEqBandIndex]));
+    buildAudioTopBar(names[m_audioEqBandIndex], right);
+
+    m_audioEqValueLabels[m_audioEqBandIndex] = makeText(screen, "", &lv_font_montserrat_28, kAccentBright, LV_ALIGN_TOP_MID, 0, 44);
+    lv_obj_t* slider = lv_slider_create(screen);
+    lv_obj_set_pos(slider, 36, 92);
+    lv_obj_set_size(slider, 248, 6);
+    lv_slider_set_range(slider, m_audioEqBandIndex == 3 ? -16 : -12, m_audioEqBandIndex == 3 ? 16 : 12);
+    lv_obj_set_style_bg_color(slider, kInkFaint, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider, LV_OPA_60, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider, kAccentBright, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider, kAccentBright, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(slider, 5, LV_PART_KNOB);
+    lv_obj_set_style_radius(slider, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(slider, 3, LV_PART_INDICATOR);
+    lv_obj_add_event_cb(slider, onAudioEqSliderAction, LV_EVENT_VALUE_CHANGED, reinterpret_cast<void*>(static_cast<uintptr_t>(m_audioEqBandIndex)));
+    m_audioEqSliders[m_audioEqBandIndex] = slider;
+    makeText(screen, m_audioEqBandIndex == 3 ? "L" : "-12dB", &lv_font_montserrat_10, kInkDim, LV_ALIGN_TOP_LEFT, 36, 104);
+    makeText(screen, "0", &lv_font_montserrat_10, kInkDim, LV_ALIGN_TOP_MID, 0, 104);
+    makeText(screen, m_audioEqBandIndex == 3 ? "R" : "+12dB", &lv_font_montserrat_10, kInkDim, LV_ALIGN_TOP_RIGHT, -36, 104);
+
+    static const char* labels[3] = {"-", "重置", "+"};
+    for (uint8_t i = 0; i < 3; ++i) {
+        lv_obj_t* btn = lv_btn_create(screen);
+        lv_obj_set_pos(btn, 14 + i * 104, 132);
+        lv_obj_set_size(btn, 86, 26);
+        lv_obj_set_style_radius(btn, 6, 0);
+        lv_obj_set_style_bg_color(btn, kPanel, 0);
+        lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(btn, kInkFaint, 0);
+        lv_obj_set_style_border_width(btn, 1, 0);
+        lv_obj_set_style_shadow_width(btn, 0, 0);
+        lv_obj_set_style_pad_all(btn, 0, 0);
+        lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(btn);
+        lv_obj_add_event_cb(btn, onAudioEqBandAdjustAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+        makeText(btn, labels[i], i == 1 ? &lv_font_cjk_13 : &lv_font_montserrat_16, kInk, LV_ALIGN_CENTER, 0, 0);
+    }
+
+    refreshAudioEqControls();
+}
+
+void HifiUi::buildAudioEffects() {
+    lv_obj_t* screen = lv_scr_act();
+    buildAudioTopBar("音效");
+    m_audioEqBandIndex = 3;
+    makeAudioRow(screen, 34, LV_SYMBOL_SETTINGS, "低音增强", "映射到 EQ", Page::AudioEq);
+    makeAudioRow(screen, 68, LV_SYMBOL_VOLUME_MAX, "响度补偿", "未接入", Page::AudioEffects);
+    makeAudioRow(screen, 102, LV_SYMBOL_AUDIO, "耳机交叉馈送", "未接入", Page::AudioEffects);
+    makeAudioRow(screen, 136, LV_SYMBOL_SHUFFLE, "左右平衡", "可调", Page::AudioEqBand);
+}
+
+void HifiUi::buildAudioDac() {
+    lv_obj_t* screen = lv_scr_act();
+    buildAudioTopBar("DAC / 耳放");
+    makeAudioRow(screen, 32, LV_SYMBOL_AUDIO, "DAC", "PCM5100A", Page::AudioDac);
+    makeAudioRow(screen, 66, LV_SYMBOL_PLAY, "I2S DATA", "GPIO7", Page::AudioDac);
+    makeAudioRow(screen, 100, LV_SYMBOL_REFRESH, "BCLK / LRCK", "GPIO15 / GPIO16", Page::AudioDac);
+    makeAudioRow(screen, 134, LV_SYMBOL_MUTE, "MUTE / AMP", "-1 不控制", Page::AudioDac);
 }
 
 void HifiUi::buildFontPreview() {
@@ -3144,7 +3528,7 @@ void HifiUi::refreshQuickPanel() {
             lv_label_set_text(m_quickBrightnessLabel, buf);
         }
     }
-    const int8_t eq[3] = {m_eqLow, m_eqMid, m_eqHigh};
+    const int8_t eq[3] = {m_audioTone.low, m_audioTone.mid, m_audioTone.high};
     for (uint8_t i = 0; i < 3; ++i) {
         if (!m_quickEqSliders[i]) continue;
         lv_slider_set_value(m_quickEqSliders[i], eq[i], LV_ANIM_OFF);
@@ -3175,15 +3559,82 @@ void HifiUi::onQuickEqAction(lv_event_t* event) {
     const uintptr_t band = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
     if (band > 2 || !s_instance->m_quickEqSliders[band]) return;
     const int32_t db = lv_slider_get_value(s_instance->m_quickEqSliders[band]);
-    if (band == 0) s_instance->m_eqLow = static_cast<int8_t>(db);
-    else if (band == 1) s_instance->m_eqMid = static_cast<int8_t>(db);
-    else s_instance->m_eqHigh = static_cast<int8_t>(db);
-    playerService.setTone(s_instance->m_eqLow, s_instance->m_eqMid, s_instance->m_eqHigh);
+    if (band == 0) s_instance->m_audioTone.low = static_cast<int8_t>(db);
+    else if (band == 1) s_instance->m_audioTone.mid = static_cast<int8_t>(db);
+    else s_instance->m_audioTone.high = static_cast<int8_t>(db);
+    s_instance->applyAudioTone();
+    s_instance->scheduleAudioToneSave();
     if (s_instance->m_quickEqLabels[band]) {
         char buf[8];
         snprintf(buf, sizeof(buf), "%+ddB", static_cast<int>(db));
         lv_label_set_text(s_instance->m_quickEqLabels[band], buf);
     }
+    s_instance->refreshAudioEqControls();
+}
+
+void HifiUi::onAudioEqPresetAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t preset = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    static const AudioToneSettings presets[5] = {
+        {0, 0, 0, 0}, {1, 2, 1, 0}, {2, 1, 2, 0}, {3, 0, 3, 0}, {4, 0, 1, 0},
+    };
+    if (preset >= 5) return;
+    s_instance->m_audioTone.low = presets[preset].low;
+    s_instance->m_audioTone.mid = presets[preset].mid;
+    s_instance->m_audioTone.high = presets[preset].high;
+    s_instance->applyAudioTone(true);
+    s_instance->scheduleAudioToneSave();
+    s_instance->refreshAudioEqControls();
+    if (s_instance->m_quickPanelOpen) s_instance->refreshQuickPanel();
+}
+
+void HifiUi::onAudioEqSliderAction(lv_event_t* event) {
+    if (!s_instance) return;
+    if (s_instance->m_audioEqRefreshing) return;
+    const uintptr_t band = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    if (band > 3 || !s_instance->m_audioEqSliders[band]) return;
+    const int8_t value = static_cast<int8_t>(lv_slider_get_value(s_instance->m_audioEqSliders[band]));
+    if (band == 0) s_instance->m_audioTone.low = value;
+    else if (band == 1) s_instance->m_audioTone.mid = value;
+    else if (band == 2) s_instance->m_audioTone.high = value;
+    else s_instance->m_audioTone.balance = value;
+    s_instance->applyAudioTone();
+    s_instance->scheduleAudioToneSave();
+    s_instance->refreshAudioEqControls();
+    if (s_instance->m_quickPanelOpen) s_instance->refreshQuickPanel();
+}
+
+void HifiUi::onAudioEqBandOpenAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t band = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    if (band > 3) return;
+    s_instance->m_audioEqBandIndex = band;
+    s_instance->show(Page::AudioEqBand);
+}
+
+void HifiUi::onAudioEqBandAdjustAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t action = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    const uint8_t band = std::min<uint8_t>(s_instance->m_audioEqBandIndex, 3);
+    int8_t* value = nullptr;
+    int8_t minValue = -12;
+    int8_t maxValue = 12;
+    if (band == 0) value = &s_instance->m_audioTone.low;
+    else if (band == 1) value = &s_instance->m_audioTone.mid;
+    else if (band == 2) value = &s_instance->m_audioTone.high;
+    else {
+        value = &s_instance->m_audioTone.balance;
+        minValue = -16;
+        maxValue = 16;
+    }
+    if (!value) return;
+    if (action == 0) *value = static_cast<int8_t>(std::max<int>(minValue, *value - 1));
+    else if (action == 1) *value = 0;
+    else if (action == 2) *value = static_cast<int8_t>(std::min<int>(maxValue, *value + 1));
+    s_instance->applyAudioTone(true);
+    s_instance->scheduleAudioToneSave();
+    s_instance->refreshAudioEqControls();
+    if (s_instance->m_quickPanelOpen) s_instance->refreshQuickPanel();
 }
 
 void HifiUi::refresh() {

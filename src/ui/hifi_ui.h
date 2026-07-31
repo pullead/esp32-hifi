@@ -12,7 +12,26 @@ class HifiUi {
     // 320x170 design spec: docs/UI_DESIGN_SPEC.md. RadioList is the station
     // browser reached from the Radio page's List slot; NowPlaying/Radio
     // themselves share one skeleton (buildMediaPage) per that spec.
-    enum class Page : uint8_t { Home, NowPlaying, Radio, RadioList, Sd, LocalNowPlaying, Clock, Settings, SettingsWifi, FontPreview };
+    enum class Page : uint8_t {
+        Home,
+        NowPlaying,
+        Radio,
+        RadioList,
+        Sd,
+        LocalNowPlaying,
+        Clock,
+        Settings,
+        SettingsWifi,
+        FontPreview,
+        AudioHome,
+        AudioDecode,
+        AudioOutputDetails,
+        AudioOutputPolicy,
+        AudioEq,
+        AudioEqBand,
+        AudioEffects,
+        AudioDac
+    };
     // Cycled by tapping the play-mode button: 顺序播放 (stop at the end of
     // the filtered list) -> 列表循环 (wrap back to the start) -> 单曲循环
     // (replay the same track) -> 随机播放 (genuine random pick) -> back to
@@ -44,6 +63,10 @@ class HifiUi {
     static void onQuickVolumeAction(lv_event_t* event);
     static void onQuickBrightnessAction(lv_event_t* event);
     static void onQuickEqAction(lv_event_t* event);
+    static void onAudioEqPresetAction(lv_event_t* event);
+    static void onAudioEqSliderAction(lv_event_t* event);
+    static void onAudioEqBandOpenAction(lv_event_t* event);
+    static void onAudioEqBandAdjustAction(lv_event_t* event);
 
     void show(Page page);
     void buildHome();
@@ -67,6 +90,23 @@ class HifiUi {
     void buildSettings();
     void buildSettingsWifi();
     void buildFontPreview();
+    void buildAudioHome();
+    void buildAudioDecode();
+    void buildAudioOutputDetails();
+    void buildAudioOutputPolicy();
+    void buildAudioEq();
+    void buildAudioEqBand();
+    void buildAudioEffects();
+    void buildAudioDac();
+    void buildAudioTopBar(const char* title, const char* rightText = nullptr);
+    lv_obj_t* makeAudioRow(lv_obj_t* parent, int16_t y, const char* icon, const char* label, const char* value, Page page);
+    lv_obj_t* makeAudioNavTile(lv_obj_t* parent, int16_t x, int16_t y, int16_t width, const char* icon, const char* title,
+                               const char* subtitle, Page page, bool selected = false);
+    void syncAudioToneFromService();
+    void applyAudioTone(bool force = false);
+    void scheduleAudioToneSave();
+    void processDeferredAudioTone();
+    void refreshAudioEqControls();
     void refreshSettingsWifi(const struct PlayerSnapshot& state);
     void buildStatusBar(lv_obj_t* screen);
     void buildQuickPanel();
@@ -341,9 +381,13 @@ class HifiUi {
     lv_obj_t* m_quickEqSliders[3] = {nullptr, nullptr, nullptr}; // low, mid, high
     lv_obj_t* m_quickEqLabels[3] = {nullptr, nullptr, nullptr};
     bool m_quickPanelOpen = false;
-    // audio.setTone() is write-only (no getter), so the current gains have
-    // to be tracked here to seed the sliders and compute new values.
-    int8_t m_eqLow = 0;
-    int8_t m_eqMid = 0;
-    int8_t m_eqHigh = 0;
+    AudioToneSettings m_audioTone{};
+    lv_obj_t* m_audioEqSliders[4] = {nullptr, nullptr, nullptr, nullptr}; // low, mid, high, balance
+    lv_obj_t* m_audioEqValueLabels[4] = {nullptr, nullptr, nullptr, nullptr};
+    lv_obj_t* m_audioEqPresetButtons[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    uint8_t m_audioEqBandIndex = 0;
+    uint32_t m_audioToneLastApplyMs = 0;
+    uint32_t m_audioToneSaveDueMs = 0;
+    bool m_audioTonePendingApply = false;
+    bool m_audioEqRefreshing = false;
 };

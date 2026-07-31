@@ -5,7 +5,8 @@ param(
     [int]$Jobs = 1,
     [switch]$Clean,
     [switch]$UseSubst,
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$FullBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +69,7 @@ Write-Host "Build workdir: $workDir"
 Write-Host "PlatformIO: $($pio.FullName)"
 Write-Host "Environment: $Environment"
 Write-Host "Jobs: $Jobs"
+Write-Host "Target: $(if ($FullBuild) { 'default full build' } else { 'buildprog' })"
 
 if ($CheckOnly) {
     exit 0
@@ -79,7 +81,11 @@ try {
         & $pio.FullName run -e $Environment -t clean
         if ($LASTEXITCODE -ne 0) { throw "PlatformIO clean failed." }
     }
-    & $pio.FullName run -e $Environment -j $Jobs
+    if ($FullBuild) {
+        & $pio.FullName run -e $Environment -j $Jobs
+    } else {
+        & $pio.FullName run -e $Environment -t buildprog -j $Jobs
+    }
     if ($LASTEXITCODE -ne 0) { throw "PlatformIO build failed." }
 } finally {
     Pop-Location
