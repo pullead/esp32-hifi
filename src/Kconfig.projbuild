@@ -1,0 +1,78 @@
+# espressif/tinyusb (the managed component pulled in via platformio.ini's
+# custom_component_add) ships no Kconfig at all -- and the "arduino_tinyusb"
+# component that arduino-esp32's CMakeLists.txt references via
+# `if(...AND CONFIG_TINYUSB_ENABLED) maybe_add_component(arduino_tinyusb)`
+# doesn't exist in the ESP Component Registry (confirmed via the registry
+# API: ComponentNotFoundError) -- it's a component that only exists inside
+# espressif/esp32-arduino-lib-builder, used to produce the prebuilt
+# esp32-arduino-libs that the Arduino IDE / official release ships. This
+# project builds arduino-esp32 from source instead, so none of that
+# component's Kconfig ever gets pulled in, which is why CONFIG_TINYUSB_*
+# were always being silently dropped by custom_sdkconfig -- there was
+# nothing to bind the values to.
+#
+# Symbol names below mirror esp32-arduino-lib-builder's own
+# components/arduino_tinyusb/Kconfig.projbuild (trimmed to just the bools
+# arduino-esp32's C++ wrapper code actually branches on -- see
+# src/tusb_config.h, which hardcodes buffer sizes instead of piping them
+# through Kconfig ints since this project doesn't need them tunable).
+#
+# PlatformIO registers this project's src/ directory as its own ESP-IDF
+# component (see espidf.py's EXTRA_COMPONENT_DIRS handling), and ESP-IDF's
+# Kconfig collection walks every component root for a Kconfig.projbuild file
+# regardless of whether that component's CMakeLists.txt is hand-written or
+# auto-generated -- so declaring the symbols here makes them real everywhere
+# needed and lets platformio.ini's per-env custom_sdkconfig lines bind.
+
+menu "TinyUSB (project-local shim for arduino-esp32's CONFIG_TINYUSB_*)"
+    depends on SOC_USB_OTG_SUPPORTED
+
+    config TINYUSB_ENABLED
+        bool "Enable TinyUSB driver"
+        default n
+        help
+            Adds support for TinyUSB.
+
+    config TINYUSB_CDC_ENABLED
+        bool "Enable USB Serial (CDC) TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+        help
+            arduino-esp32's USB.h declares String-typed descriptor fields
+            unconditionally once TINYUSB_ENABLED, but only pulls in
+            WString.h via USBCDC.h -> Stream.h -> Print.h -> WString.h, and
+            that chain only compiles when this is set -- so this needs to be
+            on even though this project never actually uses USB CDC at
+            runtime (ARDUINO_USB_MODE=0 keeps Serial on UART).
+
+    config TINYUSB_MSC_ENABLED
+        bool "Enable USB Mass Storage (MSC) TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+
+    config TINYUSB_HID_ENABLED
+        bool "Enable USB Human Interface (HID) TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+
+    config TINYUSB_MIDI_ENABLED
+        bool "Enable USB MIDI TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+
+    config TINYUSB_VENDOR_ENABLED
+        bool "Enable USB VENDOR TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+
+    config TINYUSB_DFU_ENABLED
+        bool "Enable USB DFU TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+
+    config TINYUSB_DFU_RT_ENABLED
+        bool "Enable USB DFU Runtime TinyUSB driver"
+        depends on TINYUSB_ENABLED
+        default n
+
+endmenu
