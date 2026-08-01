@@ -1436,6 +1436,45 @@ static volatile uint32_t s_usbStorageLastAccessMs = 0;
 static USBMSC s_usbMsc;
 static bool s_usbMscConfigured = false;
 static bool s_usbStarted = false;
+static constexpr bool kUsbMscReadOnlyProbe = true;
+
+static uint32_t usbMscLe32(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static bool usbMscMbrFitsDevice(const uint8_t* lba0, uint32_t sectorCount) {
+    if (!lba0) return true;
+    if (lba0[510] != 0x55 || lba0[511] != 0xAA) {
+        printf("[USBMSC] no MBR boot signature, skip partition-bound check\n");
+        return true;
+    }
+
+    bool sawPartition = false;
+    bool fits = true;
+    for (uint8_t i = 0; i < 4; ++i) {
+        const uint8_t* entry = lba0 + 446 + i * 16;
+        const uint8_t type = entry[4];
+        const uint32_t start = usbMscLe32(entry + 8);
+        const uint32_t count = usbMscLe32(entry + 12);
+        if (type == 0 || count == 0) continue;
+        sawPartition = true;
+
+        const uint64_t end = static_cast<uint64_t>(start) + static_cast<uint64_t>(count) - 1ULL;
+        printf("[USBMSC] mbr part%u type=0x%02X start=%u sectors=%u end=%llu\n",
+               static_cast<unsigned>(i + 1), type, static_cast<unsigned>(start), static_cast<unsigned>(count),
+               static_cast<unsigned long long>(end));
+        if (end >= sectorCount) {
+            printf("[USBMSC] ERROR: partition end %llu exceeds exposed sectors %u\n",
+                   static_cast<unsigned long long>(end), static_cast<unsigned>(sectorCount));
+            fits = false;
+        }
+    }
+    if (!sawPartition) printf("[USBMSC] MBR signature present, no usable partition entries\n");
+    return fits;
+}
 #endif
 
 static bool usbStorageBlocksSdAppAccess() {
@@ -1858,6 +1897,7 @@ static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t 
 }
 
 static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
+    if (kUsbMscReadOnlyProbe) return -1;
     if (s_usbStorageState != UsbStorageState::Mounted || !buffer) return -1;
     const uint32_t secSize = SD_MMC.sectorSize();
     if (!secSize) return -1;
@@ -1899,6 +1939,14 @@ static void usbStorageMountTask(void*) {
     vTaskDelay(pdMS_TO_TICKS(250));
 
     const int sectorSize = SD_MMC.sectorSize();
+    if (sectorSize <= 0) {
+        MWR_LOG_ERROR("USB MSC mount failed: invalid SD sector size");
+        s_usbStorageState = UsbStorageState::Error;
+        s_usbStorageBusy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+
     // NOT SD_MMC.numSectors(): despite the name, that returns the mounted
     // FAT filesystem's *data area* cluster count (totalBytes()/sectorSize(),
     // where totalBytes() comes from f_getfree()'s cluster accounting) --
@@ -1913,14 +1961,16 @@ static void usbStorageMountTask(void*) {
     // 125,173,759, but numSectors() only reported 123,217,825). cardSize()
     // returns the actual physical capacity (csd.capacity * csd.sector_size),
     // which is what a raw block-device passthrough needs.
-    const uint32_t sectorCount = static_cast<uint32_t>(SD_MMC.cardSize() / sectorSize);
-    if (sectorSize <= 0 || sectorCount == 0) {
+    const uint64_t cardBytes = SD_MMC.cardSize();
+    const uint64_t sectorCount64 = cardBytes / static_cast<uint32_t>(sectorSize);
+    if (cardBytes == 0 || sectorCount64 == 0 || sectorCount64 > 0xFFFFFFFFULL) {
         MWR_LOG_ERROR("USB MSC mount failed: invalid SD sector geometry");
         s_usbStorageState = UsbStorageState::Error;
         s_usbStorageBusy = false;
         vTaskDelete(nullptr);
         return;
     }
+    const uint32_t sectorCount = static_cast<uint32_t>(sectorCount64);
 
     // Diagnostic dump before USB.begin() -- once the native USB peripheral
     // switches into TinyUSB device mode, this board's single USB-C port
@@ -1932,8 +1982,12 @@ static void usbStorageMountTask(void*) {
     // what the SD card is actually handing back.
     {
         uint8_t lba0[512];
-        printf("[USBMSC] pre-mount sectorSize=%d sectorCount=%u\n", sectorSize, static_cast<unsigned>(sectorCount));
+        bool lba0Ok = false;
+        printf("[USBMSC] pre-mount cardBytes=%llu sectorSize=%d sectorCount=%u mode=%s\n",
+               static_cast<unsigned long long>(cardBytes), sectorSize, static_cast<unsigned>(sectorCount),
+               kUsbMscReadOnlyProbe ? "read-only" : "read-write");
         if (sectorSize <= (int)sizeof(lba0) && SD_MMC.readRAW(lba0, 0)) {
+            lba0Ok = true;
             auto dumpRange = [&](const char* label, int start, int len) {
                 char line[256];
                 int pos = snprintf(line, sizeof(line), "[USBMSC] lba0[%d..%d] (%s):", start, start + len - 1, label);
@@ -1956,6 +2010,13 @@ static void usbStorageMountTask(void*) {
             printf("[USBMSC] readRAW(lba0) FAILED\n");
         }
         fflush(stdout);
+        if (lba0Ok && !usbMscMbrFitsDevice(lba0, sectorCount)) {
+            MWR_LOG_ERROR("USB MSC mount failed: SD partition exceeds exposed device size");
+            s_usbStorageState = UsbStorageState::Error;
+            s_usbStorageBusy = false;
+            vTaskDelete(nullptr);
+            return;
+        }
     }
 
     if (!s_usbMscConfigured) {
@@ -1969,7 +2030,7 @@ static void usbStorageMountTask(void*) {
     }
     s_usbStorageHostEjected = false;
     s_usbStorageLastAccessMs = millis();
-    s_usbMsc.isWritable(true);
+    s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
     s_usbMsc.mediaPresent(true);
     if (!s_usbMsc.begin(static_cast<uint32_t>(sectorCount), static_cast<uint16_t>(sectorSize))) {
         MWR_LOG_ERROR("USB MSC begin failed");
