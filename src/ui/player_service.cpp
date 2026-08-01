@@ -33,6 +33,7 @@ extern uint16_t playerCoreLocalLibraryCount();
 extern bool playerCoreLocalTrack(uint16_t index, LocalTrackItem* item);
 extern bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight);
 extern UsbStorageState playerCoreUsbStorageState();
+extern bool playerCoreUsbStorageStats(UsbStorageStats* out);
 extern bool playerCoreUsbStorageMount();
 extern bool playerCoreUsbStorageUnmount();
 extern void playerCoreRadioIconSyncStart();
@@ -179,6 +180,8 @@ uint16_t PlayerService::localLibraryCount() const { return playerCoreLocalLibrar
 bool PlayerService::localTrack(uint16_t index, LocalTrackItem* item) const { return playerCoreLocalTrack(index, item); }
 
 UsbStorageState PlayerService::usbStorageState() const { return playerCoreUsbStorageState(); }
+
+bool PlayerService::usbStorageStats(UsbStorageStats* out) const { return playerCoreUsbStorageStats(out); }
 
 bool PlayerService::usbStorageMount() { return playerCoreUsbStorageMount(); }
 

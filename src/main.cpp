@@ -13,6 +13,7 @@
 #include <cstring>
 #include <freertos/queue.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <esp_wifi.h>
 #include <cctype>
 
@@ -1431,12 +1432,31 @@ static volatile bool s_localLibraryScanning = false;
 static volatile bool s_usbStorageBusy = false;
 static volatile bool s_usbStorageHostEjected = false;
 static volatile uint32_t s_usbStorageLastAccessMs = 0;
+static volatile uint32_t s_usbMscReadCount = 0;
+static volatile uint32_t s_usbMscWriteCount = 0;
+static volatile uint32_t s_usbMscReadFailCount = 0;
+static volatile uint32_t s_usbMscWriteFailCount = 0;
+static volatile uint32_t s_usbMscLastLba = 0;
+static volatile uint32_t s_usbMscMinLba = 0;
+static volatile uint32_t s_usbMscMaxLba = 0;
+static volatile uint32_t s_usbMscLastOffset = 0;
+static volatile uint32_t s_usbMscLastSize = 0;
+static volatile uint32_t s_usbMscMaxSize = 0;
+static volatile int32_t s_usbMscLastResult = 0;
+static uint32_t s_usbMscLbaBase = 0;
+static uint32_t s_usbMscBlockCount = 0;
 
 #if MWR_USB_MSC_SUPPORTED
 static USBMSC s_usbMsc;
 static bool s_usbMscConfigured = false;
 static bool s_usbStarted = false;
-static constexpr bool kUsbMscReadOnlyProbe = true;
+static constexpr bool kUsbMscReadOnlyProbe = false;
+static constexpr bool kUsbMscExposePartitionOnly = false;
+static constexpr bool kUsbMscBootPresentProbe = true;
+
+static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize);
+static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize);
+static bool usbMscStartStop(uint8_t powerCondition, bool start, bool loadEject);
 
 static uint32_t usbMscLe32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) |
@@ -1474,6 +1494,109 @@ static bool usbMscMbrFitsDevice(const uint8_t* lba0, uint32_t sectorCount) {
     }
     if (!sawPartition) printf("[USBMSC] MBR signature present, no usable partition entries\n");
     return fits;
+}
+
+static bool usbMscFindFirstPartition(const uint8_t* lba0, uint32_t sectorCount, uint32_t* outStart, uint32_t* outCount) {
+    if (!lba0 || !outStart || !outCount || lba0[510] != 0x55 || lba0[511] != 0xAA) return false;
+    for (uint8_t i = 0; i < 4; ++i) {
+        const uint8_t* entry = lba0 + 446 + i * 16;
+        const uint8_t type = entry[4];
+        const uint32_t start = usbMscLe32(entry + 8);
+        const uint32_t count = usbMscLe32(entry + 12);
+        if (type == 0 || count == 0 || start == 0) continue;
+        const uint64_t end = static_cast<uint64_t>(start) + static_cast<uint64_t>(count) - 1ULL;
+        if (end >= sectorCount) continue;
+        *outStart = start;
+        *outCount = count;
+        return true;
+    }
+    return false;
+}
+
+static bool usbStoragePrepareMsc(bool mediaPresent) {
+    const int sectorSize = SD_MMC.sectorSize();
+    if (sectorSize <= 0) {
+        MWR_LOG_ERROR("USB MSC init failed: invalid SD sector size");
+        return false;
+    }
+
+    const uint64_t cardBytes = SD_MMC.cardSize();
+    const uint64_t sectorCount64 = cardBytes / static_cast<uint32_t>(sectorSize);
+    if (cardBytes == 0 || sectorCount64 == 0 || sectorCount64 > 0xFFFFFFFFULL) {
+        MWR_LOG_ERROR("USB MSC init failed: invalid SD sector geometry");
+        return false;
+    }
+    const uint32_t sectorCount = static_cast<uint32_t>(sectorCount64);
+
+    uint32_t exposedBase = 0;
+    uint32_t exposedCount = sectorCount;
+    {
+        uint8_t lba0[512];
+        bool lba0Ok = false;
+        printf("[USBMSC] init cardBytes=%llu sectorSize=%d sectorCount=%u mode=%s media=%u\n",
+               static_cast<unsigned long long>(cardBytes), sectorSize, static_cast<unsigned>(sectorCount),
+               kUsbMscReadOnlyProbe ? "read-only" : "read-write", static_cast<unsigned>(mediaPresent));
+        if (sectorSize <= (int)sizeof(lba0) && SD_MMC.readRAW(lba0, 0)) {
+            lba0Ok = true;
+            printf("[USBMSC] lba0 bootsig[510..511]= %02X %02X\n", lba0[510], lba0[511]);
+        } else {
+            printf("[USBMSC] readRAW(lba0) FAILED\n");
+        }
+        fflush(stdout);
+        if (lba0Ok && !usbMscMbrFitsDevice(lba0, sectorCount)) {
+            MWR_LOG_ERROR("USB MSC init failed: SD partition exceeds exposed device size");
+            return false;
+        }
+        if (lba0Ok && kUsbMscExposePartitionOnly) {
+            uint32_t partStart = 0;
+            uint32_t partCount = 0;
+            if (usbMscFindFirstPartition(lba0, sectorCount, &partStart, &partCount)) {
+                exposedBase = partStart;
+                exposedCount = partCount;
+            }
+        }
+    }
+    s_usbMscLbaBase = exposedBase;
+    s_usbMscBlockCount = exposedCount;
+    printf("[USBMSC] expose base=%u blocks=%u partitionOnly=%u\n",
+           static_cast<unsigned>(s_usbMscLbaBase), static_cast<unsigned>(s_usbMscBlockCount),
+           static_cast<unsigned>(kUsbMscExposePartitionOnly));
+
+    if (!s_usbMscConfigured) {
+        s_usbMsc.vendorID("ESP32S3");
+        s_usbMsc.productID("HiFi SD");
+        s_usbMsc.productRevision("1.0");
+        s_usbMsc.onRead(usbMscRead);
+        s_usbMsc.onWrite(usbMscWrite);
+        s_usbMsc.onStartStop(usbMscStartStop);
+        s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
+        s_usbMsc.mediaPresent(mediaPresent);
+        if (!s_usbMsc.begin(static_cast<uint32_t>(s_usbMscBlockCount), static_cast<uint16_t>(sectorSize))) {
+            MWR_LOG_ERROR("USB MSC begin failed");
+            s_usbMsc.mediaPresent(false);
+            return false;
+        }
+        s_usbMscConfigured = true;
+    } else {
+        s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
+        s_usbMsc.mediaPresent(mediaPresent);
+    }
+
+    if (!s_usbStarted) {
+        USB.manufacturerName("ESP32-S3 HiFi");
+        USB.productName("HiFi SD Card");
+        printf("[USBMSC] before boot USB.begin resetReason=%d\n", static_cast<int>(esp_reset_reason()));
+        fflush(stdout);
+        s_usbStarted = USB.begin();
+        printf("[USBMSC] after boot USB.begin ok=%u resetReason=%d\n", static_cast<unsigned>(s_usbStarted), static_cast<int>(esp_reset_reason()));
+        fflush(stdout);
+        if (!s_usbStarted) {
+            MWR_LOG_ERROR("USB begin failed");
+            s_usbMsc.mediaPresent(false);
+            return false;
+        }
+    }
+    return true;
 }
 #endif
 
@@ -1868,62 +1991,117 @@ bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16
 }
 
 #if MWR_USB_MSC_SUPPORTED
+static bool usbStorageAllowsMscIo() {
+    return s_usbStorageState == UsbStorageState::Mounting || s_usbStorageState == UsbStorageState::Mounted;
+}
+
+static bool usbMscRequestFits(uint32_t lba, uint32_t offset, uint32_t size, uint32_t sectorSize) {
+    if (sectorSize == 0 || s_usbMscBlockCount == 0) return false;
+    if (offset >= sectorSize) return false;
+    if (size == 0) return lba < s_usbMscBlockCount;
+
+    const uint64_t begin = static_cast<uint64_t>(lba) * sectorSize + offset;
+    const uint64_t end = begin + size;
+    const uint64_t limit = static_cast<uint64_t>(s_usbMscBlockCount) * sectorSize;
+    return end <= limit;
+}
+
+static int32_t usbMscRecordResult(bool write, uint32_t lba, uint32_t offset, uint32_t size, int32_t result) {
+    s_usbMscLastLba = lba;
+    const uint32_t accessCount = size ? ((offset + size + 511) / 512) : 1;
+    const uint32_t endLba = lba + accessCount - 1;
+    const uint32_t totalCount = s_usbMscReadCount + s_usbMscWriteCount;
+    if (totalCount == 0 || lba < s_usbMscMinLba) s_usbMscMinLba = lba;
+    if (endLba > s_usbMscMaxLba) s_usbMscMaxLba = endLba;
+    s_usbMscLastOffset = offset;
+    s_usbMscLastSize = size;
+    if (size > s_usbMscMaxSize) s_usbMscMaxSize = size;
+    s_usbMscLastResult = result;
+    if (write) {
+        ++s_usbMscWriteCount;
+        if (result < 0 || static_cast<uint32_t>(result) != size) ++s_usbMscWriteFailCount;
+    } else {
+        ++s_usbMscReadCount;
+        if (result < 0 || static_cast<uint32_t>(result) != size) ++s_usbMscReadFailCount;
+    }
+    return result;
+}
+
 static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
-    if (s_usbStorageState != UsbStorageState::Mounted || !buffer) return -1;
+    if (!usbStorageAllowsMscIo() || !buffer) return usbMscRecordResult(false, lba, offset, bufsize, -1);
     const uint32_t secSize = SD_MMC.sectorSize();
-    if (!secSize) return -1;
+    if (!secSize) return usbMscRecordResult(false, lba, offset, bufsize, -1);
+    if (!usbMscRequestFits(lba, offset, bufsize, secSize)) {
+        return usbMscRecordResult(false, lba, offset, bufsize, -1);
+    }
     s_usbStorageLastAccessMs = millis();
 
     if (offset == 0 && (bufsize % secSize) == 0) {
         for (uint32_t done = 0; done < bufsize; done += secSize) {
-            if (!SD_MMC.readRAW(static_cast<uint8_t*>(buffer) + done, lba + done / secSize)) return -1;
+            const uint32_t hostLba = lba + done / secSize;
+            const uint32_t physicalLba = s_usbMscLbaBase + hostLba;
+            if (!SD_MMC.readRAW(static_cast<uint8_t*>(buffer) + done, physicalLba)) {
+                return usbMscRecordResult(false, hostLba, offset, bufsize, -1);
+            }
         }
-        return static_cast<int32_t>(bufsize);
+        return usbMscRecordResult(false, lba, offset, bufsize, static_cast<int32_t>(bufsize));
     }
 
     uint8_t sector[512];
-    if (secSize > sizeof(sector)) return -1;
+    if (secSize > sizeof(sector)) return usbMscRecordResult(false, lba, offset, bufsize, -1);
     uint32_t done = 0;
     while (done < bufsize) {
         const uint32_t absolute = offset + done;
-        const uint32_t sectorLba = lba + absolute / secSize;
+        const uint32_t hostLba = lba + absolute / secSize;
+        const uint32_t physicalLba = s_usbMscLbaBase + hostLba;
         const uint32_t inSector = absolute % secSize;
         const uint32_t chunk = std::min<uint32_t>(bufsize - done, secSize - inSector);
-        if (!SD_MMC.readRAW(sector, sectorLba)) return -1;
+        if (!SD_MMC.readRAW(sector, physicalLba)) return usbMscRecordResult(false, hostLba, offset, bufsize, -1);
         memcpy(static_cast<uint8_t*>(buffer) + done, sector + inSector, chunk);
         done += chunk;
     }
-    return static_cast<int32_t>(bufsize);
+    return usbMscRecordResult(false, lba, offset, bufsize, static_cast<int32_t>(bufsize));
 }
 
 static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
-    if (kUsbMscReadOnlyProbe) return -1;
-    if (s_usbStorageState != UsbStorageState::Mounted || !buffer) return -1;
+    if (kUsbMscReadOnlyProbe) {
+        s_usbStorageLastAccessMs = millis();
+        return usbMscRecordResult(true, lba, offset, bufsize, -1);
+    }
+    if (!usbStorageAllowsMscIo() || !buffer) return usbMscRecordResult(true, lba, offset, bufsize, -1);
     const uint32_t secSize = SD_MMC.sectorSize();
-    if (!secSize) return -1;
+    if (!secSize) return usbMscRecordResult(true, lba, offset, bufsize, -1);
+    if (!usbMscRequestFits(lba, offset, bufsize, secSize)) {
+        return usbMscRecordResult(true, lba, offset, bufsize, -1);
+    }
     s_usbStorageLastAccessMs = millis();
 
     if (offset == 0 && (bufsize % secSize) == 0) {
         for (uint32_t done = 0; done < bufsize; done += secSize) {
-            if (!SD_MMC.writeRAW(buffer + done, lba + done / secSize)) return -1;
+            const uint32_t hostLba = lba + done / secSize;
+            const uint32_t physicalLba = s_usbMscLbaBase + hostLba;
+            if (!SD_MMC.writeRAW(buffer + done, physicalLba)) {
+                return usbMscRecordResult(true, hostLba, offset, bufsize, -1);
+            }
         }
-        return static_cast<int32_t>(bufsize);
+        return usbMscRecordResult(true, lba, offset, bufsize, static_cast<int32_t>(bufsize));
     }
 
     uint8_t sector[512];
-    if (secSize > sizeof(sector)) return -1;
+    if (secSize > sizeof(sector)) return usbMscRecordResult(true, lba, offset, bufsize, -1);
     uint32_t done = 0;
     while (done < bufsize) {
         const uint32_t absolute = offset + done;
-        const uint32_t sectorLba = lba + absolute / secSize;
+        const uint32_t hostLba = lba + absolute / secSize;
+        const uint32_t physicalLba = s_usbMscLbaBase + hostLba;
         const uint32_t inSector = absolute % secSize;
         const uint32_t chunk = std::min<uint32_t>(bufsize - done, secSize - inSector);
-        if (!SD_MMC.readRAW(sector, sectorLba)) return -1;
+        if (!SD_MMC.readRAW(sector, physicalLba)) return usbMscRecordResult(true, hostLba, offset, bufsize, -1);
         memcpy(sector + inSector, buffer + done, chunk);
-        if (!SD_MMC.writeRAW(sector, sectorLba)) return -1;
+        if (!SD_MMC.writeRAW(sector, physicalLba)) return usbMscRecordResult(true, hostLba, offset, bufsize, -1);
         done += chunk;
     }
-    return static_cast<int32_t>(bufsize);
+    return usbMscRecordResult(true, lba, offset, bufsize, static_cast<int32_t>(bufsize));
 }
 
 static bool usbMscStartStop(uint8_t powerCondition, bool start, bool loadEject) {
@@ -1934,9 +2112,49 @@ static bool usbMscStartStop(uint8_t powerCondition, bool start, bool loadEject) 
 
 static void usbStorageMountTask(void*) {
     s_usbStorageState = UsbStorageState::Mounting;
+    s_usbMscReadCount = 0;
+    s_usbMscWriteCount = 0;
+    s_usbMscReadFailCount = 0;
+    s_usbMscWriteFailCount = 0;
+    s_usbMscLastLba = 0;
+    s_usbMscMinLba = 0;
+    s_usbMscMaxLba = 0;
+    s_usbMscLastOffset = 0;
+    s_usbMscLastSize = 0;
+    s_usbMscMaxSize = 0;
+    s_usbMscLastResult = 0;
     stopSong();
     s_memLogLocalAtSec = 0;
+
+    const uint32_t scanWaitStart = millis();
+    while (s_localLibraryScanning && millis() - scanWaitStart < 10000) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    if (s_localLibraryScanning) {
+        MWR_LOG_ERROR("USB MSC mount failed: local SD scan did not stop in time");
+        s_usbStorageState = UsbStorageState::Error;
+        s_usbStorageBusy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
     vTaskDelay(pdMS_TO_TICKS(250));
+
+    if (!s_usbStarted || !s_usbMscConfigured) {
+        MWR_LOG_ERROR("USB MSC mount failed: USB device was not initialized at boot");
+        s_usbStorageState = UsbStorageState::Error;
+        s_usbStorageBusy = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+    s_usbStorageHostEjected = false;
+    s_usbStorageLastAccessMs = millis();
+    s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
+    s_usbMsc.mediaPresent(true);
+    printf("[USBMSC] media present\n");
+    s_usbStorageState = UsbStorageState::Mounted;
+    s_usbStorageBusy = false;
+    vTaskDelete(nullptr);
+    return;
 
     const int sectorSize = SD_MMC.sectorSize();
     if (sectorSize <= 0) {
@@ -2044,7 +2262,11 @@ static void usbStorageMountTask(void*) {
     if (!s_usbStarted) {
         USB.manufacturerName("ESP32-S3 HiFi");
         USB.productName("HiFi SD Card");
+        printf("[USBMSC] before USB.begin resetReason=%d\n", static_cast<int>(esp_reset_reason()));
+        fflush(stdout);
         s_usbStarted = USB.begin();
+        printf("[USBMSC] after USB.begin ok=%u resetReason=%d\n", static_cast<unsigned>(s_usbStarted), static_cast<int>(esp_reset_reason()));
+        fflush(stdout);
         if (!s_usbStarted) {
             MWR_LOG_ERROR("USB begin failed");
             s_usbMsc.mediaPresent(false);
@@ -2071,8 +2293,6 @@ static void usbStorageUnmountTask(void*) {
     }
 
     s_usbMsc.mediaPresent(false);
-    s_usbMsc.end();
-    s_usbMscConfigured = false;
     vTaskDelay(pdMS_TO_TICKS(500));
 
     SD_MMC.end();
@@ -2092,6 +2312,22 @@ static void usbStorageUnmountTask(void*) {
 #endif
 
 UsbStorageState playerCoreUsbStorageState() { return s_usbStorageState; }
+
+bool playerCoreUsbStorageStats(UsbStorageStats* out) {
+    if (!out) return false;
+    out->readCount = s_usbMscReadCount;
+    out->writeCount = s_usbMscWriteCount;
+    out->readFailCount = s_usbMscReadFailCount;
+    out->writeFailCount = s_usbMscWriteFailCount;
+    out->lastLba = s_usbMscLastLba;
+    out->minLba = s_usbMscMinLba;
+    out->maxLba = s_usbMscMaxLba;
+    out->lastOffset = s_usbMscLastOffset;
+    out->lastSize = s_usbMscLastSize;
+    out->maxSize = s_usbMscMaxSize;
+    out->lastResult = s_usbMscLastResult;
+    return true;
+}
 
 bool playerCoreUsbStorageMount() {
 #if MWR_USB_MSC_SUPPORTED
@@ -3413,7 +3649,15 @@ static bool setupLvglRuntime() {
 
     logMemoryState("runtime_start");
     if (!init_SD_card()) return false;
-    startLocalMusicScan();
+#if MWR_USB_MSC_SUPPORTED
+    if (!usbStoragePrepareMsc(kUsbMscBootPresentProbe)) {
+        MWR_LOG_ERROR("USB MSC boot initialization failed");
+        s_usbStorageState = UsbStorageState::Error;
+    } else if (kUsbMscBootPresentProbe) {
+        s_usbStorageState = UsbStorageState::Mounted;
+    }
+#endif
+    if (!kUsbMscBootPresentProbe) startLocalMusicScan();
     if (!defaultsettings()) return false;
     if (ESP.getFlashChipSize() > 80000000) FFat.begin();
     logMemoryState("after_sd_init");
@@ -3566,6 +3810,8 @@ void setup() {
     Serial.begin(MONITOR_SPEED);
     vTaskDelay(1500); // wait for Serial to be ready
     printf("\n\n");
+    printf("[BOOT] resetReason=%d\n", static_cast<int>(esp_reset_reason()));
+    fflush(stdout);
     trim(Version);
     printfln(s_tag.none, "");
     printfln(s_tag.none, "             " ANSI_ESC_YELLOW " ***************************************************** ");

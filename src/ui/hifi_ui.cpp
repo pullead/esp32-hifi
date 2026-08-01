@@ -834,7 +834,7 @@ void HifiUi::show(Page page) {
     m_wifiQrLastContent[0] = '\0'; // force a fresh lv_qrcode_update on rebuild
     m_wifiNetworkList = nullptr;
     m_wifiAddPwField = m_wifiAddKeyboard = nullptr;
-    m_usbStorageStatus = m_usbStorageDetail = nullptr;
+    m_usbStorageStatus = m_usbStorageDetail = m_usbStorageDebug = nullptr;
     m_usbStorageButton = m_usbStorageButtonLabel = nullptr;
     m_lastUsbStorageState = UsbStorageState::Unsupported;
     for (auto& slider : m_audioEqSliders) slider = nullptr;
@@ -2811,7 +2811,7 @@ void HifiUi::buildUsbStorage() {
 
     lv_obj_t* panel = lv_obj_create(screen);
     lv_obj_set_pos(panel, 12, 36);
-    lv_obj_set_size(panel, 296, 76);
+    lv_obj_set_size(panel, 296, 86);
     lv_obj_set_style_radius(panel, 8, 0);
     lv_obj_set_style_bg_color(panel, kPanel, 0);
     lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
@@ -2832,13 +2832,18 @@ void HifiUi::buildUsbStorage() {
     lv_obj_clear_flag(iconWrap, LV_OBJ_FLAG_SCROLLABLE);
     makeText(iconWrap, LV_SYMBOL_USB, &lv_font_montserrat_16, kAccentBright, LV_ALIGN_CENTER, 0, 0);
 
-    m_usbStorageStatus = makeText(panel, "", &lv_font_cjk_16, kInk, LV_ALIGN_TOP_LEFT, 66, 12);
+    m_usbStorageStatus = makeText(panel, "", &lv_font_cjk_16, kInk, LV_ALIGN_TOP_LEFT, 66, 8);
     lv_obj_set_width(m_usbStorageStatus, 210);
     lv_label_set_long_mode(m_usbStorageStatus, LV_LABEL_LONG_DOT);
 
-    m_usbStorageDetail = makeText(panel, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 66, 38);
+    m_usbStorageDetail = makeText(panel, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 66, 31);
     lv_obj_set_width(m_usbStorageDetail, 216);
     lv_label_set_long_mode(m_usbStorageDetail, LV_LABEL_LONG_DOT);
+
+    m_usbStorageDebug = makeText(panel, "", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 8, 57);
+    lv_obj_set_width(m_usbStorageDebug, 216);
+    lv_obj_set_width(m_usbStorageDebug, 280);
+    lv_label_set_long_mode(m_usbStorageDebug, LV_LABEL_LONG_WRAP);
 
     m_usbStorageButton = lv_btn_create(screen);
     lv_obj_set_pos(m_usbStorageButton, 42, 126);
@@ -2858,7 +2863,8 @@ void HifiUi::buildUsbStorage() {
 void HifiUi::refreshUsbStorage() {
     if (!m_usbStorageStatus || !m_usbStorageDetail || !m_usbStorageButton || !m_usbStorageButtonLabel) return;
     const UsbStorageState state = playerService.usbStorageState();
-    if (state == m_lastUsbStorageState && state != UsbStorageState::Scanning) return;
+    const bool liveStats = state == UsbStorageState::Mounting || state == UsbStorageState::Mounted;
+    if (state == m_lastUsbStorageState && state != UsbStorageState::Scanning && !liveStats) return;
     m_lastUsbStorageState = state;
 
     const char* title = "未挂载";
@@ -2918,6 +2924,22 @@ void HifiUi::refreshUsbStorage() {
 
     lv_label_set_text(m_usbStorageStatus, title);
     lv_label_set_text(m_usbStorageDetail, detail);
+    if (m_usbStorageDebug) {
+        UsbStorageStats stats;
+        if (playerService.usbStorageStats(&stats)) {
+            char debug[128];
+            snprintf(debug, sizeof(debug), "R%lu/%lu W%lu/%lu S%lu R%ld\nL%lu %lu-%lu O%lu M%lu",
+                     static_cast<unsigned long>(stats.readCount), static_cast<unsigned long>(stats.readFailCount),
+                     static_cast<unsigned long>(stats.writeCount), static_cast<unsigned long>(stats.writeFailCount),
+                     static_cast<unsigned long>(stats.lastSize), static_cast<long>(stats.lastResult),
+                     static_cast<unsigned long>(stats.lastLba), static_cast<unsigned long>(stats.minLba),
+                     static_cast<unsigned long>(stats.maxLba), static_cast<unsigned long>(stats.lastOffset),
+                     static_cast<unsigned long>(stats.maxSize));
+            lv_label_set_text(m_usbStorageDebug, debug);
+        } else {
+            lv_label_set_text(m_usbStorageDebug, "MSC stats unavailable");
+        }
+    }
     lv_label_set_text(m_usbStorageButtonLabel, button);
     lv_obj_set_style_bg_color(m_usbStorageButton, buttonColor, 0);
     lv_obj_set_style_bg_opa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);

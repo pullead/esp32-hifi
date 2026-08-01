@@ -13,6 +13,20 @@ enum class PlayerTransport : uint8_t { Stopped, Buffering, Playing, Paused, Erro
 enum class LyricFetchState : uint8_t { Idle, Pending, Found, NotFound };
 enum class UsbStorageState : uint8_t { Idle, Mounting, Mounted, Restoring, Scanning, Error, Unsupported };
 
+struct UsbStorageStats {
+    uint32_t readCount = 0;
+    uint32_t writeCount = 0;
+    uint32_t readFailCount = 0;
+    uint32_t writeFailCount = 0;
+    uint32_t lastLba = 0;
+    uint32_t minLba = 0;
+    uint32_t maxLba = 0;
+    uint32_t lastOffset = 0;
+    uint32_t lastSize = 0;
+    uint32_t maxSize = 0;
+    int32_t lastResult = 0;
+};
+
 struct PlayerSnapshot {
     PlayerSource source = PlayerSource::None;
     PlayerTransport transport = PlayerTransport::Stopped;
@@ -165,6 +179,7 @@ class PlayerService {
     bool localTrack(uint16_t index, LocalTrackItem* item) const;
     bool playLocalTrack(uint16_t index);
     UsbStorageState usbStorageState() const;
+    bool usbStorageStats(UsbStorageStats* out) const;
     bool usbStorageMount();
     bool usbStorageUnmount();
     bool seekTo(uint32_t positionSeconds);
