@@ -27,6 +27,18 @@ struct UsbStorageStats {
     int32_t lastResult = 0;
 };
 
+struct UsbStorageFormatInfo {
+    bool valid = false;
+    bool fat32 = false;
+    bool recommendedAllocation = false;
+    uint16_t bytesPerSector = 0;
+    uint8_t sectorsPerCluster = 0;
+    uint32_t allocationUnitBytes = 0;
+    uint64_t totalBytes = 0;
+    uint64_t usedBytes = 0;
+    uint32_t partitionStartLba = 0;
+};
+
 struct PlayerSnapshot {
     PlayerSource source = PlayerSource::None;
     PlayerTransport transport = PlayerTransport::Stopped;
@@ -180,6 +192,7 @@ class PlayerService {
     bool playLocalTrack(uint16_t index);
     UsbStorageState usbStorageState() const;
     bool usbStorageStats(UsbStorageStats* out) const;
+    bool usbStorageFormatInfo(UsbStorageFormatInfo* out) const;
     bool usbStorageMount();
     bool usbStorageUnmount();
     bool seekTo(uint32_t positionSeconds);

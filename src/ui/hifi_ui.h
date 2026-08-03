@@ -338,6 +338,9 @@ class HifiUi {
     char m_wifiQrLastContent[128]{};
     lv_obj_t* m_usbStorageStatus = nullptr;
     lv_obj_t* m_usbStorageDetail = nullptr;
+    lv_obj_t* m_usbStorageFormat = nullptr;
+    lv_obj_t* m_usbStorageCapacity = nullptr;
+    lv_obj_t* m_usbStorageHint = nullptr;
     lv_obj_t* m_usbStorageDebug = nullptr;
     lv_obj_t* m_usbStorageButton = nullptr;
     lv_obj_t* m_usbStorageButtonLabel = nullptr;

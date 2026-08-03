@@ -155,6 +155,17 @@ void formatKhz(uint32_t sampleRate, char* output, size_t outputSize) {
     else snprintf(output, outputSize, "%.1f kHz", static_cast<double>(sampleRate) / 1000.0);
 }
 
+void formatStorageSize(uint64_t bytes, char* output, size_t outputSize) {
+    if (!output || !outputSize) return;
+    const double gb = static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0);
+    const double mb = static_cast<double>(bytes) / (1024.0 * 1024.0);
+    if (gb >= 9.95) snprintf(output, outputSize, "%.1fGB", gb);
+    else if (gb >= 1.0) snprintf(output, outputSize, "%.2fGB", gb);
+    else if (mb >= 9.95) snprintf(output, outputSize, "%.0fMB", mb);
+    else if (mb >= 1.0) snprintf(output, outputSize, "%.1fMB", mb);
+    else snprintf(output, outputSize, "%luKB", static_cast<unsigned long>((bytes + 1023) / 1024));
+}
+
 // Level-2 station-icon fallback (see fetchOneStationIcon()'s comment on the
 // two network levels above this one): when there's truly nothing to show --
 // no real favicon, and the theme-photo fallback also failed or hasn't run
@@ -834,7 +845,9 @@ void HifiUi::show(Page page) {
     m_wifiQrLastContent[0] = '\0'; // force a fresh lv_qrcode_update on rebuild
     m_wifiNetworkList = nullptr;
     m_wifiAddPwField = m_wifiAddKeyboard = nullptr;
-    m_usbStorageStatus = m_usbStorageDetail = m_usbStorageDebug = nullptr;
+    m_usbStorageStatus = m_usbStorageDetail = nullptr;
+    m_usbStorageFormat = m_usbStorageCapacity = m_usbStorageHint = nullptr;
+    m_usbStorageDebug = nullptr;
     m_usbStorageButton = m_usbStorageButtonLabel = nullptr;
     m_lastUsbStorageState = UsbStorageState::Unsupported;
     for (auto& slider : m_audioEqSliders) slider = nullptr;
@@ -2806,6 +2819,89 @@ void HifiUi::buildSettings() {
 }
 
 void HifiUi::buildUsbStorage() {
+    {
+        lv_obj_t* usbScreen = lv_scr_act();
+        buildAudioTopBar("U盘挂载", "USB", true, LV_SYMBOL_USB);
+
+        lv_obj_t* usbPanel = lv_obj_create(usbScreen);
+        lv_obj_set_pos(usbPanel, 10, 30);
+        lv_obj_set_size(usbPanel, 300, 72);
+        lv_obj_set_style_radius(usbPanel, 8, 0);
+        lv_obj_set_style_bg_color(usbPanel, kPanel, 0);
+        lv_obj_set_style_bg_opa(usbPanel, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(usbPanel, kAccent, 0);
+        lv_obj_set_style_border_width(usbPanel, 1, 0);
+        lv_obj_set_style_pad_all(usbPanel, 0, 0);
+        lv_obj_clear_flag(usbPanel, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* usbIcon = lv_obj_create(usbPanel);
+        lv_obj_set_pos(usbIcon, 12, 12);
+        lv_obj_set_size(usbIcon, 38, 38);
+        lv_obj_set_style_radius(usbIcon, 19, 0);
+        lv_obj_set_style_bg_color(usbIcon, kPanelDeep, 0);
+        lv_obj_set_style_bg_opa(usbIcon, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(usbIcon, kAccentBright, 0);
+        lv_obj_set_style_border_width(usbIcon, 1, 0);
+        lv_obj_set_style_pad_all(usbIcon, 0, 0);
+        lv_obj_clear_flag(usbIcon, LV_OBJ_FLAG_SCROLLABLE);
+        makeText(usbIcon, LV_SYMBOL_USB, &lv_font_montserrat_16, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+
+        m_usbStorageStatus = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_TOP_LEFT, 60, 8);
+        lv_obj_set_width(m_usbStorageStatus, 146);
+        lv_label_set_long_mode(m_usbStorageStatus, LV_LABEL_LONG_DOT);
+
+        m_usbStorageDetail = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInkDim, LV_ALIGN_TOP_LEFT, 60, 30);
+        lv_obj_set_width(m_usbStorageDetail, 226);
+        lv_label_set_long_mode(m_usbStorageDetail, LV_LABEL_LONG_DOT);
+
+        m_usbStorageHint = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInkFaint, LV_ALIGN_TOP_LEFT, 12, 53);
+        lv_obj_set_width(m_usbStorageHint, 276);
+        lv_label_set_long_mode(m_usbStorageHint, LV_LABEL_LONG_DOT);
+
+        auto makeUsbInfoBox = [&](int16_t x, const char* icon, const char* label) {
+            lv_obj_t* box = lv_obj_create(usbScreen);
+            lv_obj_set_pos(box, x, 108);
+            lv_obj_set_size(box, 145, 24);
+            lv_obj_set_style_radius(box, 7, 0);
+            lv_obj_set_style_bg_color(box, kPanelDeep, 0);
+            lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_color(box, kInkFaint, 0);
+            lv_obj_set_style_border_width(box, 1, 0);
+            lv_obj_set_style_pad_all(box, 0, 0);
+            lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+            makeText(box, icon, &lv_font_montserrat_12, kAccentBright, LV_ALIGN_LEFT_MID, 8, 0);
+            makeText(box, label, HIFI_FONT_DYNAMIC_TEXT, kInkDim, LV_ALIGN_LEFT_MID, 28, 0);
+            return box;
+        };
+
+        lv_obj_t* formatBox = makeUsbInfoBox(10, LV_SYMBOL_SD_CARD, "格式");
+        m_usbStorageFormat = makeText(formatBox, "", &lv_font_montserrat_12, kOk, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_set_width(m_usbStorageFormat, 74);
+        lv_obj_set_style_text_align(m_usbStorageFormat, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(m_usbStorageFormat, LV_LABEL_LONG_DOT);
+
+        lv_obj_t* capacityBox = makeUsbInfoBox(165, "GB", "容量");
+        m_usbStorageCapacity = makeText(capacityBox, "", &lv_font_montserrat_12, kInk, LV_ALIGN_RIGHT_MID, -8, 0);
+        lv_obj_set_width(m_usbStorageCapacity, 76);
+        lv_obj_set_style_text_align(m_usbStorageCapacity, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_long_mode(m_usbStorageCapacity, LV_LABEL_LONG_DOT);
+
+        m_usbStorageButton = lv_btn_create(usbScreen);
+        lv_obj_set_pos(m_usbStorageButton, 10, 138);
+        lv_obj_set_size(m_usbStorageButton, 300, 26);
+        lv_obj_set_style_radius(m_usbStorageButton, 8, 0);
+        lv_obj_set_style_border_width(m_usbStorageButton, 0, 0);
+        lv_obj_set_style_shadow_width(m_usbStorageButton, 0, 0);
+        lv_obj_set_style_pad_all(m_usbStorageButton, 0, 0);
+        lv_obj_clear_flag(m_usbStorageButton, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(m_usbStorageButton);
+        lv_obj_add_event_cb(m_usbStorageButton, onUsbStorageAction, LV_EVENT_CLICKED, nullptr);
+        m_usbStorageButtonLabel = makeText(m_usbStorageButton, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_CENTER, 0, 0);
+
+        refreshUsbStorage();
+        return;
+    }
+
     lv_obj_t* screen = lv_scr_act();
     buildAudioTopBar("U盘挂载", nullptr);
 
@@ -2861,6 +2957,108 @@ void HifiUi::buildUsbStorage() {
 }
 
 void HifiUi::refreshUsbStorage() {
+    {
+        if (!m_usbStorageStatus || !m_usbStorageDetail || !m_usbStorageFormat || !m_usbStorageCapacity || !m_usbStorageHint || !m_usbStorageButton || !m_usbStorageButtonLabel) return;
+        const UsbStorageState state = playerService.usbStorageState();
+        if (state == m_lastUsbStorageState && state != UsbStorageState::Scanning) return;
+        m_lastUsbStorageState = state;
+
+        const char* title = "准备共享";
+        const char* detail = "点击后电脑将显示 SD 卡";
+        const char* hint = "音乐和歌词建议放入 /Music";
+        const char* button = "挂载到电脑";
+        lv_color_t buttonColor = kAccentDeep;
+        bool enabled = true;
+
+        switch (state) {
+            case UsbStorageState::Idle:
+                break;
+            case UsbStorageState::Mounting:
+                title = "正在挂载";
+                detail = "正在停止播放并导出 SD 卡";
+                hint = "请等待电脑识别新磁盘";
+                button = "请稍候";
+                buttonColor = kPanelDeep;
+                enabled = false;
+                break;
+            case UsbStorageState::Mounted:
+                title = "U盘模式已开启";
+                detail = "电脑可复制、删除或移动文件";
+                hint = "完成后先弹出磁盘，再退出U盘模式";
+                button = "退出U盘模式";
+                buttonColor = kMute;
+                break;
+            case UsbStorageState::Restoring:
+                title = "正在恢复";
+                detail = "正在重新挂载 SD 卡";
+                hint = "正在恢复播放器访问权限";
+                button = "请稍候";
+                buttonColor = kPanelDeep;
+                enabled = false;
+                break;
+            case UsbStorageState::Scanning: {
+                static char scanDetail[40];
+                snprintf(scanDetail, sizeof(scanDetail), "已发现 %u 首本地音乐", playerService.localLibraryCount());
+                title = "正在扫描音乐";
+                detail = scanDetail;
+                hint = "扫描完成后会回到普通播放模式";
+                button = "扫描中";
+                buttonColor = kPanelDeep;
+                enabled = false;
+                break;
+            }
+            case UsbStorageState::Error:
+                title = "挂载失败";
+                detail = "检查 SD 卡或 USB 后重试";
+                hint = "如果刚弹出磁盘，请重新插拔开发板";
+                button = "重试挂载";
+                buttonColor = kMute;
+                break;
+            case UsbStorageState::Unsupported:
+            default:
+                title = "当前不可用";
+                detail = "固件未启用 USB MSC";
+                hint = "需要 TinyUSB MSC 构建配置";
+                button = "不可用";
+                buttonColor = kPanelDeep;
+                enabled = false;
+                break;
+        }
+
+        UsbStorageFormatInfo formatInfo;
+        const bool hasFormat = playerService.usbStorageFormatInfo(&formatInfo);
+        char formatText[32] = "--";
+        lv_color_t formatColor = kInkFaint;
+        if (hasFormat && formatInfo.valid) {
+            const unsigned long allocKb = static_cast<unsigned long>((formatInfo.allocationUnitBytes + 1023) / 1024);
+            snprintf(formatText, sizeof(formatText), "%s/%luKB", formatInfo.fat32 ? "FAT32" : "FAT", allocKb);
+            formatColor = formatInfo.recommendedAllocation ? kOk : lv_color_hex(0xFACC15);
+            if (!formatInfo.recommendedAllocation) hint = "建议 FAT32 / 32KB，电脑打开更快";
+        }
+
+        char capacityText[40] = "--";
+        if (hasFormat && formatInfo.totalBytes > 0) {
+            char used[16];
+            char total[16];
+            formatStorageSize(formatInfo.usedBytes, used, sizeof(used));
+            formatStorageSize(formatInfo.totalBytes, total, sizeof(total));
+            snprintf(capacityText, sizeof(capacityText), "%s/%s", used, total);
+        }
+
+        lv_label_set_text(m_usbStorageStatus, title);
+        lv_label_set_text(m_usbStorageDetail, detail);
+        lv_label_set_text(m_usbStorageHint, hint);
+        lv_label_set_text(m_usbStorageFormat, formatText);
+        lv_obj_set_style_text_color(m_usbStorageFormat, formatColor, 0);
+        lv_label_set_text(m_usbStorageCapacity, capacityText);
+        lv_label_set_text(m_usbStorageButtonLabel, button);
+        lv_obj_set_style_bg_color(m_usbStorageButton, buttonColor, 0);
+        lv_obj_set_style_bg_opa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
+        if (enabled) lv_obj_clear_state(m_usbStorageButton, LV_STATE_DISABLED);
+        else lv_obj_add_state(m_usbStorageButton, LV_STATE_DISABLED);
+        return;
+    }
+
     if (!m_usbStorageStatus || !m_usbStorageDetail || !m_usbStorageButton || !m_usbStorageButtonLabel) return;
     const UsbStorageState state = playerService.usbStorageState();
     const bool liveStats = state == UsbStorageState::Mounting || state == UsbStorageState::Mounted;

@@ -1425,6 +1425,7 @@ static void weatherTask(void*) {
 // only runs while a file is actually being decoded -- not useful for
 // batch-scanning hundreds of files on disk without playing each one.
 constexpr uint16_t kMaxLocalTracks = 300;
+static constexpr const char* kLocalMusicDir = "/Music";
 static LocalTrackItem* s_localTracks = nullptr;
 static uint16_t s_localTrackCount = 0;
 static volatile bool s_localLibraryScanning = false;
@@ -1445,6 +1446,8 @@ static volatile uint32_t s_usbMscMaxSize = 0;
 static volatile int32_t s_usbMscLastResult = 0;
 static uint32_t s_usbMscLbaBase = 0;
 static uint32_t s_usbMscBlockCount = 0;
+static uint32_t s_usbStoragePartitionStartLba = 0;
+static UsbStorageFormatInfo s_usbStorageFormatInfo{};
 
 #if MWR_USB_MSC_SUPPORTED
 static USBMSC s_usbMsc;
@@ -1452,7 +1455,7 @@ static bool s_usbMscConfigured = false;
 static bool s_usbStarted = false;
 static constexpr bool kUsbMscReadOnlyProbe = false;
 static constexpr bool kUsbMscExposePartitionOnly = false;
-static constexpr bool kUsbMscBootPresentProbe = true;
+static constexpr bool kUsbMscBootPresentProbe = false;
 
 static int32_t usbMscRead(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize);
 static int32_t usbMscWrite(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize);
@@ -1463,6 +1466,11 @@ static uint32_t usbMscLe32(const uint8_t* p) {
            (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) |
            (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static uint16_t usbMscLe16(const uint8_t* p) {
+    return static_cast<uint16_t>(p[0]) |
+           (static_cast<uint16_t>(p[1]) << 8);
 }
 
 static bool usbMscMbrFitsDevice(const uint8_t* lba0, uint32_t sectorCount) {
@@ -1513,6 +1521,38 @@ static bool usbMscFindFirstPartition(const uint8_t* lba0, uint32_t sectorCount, 
     return false;
 }
 
+static void usbStorageUpdateFormatInfo(uint32_t partitionStartLba, uint64_t totalBytes, uint64_t usedBytes) {
+    UsbStorageFormatInfo info{};
+    info.totalBytes = totalBytes;
+    info.usedBytes = usedBytes <= totalBytes ? usedBytes : 0;
+    info.partitionStartLba = partitionStartLba;
+
+    uint8_t boot[512];
+    if (SD_MMC.readRAW(boot, partitionStartLba) && boot[510] == 0x55 && boot[511] == 0xAA) {
+        const uint16_t bytesPerSector = usbMscLe16(boot + 11);
+        const uint8_t sectorsPerCluster = boot[13];
+        const uint16_t rootEntryCount = usbMscLe16(boot + 17);
+        const uint16_t fat16Sectors = usbMscLe16(boot + 22);
+        const uint32_t fat32Sectors = usbMscLe32(boot + 36);
+        const bool plausibleSectorSize = bytesPerSector == 512 || bytesPerSector == 1024 || bytesPerSector == 2048 || bytesPerSector == 4096;
+        const bool plausibleCluster = sectorsPerCluster > 0 && (sectorsPerCluster & (sectorsPerCluster - 1)) == 0;
+        info.valid = plausibleSectorSize && plausibleCluster;
+        info.fat32 = info.valid && rootEntryCount == 0 && fat16Sectors == 0 && fat32Sectors > 0;
+        info.bytesPerSector = bytesPerSector;
+        info.sectorsPerCluster = sectorsPerCluster;
+        info.allocationUnitBytes = static_cast<uint32_t>(bytesPerSector) * sectorsPerCluster;
+        info.recommendedAllocation = info.fat32 && info.allocationUnitBytes == 32768;
+        printf("[USBMSC] fs bpb valid=%u fat32=%u bytesPerSector=%u sectorsPerCluster=%u allocation=%u recommended=%u partStart=%u\n",
+               static_cast<unsigned>(info.valid), static_cast<unsigned>(info.fat32), static_cast<unsigned>(info.bytesPerSector),
+               static_cast<unsigned>(info.sectorsPerCluster), static_cast<unsigned>(info.allocationUnitBytes),
+               static_cast<unsigned>(info.recommendedAllocation), static_cast<unsigned>(info.partitionStartLba));
+    } else {
+        printf("[USBMSC] fs bpb read failed at lba=%u\n", static_cast<unsigned>(partitionStartLba));
+    }
+
+    s_usbStorageFormatInfo = info;
+}
+
 static bool usbStoragePrepareMsc(bool mediaPresent) {
     const int sectorSize = SD_MMC.sectorSize();
     if (sectorSize <= 0) {
@@ -1530,6 +1570,7 @@ static bool usbStoragePrepareMsc(bool mediaPresent) {
 
     uint32_t exposedBase = 0;
     uint32_t exposedCount = sectorCount;
+    uint32_t firstPartitionStart = 0;
     {
         uint8_t lba0[512];
         bool lba0Ok = false;
@@ -1553,11 +1594,18 @@ static bool usbStoragePrepareMsc(bool mediaPresent) {
             if (usbMscFindFirstPartition(lba0, sectorCount, &partStart, &partCount)) {
                 exposedBase = partStart;
                 exposedCount = partCount;
+                firstPartitionStart = partStart;
             }
+        } else if (lba0Ok) {
+            uint32_t partStart = 0;
+            uint32_t partCount = 0;
+            if (usbMscFindFirstPartition(lba0, sectorCount, &partStart, &partCount)) firstPartitionStart = partStart;
         }
     }
     s_usbMscLbaBase = exposedBase;
     s_usbMscBlockCount = exposedCount;
+    s_usbStoragePartitionStartLba = firstPartitionStart;
+    usbStorageUpdateFormatInfo(s_usbStoragePartitionStartLba, SD_MMC.cardSize(), SD_MMC.usedBytes());
     printf("[USBMSC] expose base=%u blocks=%u partitionOnly=%u\n",
            static_cast<unsigned>(s_usbMscLbaBase), static_cast<unsigned>(s_usbMscBlockCount),
            static_cast<unsigned>(kUsbMscExposePartitionOnly));
@@ -1645,6 +1693,23 @@ static bool endsWithIcase(const char* name, const char* suffix) {
     const size_t suffixLen = strlen(suffix);
     if (suffixLen > nameLen) return false;
     return strncasecmp(name + (nameLen - suffixLen), suffix, suffixLen) == 0;
+}
+
+static void ensureLocalMusicDir() {
+    if (usbStorageBlocksSdAppAccess()) return;
+    File existing = SD_MMC.open(kLocalMusicDir);
+    if (existing) {
+        const bool isDir = existing.isDirectory();
+        existing.close();
+        if (isDir) return;
+        MWR_LOG_ERROR("Local music path exists but is not a directory: {}", kLocalMusicDir);
+        return;
+    }
+    if (SD_MMC.mkdir(kLocalMusicDir)) {
+        printf("[MUSIC] created local music folder: %s\n", kLocalMusicDir);
+    } else {
+        MWR_LOG_ERROR("Failed to create local music folder: {}", kLocalMusicDir);
+    }
 }
 
 // Reads a 4-byte synchsafe integer (each byte's high bit is always 0, 7
@@ -1930,6 +1995,7 @@ static void scanMusicDir(const char* path, uint8_t depth) {
 }
 
 static void localMusicScanTask(void*) {
+    ensureLocalMusicDir();
     if (s_localTracks) {
         free(s_localTracks);
         s_localTracks = nullptr;
@@ -2303,6 +2369,8 @@ static void usbStorageUnmountTask(void*) {
         vTaskDelete(nullptr);
         return;
     }
+    ensureLocalMusicDir();
+    usbStorageUpdateFormatInfo(s_usbStoragePartitionStartLba, SD_MMC.cardSize(), SD_MMC.usedBytes());
 
     if (startLocalMusicScan()) s_usbStorageState = UsbStorageState::Scanning;
     else s_usbStorageState = UsbStorageState::Idle;
@@ -2327,6 +2395,12 @@ bool playerCoreUsbStorageStats(UsbStorageStats* out) {
     out->maxSize = s_usbMscMaxSize;
     out->lastResult = s_usbMscLastResult;
     return true;
+}
+
+bool playerCoreUsbStorageFormatInfo(UsbStorageFormatInfo* out) {
+    if (!out) return false;
+    *out = s_usbStorageFormatInfo;
+    return s_usbStorageFormatInfo.valid || s_usbStorageFormatInfo.totalBytes > 0;
 }
 
 bool playerCoreUsbStorageMount() {
@@ -3649,6 +3723,7 @@ static bool setupLvglRuntime() {
 
     logMemoryState("runtime_start");
     if (!init_SD_card()) return false;
+    ensureLocalMusicDir();
 #if MWR_USB_MSC_SUPPORTED
     if (!usbStoragePrepareMsc(kUsbMscBootPresentProbe)) {
         MWR_LOG_ERROR("USB MSC boot initialization failed");
