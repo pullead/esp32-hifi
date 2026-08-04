@@ -85,7 +85,8 @@ class HifiUi {
     void buildCassetteVisual(lv_obj_t* screen);
     void loadCoverArt(uint16_t trackIndex);
     void clearCoverArt();
-    void playLocalTrackByIndex(uint16_t index);
+    void playLocalTrackByIndex(uint16_t index, uint32_t positionSeconds = 0);
+    int32_t findLocalTrackByPath(const char* path) const;
     int32_t findLocalTrack(uint16_t from, bool forward, bool wrap = true) const;
     static const char* localPlayModeSymbol(LocalPlayMode mode);
     void refreshLocalNowPlaying(const struct PlayerSnapshot& state);

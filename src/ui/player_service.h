@@ -162,6 +162,8 @@ class PlayerService {
     uint8_t wifiScanResults(WifiScanItem* items, uint8_t maxItems) const;
     void nextStation();
     void previousStation();
+    uint16_t currentRadioStationIndex() const;
+    bool playCurrentRadioStation();
     uint16_t radioStationCount() const;
     bool radioStation(uint16_t index, RadioStationItem* item) const;
     bool playRadioStation(uint16_t index);
@@ -189,7 +191,9 @@ class PlayerService {
     bool localLibraryScanning() const;
     uint16_t localLibraryCount() const;
     bool localTrack(uint16_t index, LocalTrackItem* item) const;
-    bool playLocalTrack(uint16_t index);
+    const char* lastLocalFilePath() const;
+    uint32_t lastLocalFilePosition() const;
+    bool playLocalTrack(uint16_t index, uint32_t positionSeconds = 0);
     UsbStorageState usbStorageState() const;
     bool usbStorageStats(UsbStorageStats* out) const;
     bool usbStorageFormatInfo(UsbStorageFormatInfo* out) const;

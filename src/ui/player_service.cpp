@@ -25,6 +25,7 @@ extern uint8_t playerCoreWifiScanResults(WifiScanItem* items, uint8_t maxItems);
 extern void playerCoreNextStation();
 extern void playerCorePreviousStation();
 extern void playerCoreReadSnapshot(PlayerSnapshot* snapshot);
+extern uint16_t playerCoreCurrentRadioStationNumber();
 extern uint16_t playerCoreRadioStationCount();
 extern bool playerCoreRadioStation(uint16_t index, RadioStationItem* item);
 extern bool playerCorePlayRadioStation(uint16_t index);
@@ -41,6 +42,8 @@ extern void playerCoreRadioIconSyncStart();
 extern bool playerCoreRadioIconSyncInProgress();
 extern bool playerCoreDecodeRadioIcon(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight);
 extern bool playerCoreSeekTo(uint32_t positionSeconds);
+extern const char* playerCoreLastLocalFilePath();
+extern uint32_t playerCoreLastLocalFilePosition();
 extern bool playerCoreLoadLyrics(uint16_t index);
 extern const char* playerCoreCurrentLyricLine(uint32_t positionMs);
 extern bool playerCoreLyricsOnlineReady(uint16_t* outIndex);
@@ -141,12 +144,14 @@ bool PlayerService::wifiScanInProgress() const { return playerCoreWifiScanInProg
 uint8_t PlayerService::wifiScanResults(WifiScanItem* items, uint8_t maxItems) const { return playerCoreWifiScanResults(items, maxItems); }
 
 void PlayerService::nextStation() {
+    if (m_snapshot.source == PlayerSource::Sd) stop();
     playerCoreNextStation();
     m_snapshot.source = PlayerSource::Radio;
     m_snapshot.transport = PlayerTransport::Buffering;
 }
 
 void PlayerService::previousStation() {
+    if (m_snapshot.source == PlayerSource::Sd) stop();
     playerCorePreviousStation();
     m_snapshot.source = PlayerSource::Radio;
     m_snapshot.transport = PlayerTransport::Buffering;
@@ -156,13 +161,26 @@ uint16_t PlayerService::radioStationCount() const { return playerCoreRadioStatio
 
 bool PlayerService::radioStation(uint16_t index, RadioStationItem* item) const { return playerCoreRadioStation(index, item); }
 
+uint16_t PlayerService::currentRadioStationIndex() const { return playerCoreCurrentRadioStationNumber(); }
+
+bool PlayerService::playCurrentRadioStation() {
+    uint16_t index = currentRadioStationIndex();
+    if (!index && radioStationCount()) index = 1;
+    return index ? playRadioStation(index) : false;
+}
+
 bool PlayerService::playRadioStation(uint16_t index) {
     // See playRadioUrl()'s comment.
+    RadioStationItem item{};
+    const bool haveStationInfo = playerCoreRadioStation(index, &item);
     if (m_snapshot.source == PlayerSource::Sd) stop();
     const bool started = playerCorePlayRadioStation(index);
     if (started) {
         m_snapshot.source = PlayerSource::Radio;
         m_snapshot.transport = PlayerTransport::Buffering;
+        m_snapshot.radioStationIndex = index;
+        copyText(m_snapshot.title, sizeof(m_snapshot.title), haveStationInfo && item.name[0] ? item.name : "Radio");
+        copyText(m_snapshot.detail, sizeof(m_snapshot.detail), haveStationInfo && item.url[0] ? item.url : "");
         m_snapshot.error[0] = '\0';
     }
     return started;
@@ -180,6 +198,10 @@ uint16_t PlayerService::localLibraryCount() const { return playerCoreLocalLibrar
 
 bool PlayerService::localTrack(uint16_t index, LocalTrackItem* item) const { return playerCoreLocalTrack(index, item); }
 
+const char* PlayerService::lastLocalFilePath() const { return playerCoreLastLocalFilePath(); }
+
+uint32_t PlayerService::lastLocalFilePosition() const { return playerCoreLastLocalFilePosition(); }
+
 UsbStorageState PlayerService::usbStorageState() const { return playerCoreUsbStorageState(); }
 
 bool PlayerService::usbStorageStats(UsbStorageStats* out) const { return playerCoreUsbStorageStats(out); }
@@ -190,10 +212,10 @@ bool PlayerService::usbStorageMount() { return playerCoreUsbStorageMount(); }
 
 bool PlayerService::usbStorageUnmount() { return playerCoreUsbStorageUnmount(); }
 
-bool PlayerService::playLocalTrack(uint16_t index) {
+bool PlayerService::playLocalTrack(uint16_t index, uint32_t positionSeconds) {
     LocalTrackItem item;
     if (!playerCoreLocalTrack(index, &item)) return false;
-    const bool started = playSdFile(item.path);
+    const bool started = playSdFile(item.path, positionSeconds);
     if (started) {
         // playSdFile() above sets `detail` to the raw path -- overwrite
         // with the real ID3 title/artist/album immediately rather than

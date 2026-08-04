@@ -283,6 +283,7 @@ struct settings_s {
     uint8_t      numOfIrButtons = 0;
     ps_ptr<char> lastconnectedhost = {};
     ps_ptr<char> lastconnectedfile = {};
+    uint32_t     lastconnectedfilepos = 0;
 } s_settings;
 
 struct volume_s {

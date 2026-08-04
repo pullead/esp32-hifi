@@ -1683,6 +1683,8 @@ void HifiUi::buildLocalMusic() {
 // (respecting the current artist/album filter) instead of radio stations.
 void HifiUi::buildLocalNowPlaying() {
     lv_obj_t* screen = lv_scr_act();
+    const PlayerSnapshot buildState = playerService.snapshot();
+    if (buildState.source != PlayerSource::Sd && m_currentRadioIconIndex != 0) clearRadioIcon();
 
     if (m_localCassetteView) {
         // Full-screen, no status bar, no buttons at all -- purely visual,
@@ -2227,6 +2229,8 @@ void HifiUi::refreshLocalNowPlaying(const PlayerSnapshot& rawState) {
 // StreamTitle in place of track title/artist.
 void HifiUi::buildRadioNowPlaying() {
     lv_obj_t* screen = lv_scr_act();
+    const PlayerSnapshot buildState = playerService.snapshot();
+    if (buildState.source != PlayerSource::Radio && m_currentRadioIconIndex == 0 && m_coverArtPixels) clearCoverArt();
 
     if (m_radioCassetteView) {
         // Full-screen, no status bar/buttons -- same rule as local's
@@ -2681,11 +2685,23 @@ void HifiUi::refreshRadioNowPlaying(const PlayerSnapshot& rawState) {
     }
 }
 
-void HifiUi::playLocalTrackByIndex(uint16_t index) {
-    if (!playerService.playLocalTrack(index)) return;
+void HifiUi::playLocalTrackByIndex(uint16_t index, uint32_t positionSeconds) {
+    if (!playerService.playLocalTrack(index, positionSeconds)) return;
     m_currentLocalTrackIndex = index;
+    m_currentRadioIconIndex = 0;
     loadCoverArt(index);
     m_hasLyrics = playerService.loadLyrics(index);
+}
+
+int32_t HifiUi::findLocalTrackByPath(const char* path) const {
+    if (!path || !path[0]) return -1;
+    const uint16_t count = playerService.localLibraryCount();
+    for (uint16_t i = 0; i < count; ++i) {
+        LocalTrackItem item{};
+        if (!playerService.localTrack(i, &item)) continue;
+        if (strcmp(item.path, path) == 0) return i;
+    }
+    return -1;
 }
 
 // Walks s_localTracks (via playerService) from `from`, respecting the
@@ -4665,14 +4681,18 @@ void HifiUi::onTransportAction(lv_event_t* event) {
         if (s_instance) s_instance->clearCoverArt(); // moving to a radio station -- any cached local-track art is now stale
     } else if (action == kActionPlayPause) {
         const PlayerSnapshot state = playerService.snapshot();
+        const bool onRadioPage = s_instance && s_instance->m_page == Page::Radio;
         const bool idle = state.transport == PlayerTransport::Stopped || state.transport == PlayerTransport::Error ||
                           state.source == PlayerSource::None;
         bool showPause;
-        if (idle) {
-            if (playerService.radioStationCount()) playerService.playRadioStation(1);
-            else playerService.playRadioUrl(kDefaultRadioUrl);
+        if (onRadioPage && state.source != PlayerSource::Radio) {
+            const bool started = playerService.playCurrentRadioStation() || playerService.playRadioUrl(kDefaultRadioUrl);
             if (s_instance) s_instance->clearCoverArt();
-            showPause = true; // starting playback
+            showPause = started;
+        } else if (idle) {
+            const bool started = playerService.playCurrentRadioStation() || playerService.playRadioUrl(kDefaultRadioUrl);
+            if (s_instance) s_instance->clearCoverArt();
+            showPause = started; // starting playback
         } else {
             showPause = !playerService.togglePause();
         }
@@ -4734,7 +4754,26 @@ void HifiUi::onLocalTransportAction(lv_event_t* event) {
             s_instance->show(Page::LocalNowPlaying); // full rebuild -- the cover art image needs a fresh lv_img_dsc_t
         }
     } else if (action == kActionPlayPause) {
-        const bool showPause = !playerService.togglePause();
+        const PlayerSnapshot state = playerService.snapshot();
+        bool showPause = false;
+        if (state.source != PlayerSource::Sd || state.transport == PlayerTransport::Stopped || state.transport == PlayerTransport::Error) {
+            int32_t index = s_instance->findLocalTrackByPath(playerService.lastLocalFilePath());
+            uint32_t positionSeconds = 0;
+            if (index >= 0) {
+                positionSeconds = playerService.lastLocalFilePosition();
+            } else if (s_instance->m_currentLocalTrackIndex < playerService.localLibraryCount()) {
+                index = s_instance->m_currentLocalTrackIndex;
+            } else if (playerService.localLibraryCount()) {
+                index = 0;
+            }
+            if (index >= 0) {
+                s_instance->playLocalTrackByIndex(static_cast<uint16_t>(index), positionSeconds);
+                s_instance->show(Page::LocalNowPlaying);
+                showPause = true;
+            }
+        } else {
+            showPause = !playerService.togglePause();
+        }
         printf("[LOCAL] playPause -> showPause=%d\n", showPause);
         if (s_instance->m_playIcon) lv_label_set_text(s_instance->m_playIcon, showPause ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }

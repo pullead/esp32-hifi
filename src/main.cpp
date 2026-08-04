@@ -357,6 +357,7 @@ boolean defaultsettings() {
 
     s_settings.lastconnectedhost.reset();
     s_settings.lastconnectedfile.reset();
+    s_settings.lastconnectedfilepos = 0;
 
     s_volume.cur_volume = atoi(parseJson("\"volume\":"));
     s_volume.volumeSteps = atoi(parseJson("\"volumeSteps\":"));
@@ -393,6 +394,7 @@ boolean defaultsettings() {
     s_TZString = parseJson("\"Timezone_String\":");
     s_settings.lastconnectedhost.copy_from(parseJson("\"lastconnectedhost\":"));
     s_settings.lastconnectedfile.copy_from(parseJson("\"lastconnectedfile\":"));
+    s_settings.lastconnectedfilepos = atoi(parseJson("\"lastconnectedfilepos\":"));
     s_sleepMode = atoi(parseJson("\"sleepMode\":"));
     s_state = atoi(parseJson("\"state\":"));
 
@@ -451,6 +453,7 @@ void updateSettings() {
     jO.appendf(",\n  \"sleeptime\":{}", s_sleeptime);
     jO.appendf(",\n  \"lastconnectedhost\":\"{}\"", s_settings.lastconnectedhost.c_get());
     jO.appendf(",\n  \"lastconnectedfile\":\"{}\"", s_settings.lastconnectedfile.c_get());
+    jO.appendf(",\n  \"lastconnectedfilepos\":{}", s_settings.lastconnectedfilepos);
     jO.appendf(",\n  \"station\":{}", s_cur_station);
     jO.appendf(",\n  \"Timezone_Name\":\"{}\"", s_TZName.c_get());
     jO.appendf(",\n  \"Timezone_String\":\"{}\"", s_TZString.c_get());
@@ -1113,6 +1116,21 @@ void connecttohost(ps_ptr<char> host) {
 // from one place instead of repeating the same check at each call site.
 static bool usbStorageBlocksSdAppAccess();
 
+static bool isUserLocalAudioPath(const char* filename) {
+    if (!filename || !isAudio(filename)) return false;
+    if (startsWith(filename, "/ring/")) return false;
+    if (startsWith(filename, "/voice_time/")) return false;
+    return true;
+}
+
+static void rememberCurrentLocalPlayback(bool persist) {
+    if (!s_f_isFSConnected) return;
+    if (s_settings.lastconnectedfile.valid()) {
+        s_settings.lastconnectedfilepos = audio.getAudioCurrentTime();
+        if (persist) updateSettings();
+    }
+}
+
 void connecttoFS(const char* FS, const char* filename, uint32_t fileStartTime) {
     if (!filename) return;
     // The SD card is exposed as a raw USB block device while mounted/
@@ -1131,14 +1149,15 @@ void connecttoFS(const char* FS, const char* filename, uint32_t fileStartTime) {
     s_f_pauseResume = false;
     s_f_isFSConnected = audio.connecttoFS(SD_MMC, filename, fileStartTime);
     s_f_isWebConnected = false;
-    if (!startsWith(filename, "/audiofiles/")) { return; }
-    if (s_f_isFSConnected && isAudio(filename)) {
+    if (s_f_isFSConnected && isUserLocalAudioPath(filename)) {
         s_settings.lastconnectedfile.copy_from(filename);
+        s_settings.lastconnectedfilepos = fileStartTime;
         s_SD_content.setLastConnectedFile(filename);
         s_cur_AudioFolder = s_SD_content.getLastConnectedFolder();
         s_cur_AudioFileName = s_SD_content.getLastConnectedFileName();
         s_cur_AudioFileNr = s_SD_content.getPosByFileName(s_cur_AudioFileName.c_get());
         if (s_cur_AudioFileNr == -1) s_cur_AudioFileNr = 0;
+        updateSettings();
     }
     MWR_LOG_DEBUG("Filesize {}", audio.getFileSize());
     MWR_LOG_DEBUG("FilePos {}", audio.getAudioFilePosition());
@@ -1190,7 +1209,10 @@ static bool playerCorePlayStationNumber(uint16_t stationNumber) {
     s_f_newIcyDescription = true;
     connecttohost(s_stationURL);
     printfln(s_tag.action, "LVGL switch to station " ANSI_ESC_CYAN "{}", stationNumber);
-    if (s_f_isWebConnected) s_memLogRadioAtSec = s_totalRuntime + 5; // see loopLvglRuntime()'s s_f_1sec block
+    if (s_f_isWebConnected) {
+        s_memLogRadioAtSec = s_totalRuntime + 5; // see loopLvglRuntime()'s s_f_1sec block
+        updateSettings();
+    }
     return s_f_isWebConnected;
 }
 
@@ -1205,6 +1227,18 @@ bool playerCoreRadioStation(uint16_t index, RadioStationItem* item) {
     strlcpy(item->url, staMgnt.getStationUrl(index), sizeof(item->url));
     return true;
 }
+
+uint16_t playerCoreCurrentRadioStationNumber() {
+    const uint16_t count = staMgnt.getSumStations();
+    if (!count) return 0;
+    return (s_cur_station >= 1 && s_cur_station <= count) ? s_cur_station : 1;
+}
+
+const char* playerCoreLastLocalFilePath() {
+    return s_settings.lastconnectedfile.valid() ? s_settings.lastconnectedfile.c_get() : "";
+}
+
+uint32_t playerCoreLastLocalFilePosition() { return s_settings.lastconnectedfilepos; }
 
 bool playerCorePlayRadioStation(uint16_t index) { return playerCorePlayStationNumber(index); }
 
@@ -1221,7 +1255,10 @@ bool playerCorePlaySdFile(const char* path, uint32_t positionSeconds) {
     return s_f_isFSConnected;
 }
 
-void playerCoreStop() { stopSong(); }
+void playerCoreStop() {
+    rememberCurrentLocalPlayback(true);
+    stopSong();
+}
 
 static bool audioPauseResumeAndUpdateState() {
     const bool accepted = audio.pauseResume();
