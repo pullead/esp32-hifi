@@ -7,6 +7,9 @@ class HifiUi {
   public:
     bool begin();
     void tick();
+    // USB storage mode: show the USB page (status/debug/unmount) directly,
+    // without going through the normal page stack.
+    static void showUsbStoragePage();
 
   private:
     // 320x170 design spec: docs/UI_DESIGN_SPEC.md. RadioList is the station
@@ -346,6 +349,12 @@ class HifiUi {
     lv_obj_t* m_usbStorageButton = nullptr;
     lv_obj_t* m_usbStorageButtonLabel = nullptr;
     UsbStorageState m_lastUsbStorageState = UsbStorageState::Unsupported;
+    // Mount confirmation: the first tap on 挂载 arms the button, a second
+    // tap within 5s actually mounts (mount now stops playback and reboots
+    // into USB storage mode). Auto-expires in refreshUsbStorage().
+    bool m_usbStorageConfirmArmed = false;
+    uint32_t m_usbStorageConfirmArmedAt = 0;
+    bool m_lastUsbStorageConfirmArmed = false;
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to

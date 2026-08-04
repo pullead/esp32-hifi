@@ -13,3 +13,7 @@ bool lvglRuntimeBegin() {
 void lvglRuntimeTick() {
     s_hifiUi.tick();
 }
+
+void lvglRuntimeShowUsbStoragePage() {
+    s_hifiUi.showUsbStoragePage();
+}

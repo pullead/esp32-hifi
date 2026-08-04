@@ -835,6 +835,31 @@ static void unlockPreferences() {
     if (s_prefMutex) xSemaphoreGive(s_prefMutex);
 }
 
+// USB storage mode is entered by writing a temporary NVS flag and
+// rebooting. Runtime USB.begin() is unsafe on this board (ESP_RST_USB --
+// see DEV_LOG 2026-07-31), so TinyUSB is only ever started at boot:
+// never in normal mode, and with media exposed immediately in storage
+// mode. The flag is cleared (and the board rebooted) on host eject or on
+// the unmount button, so normal boots never initialize TinyUSB and the
+// USB-Serial/JTAG console stays alive.
+static constexpr const char* kUsbMscModePrefKey = "usb_msc_mode";
+
+static bool usbMscModeFlag() {
+    bool value = false;
+    if (lockPreferences()) {
+        value = pref.getBool(kUsbMscModePrefKey, false);
+        unlockPreferences();
+    }
+    return value;
+}
+
+static void usbMscSetModeFlag(bool on) {
+    if (lockPreferences(pdMS_TO_TICKS(1000))) {
+        pref.putBool(kUsbMscModePrefKey, on);
+        unlockPreferences();
+    }
+}
+
 static ps_ptr<char> wifiPrefGet(uint8_t i) {
     ps_ptr<char> line;
     if (!lockPreferences()) {
@@ -1477,6 +1502,7 @@ static volatile bool s_localLibraryScanning = false;
 // s_usbStorageState itself is declared earlier now (see playerCorePlaySdFile()'s comment) -- the rest of the USB-storage statics stay here.
 static volatile bool s_usbStorageBusy = false;
 static volatile bool s_usbStorageHostEjected = false;
+static bool s_usbMscModeActive = false;
 static volatile uint32_t s_usbStorageLastAccessMs = 0;
 static volatile uint32_t s_usbMscReadCount = 0;
 static volatile uint32_t s_usbMscWriteCount = 0;
@@ -1498,6 +1524,7 @@ static UsbStorageFormatInfo s_usbStorageFormatInfo{};
 static USBMSC s_usbMsc;
 static bool s_usbMscConfigured = false;
 static bool s_usbStarted = false;
+static uint16_t s_usbMscSectorSize = 0;
 static constexpr bool kUsbMscReadOnlyProbe = false;
 static constexpr bool kUsbMscExposePartitionOnly = false;
 static constexpr bool kUsbMscBootPresentProbe = false;
@@ -1598,12 +1625,17 @@ static void usbStorageUpdateFormatInfo(uint32_t partitionStartLba, uint64_t tota
     s_usbStorageFormatInfo = info;
 }
 
-static bool usbStoragePrepareMsc(bool mediaPresent) {
+// Geometry/format probe only -- no USB side effects. Called at every normal
+// boot so the USB storage page can show FAT type / allocation unit /
+// capacity without ever starting TinyUSB (which would take over the single
+// USB-C port away from the serial console).
+static bool usbStorageProbeGeometry() {
     const int sectorSize = SD_MMC.sectorSize();
     if (sectorSize <= 0) {
         MWR_LOG_ERROR("USB MSC init failed: invalid SD sector size");
         return false;
     }
+    s_usbMscSectorSize = static_cast<uint16_t>(sectorSize);
 
     const uint64_t cardBytes = SD_MMC.cardSize();
     const uint64_t sectorCount64 = cardBytes / static_cast<uint32_t>(sectorSize);
@@ -1619,9 +1651,9 @@ static bool usbStoragePrepareMsc(bool mediaPresent) {
     {
         uint8_t lba0[512];
         bool lba0Ok = false;
-        printf("[USBMSC] init cardBytes=%llu sectorSize=%d sectorCount=%u mode=%s media=%u\n",
+        printf("[USBMSC] init cardBytes=%llu sectorSize=%d sectorCount=%u mode=%s\n",
                static_cast<unsigned long long>(cardBytes), sectorSize, static_cast<unsigned>(sectorCount),
-               kUsbMscReadOnlyProbe ? "read-only" : "read-write", static_cast<unsigned>(mediaPresent));
+               kUsbMscReadOnlyProbe ? "read-only" : "read-write");
         if (sectorSize <= (int)sizeof(lba0) && SD_MMC.readRAW(lba0, 0)) {
             lba0Ok = true;
             printf("[USBMSC] lba0 bootsig[510..511]= %02X %02X\n", lba0[510], lba0[511]);
@@ -1654,7 +1686,11 @@ static bool usbStoragePrepareMsc(bool mediaPresent) {
     printf("[USBMSC] expose base=%u blocks=%u partitionOnly=%u\n",
            static_cast<unsigned>(s_usbMscLbaBase), static_cast<unsigned>(s_usbMscBlockCount),
            static_cast<unsigned>(kUsbMscExposePartitionOnly));
+    return true;
+}
 
+static bool usbStoragePrepareMsc(bool mediaPresent) {
+    if (!usbStorageProbeGeometry()) return false;
     if (!s_usbMscConfigured) {
         s_usbMsc.vendorID("ESP32S3");
         s_usbMsc.productID("HiFi SD");
@@ -1664,7 +1700,7 @@ static bool usbStoragePrepareMsc(bool mediaPresent) {
         s_usbMsc.onStartStop(usbMscStartStop);
         s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
         s_usbMsc.mediaPresent(mediaPresent);
-        if (!s_usbMsc.begin(static_cast<uint32_t>(s_usbMscBlockCount), static_cast<uint16_t>(sectorSize))) {
+        if (!s_usbMsc.begin(static_cast<uint32_t>(s_usbMscBlockCount), s_usbMscSectorSize)) {
             MWR_LOG_ERROR("USB MSC begin failed");
             s_usbMsc.mediaPresent(false);
             return false;
@@ -2221,205 +2257,30 @@ static bool usbMscStartStop(uint8_t powerCondition, bool start, bool loadEject) 
     return true;
 }
 
-static void usbStorageMountTask(void*) {
+static void usbStorageRebootToMscTask(void*) {
+    // Mounting now means "write the NVS flag and reboot into USB storage
+    // mode" -- TinyUSB is only ever started at boot (runtime USB.begin()
+    // is unsafe: ESP_RST_USB, see DEV_LOG 2026-07-31). The short delay
+    // lets the UI paint the "正在重启进入U盘模式" state before the reboot.
     s_usbStorageState = UsbStorageState::Mounting;
-    s_usbMscReadCount = 0;
-    s_usbMscWriteCount = 0;
-    s_usbMscReadFailCount = 0;
-    s_usbMscWriteFailCount = 0;
-    s_usbMscLastLba = 0;
-    s_usbMscMinLba = 0;
-    s_usbMscMaxLba = 0;
-    s_usbMscLastOffset = 0;
-    s_usbMscLastSize = 0;
-    s_usbMscMaxSize = 0;
-    s_usbMscLastResult = 0;
-    stopSong();
-    s_memLogLocalAtSec = 0;
-
-    const uint32_t scanWaitStart = millis();
-    while (s_localLibraryScanning && millis() - scanWaitStart < 10000) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    if (s_localLibraryScanning) {
-        MWR_LOG_ERROR("USB MSC mount failed: local SD scan did not stop in time");
-        s_usbStorageState = UsbStorageState::Error;
-        s_usbStorageBusy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-    vTaskDelay(pdMS_TO_TICKS(250));
-
-    if (!s_usbStarted || !s_usbMscConfigured) {
-        MWR_LOG_ERROR("USB MSC mount failed: USB device was not initialized at boot");
-        s_usbStorageState = UsbStorageState::Error;
-        s_usbStorageBusy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-    s_usbStorageHostEjected = false;
-    s_usbStorageLastAccessMs = millis();
-    s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
-    s_usbMsc.mediaPresent(true);
-    printf("[USBMSC] media present\n");
-    s_usbStorageState = UsbStorageState::Mounted;
-    s_usbStorageBusy = false;
-    vTaskDelete(nullptr);
-    return;
-
-    const int sectorSize = SD_MMC.sectorSize();
-    if (sectorSize <= 0) {
-        MWR_LOG_ERROR("USB MSC mount failed: invalid SD sector size");
-        s_usbStorageState = UsbStorageState::Error;
-        s_usbStorageBusy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    // NOT SD_MMC.numSectors(): despite the name, that returns the mounted
-    // FAT filesystem's *data area* cluster count (totalBytes()/sectorSize(),
-    // where totalBytes() comes from f_getfree()'s cluster accounting) --
-    // it excludes the boot sector, reserved sectors, FAT tables, and root
-    // directory area, so it's always smaller than the card's real physical
-    // capacity. Exposing that truncated count as the USB MSC device's total
-    // sector count produces a device whose MBR partition table (written by
-    // whatever originally formatted the card against its true capacity)
-    // describes a partition extending past the end of what we report --
-    // which is exactly what made macOS show "此电脑不能读取你连接的磁盘"
-    // (confirmed via LBA0 dump: partition table said sectors up to
-    // 125,173,759, but numSectors() only reported 123,217,825). cardSize()
-    // returns the actual physical capacity (csd.capacity * csd.sector_size),
-    // which is what a raw block-device passthrough needs.
-    const uint64_t cardBytes = SD_MMC.cardSize();
-    const uint64_t sectorCount64 = cardBytes / static_cast<uint32_t>(sectorSize);
-    if (cardBytes == 0 || sectorCount64 == 0 || sectorCount64 > 0xFFFFFFFFULL) {
-        MWR_LOG_ERROR("USB MSC mount failed: invalid SD sector geometry");
-        s_usbStorageState = UsbStorageState::Error;
-        s_usbStorageBusy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-    const uint32_t sectorCount = static_cast<uint32_t>(sectorCount64);
-
-    // Diagnostic dump before USB.begin() -- once the native USB peripheral
-    // switches into TinyUSB device mode, this board's single USB-C port
-    // stops being a serial console (confirmed empirically: the host-side
-    // capture dies with "Device not configured" the instant USB.begin()
-    // runs), so anything printed after this point is unobservable over
-    // serial. Print the raw LBA0 sector here, before that happens, so a
-    // "此电脑不能读取你连接的磁盘" failure on the host can be diagnosed from
-    // what the SD card is actually handing back.
-    {
-        uint8_t lba0[512];
-        bool lba0Ok = false;
-        printf("[USBMSC] pre-mount cardBytes=%llu sectorSize=%d sectorCount=%u mode=%s\n",
-               static_cast<unsigned long long>(cardBytes), sectorSize, static_cast<unsigned>(sectorCount),
-               kUsbMscReadOnlyProbe ? "read-only" : "read-write");
-        if (sectorSize <= (int)sizeof(lba0) && SD_MMC.readRAW(lba0, 0)) {
-            lba0Ok = true;
-            auto dumpRange = [&](const char* label, int start, int len) {
-                char line[256];
-                int pos = snprintf(line, sizeof(line), "[USBMSC] lba0[%d..%d] (%s):", start, start + len - 1, label);
-                for (int i = 0; i < len && pos < (int)sizeof(line) - 4; ++i) {
-                    pos += snprintf(line + pos, sizeof(line) - pos, " %02X", lba0[start + i]);
-                }
-                printf("%s\n", line);
-            };
-            // BPB/EBPB region (covers jump instr, OEM name, bytes/sector,
-            // sectors/cluster, FAT count, etc. for a raw superfloppy FAT
-            // volume boot sector, if that's what's actually at LBA0).
-            dumpRange("BPB", 0, 64);
-            // MBR partition table: 4 entries x 16 bytes starting at 446. If
-            // this SD card actually has a partition table (common for
-            // factory-formatted cards) rather than a raw/superfloppy FAT
-            // volume, this is where the real filesystem's start LBA lives.
-            dumpRange("partition table", 446, 64);
-            printf("[USBMSC] lba0 bootsig[510..511]= %02X %02X\n", lba0[510], lba0[511]);
-        } else {
-            printf("[USBMSC] readRAW(lba0) FAILED\n");
-        }
-        fflush(stdout);
-        if (lba0Ok && !usbMscMbrFitsDevice(lba0, sectorCount)) {
-            MWR_LOG_ERROR("USB MSC mount failed: SD partition exceeds exposed device size");
-            s_usbStorageState = UsbStorageState::Error;
-            s_usbStorageBusy = false;
-            vTaskDelete(nullptr);
-            return;
-        }
-    }
-
-    if (!s_usbMscConfigured) {
-        s_usbMsc.vendorID("ESP32S3");
-        s_usbMsc.productID("HiFi SD");
-        s_usbMsc.productRevision("1.0");
-        s_usbMsc.onRead(usbMscRead);
-        s_usbMsc.onWrite(usbMscWrite);
-        s_usbMsc.onStartStop(usbMscStartStop);
-        s_usbMscConfigured = true;
-    }
-    s_usbStorageHostEjected = false;
-    s_usbStorageLastAccessMs = millis();
-    s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
-    s_usbMsc.mediaPresent(true);
-    if (!s_usbMsc.begin(static_cast<uint32_t>(sectorCount), static_cast<uint16_t>(sectorSize))) {
-        MWR_LOG_ERROR("USB MSC begin failed");
-        s_usbMsc.mediaPresent(false);
-        s_usbStorageState = UsbStorageState::Error;
-        s_usbStorageBusy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-
-    if (!s_usbStarted) {
-        USB.manufacturerName("ESP32-S3 HiFi");
-        USB.productName("HiFi SD Card");
-        printf("[USBMSC] before USB.begin resetReason=%d\n", static_cast<int>(esp_reset_reason()));
-        fflush(stdout);
-        s_usbStarted = USB.begin();
-        printf("[USBMSC] after USB.begin ok=%u resetReason=%d\n", static_cast<unsigned>(s_usbStarted), static_cast<int>(esp_reset_reason()));
-        fflush(stdout);
-        if (!s_usbStarted) {
-            MWR_LOG_ERROR("USB begin failed");
-            s_usbMsc.mediaPresent(false);
-            s_usbMsc.end();
-            s_usbMscConfigured = false;
-            s_usbStorageState = UsbStorageState::Error;
-            s_usbStorageBusy = false;
-            vTaskDelete(nullptr);
-            return;
-        }
-    }
-
-    printf("[USBMSC] mounted sectors=%u sectorSize=%d\n", static_cast<unsigned>(sectorCount), sectorSize);
-    s_usbStorageState = UsbStorageState::Mounted;
-    s_usbStorageBusy = false;
+    vTaskDelay(pdMS_TO_TICKS(400));
+    ESP.restart();
     vTaskDelete(nullptr);
 }
 
-static void usbStorageUnmountTask(void*) {
+static void usbStorageRebootToNormalTask(void*) {
+    // Leaving storage mode is the mirror image: clear the flag and reboot
+    // back into the normal app, which remounts SD and rescans /Music.
     s_usbStorageState = UsbStorageState::Restoring;
+    // Give any pending host writes a moment to settle before the reboot
+    // (same quiesce window the old unmount task used).
     const uint32_t waitStart = millis();
     while (millis() - s_usbStorageLastAccessMs < 1000 && millis() - waitStart < 3000) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
-
-    s_usbMsc.mediaPresent(false);
-    vTaskDelay(pdMS_TO_TICKS(500));
-
-    SD_MMC.end();
-    vTaskDelay(pdMS_TO_TICKS(200));
-    if (!init_SD_card()) {
-        s_usbStorageState = UsbStorageState::Error;
-        s_usbStorageBusy = false;
-        vTaskDelete(nullptr);
-        return;
-    }
-    ensureLocalMusicDir();
-    usbStorageUpdateFormatInfo(s_usbStoragePartitionStartLba, SD_MMC.cardSize(), SD_MMC.usedBytes());
-
-    if (startLocalMusicScan()) s_usbStorageState = UsbStorageState::Scanning;
-    else s_usbStorageState = UsbStorageState::Idle;
-    s_usbStorageBusy = false;
+    usbMscSetModeFlag(false);
+    vTaskDelay(pdMS_TO_TICKS(400));
+    ESP.restart();
     vTaskDelete(nullptr);
 }
 #endif
@@ -2451,12 +2312,15 @@ bool playerCoreUsbStorageFormatInfo(UsbStorageFormatInfo* out) {
 bool playerCoreUsbStorageMount() {
 #if MWR_USB_MSC_SUPPORTED
     if ((s_usbStorageState != UsbStorageState::Idle && s_usbStorageState != UsbStorageState::Error) || s_usbStorageBusy) return false;
+    stopSong(); // stop playback before handing the SD card to the host
     s_usbStorageBusy = true;
-    const BaseType_t created = xTaskCreate(usbStorageMountTask, "usbMscOn", 4096, nullptr, 2, nullptr);
+    usbMscSetModeFlag(true);
+    const BaseType_t created = xTaskCreate(usbStorageRebootToMscTask, "usbMscOn", 4096, nullptr, 2, nullptr);
     if (created != pdPASS) {
         s_usbStorageBusy = false;
+        usbMscSetModeFlag(false);
         s_usbStorageState = UsbStorageState::Error;
-        MWR_LOG_ERROR("Failed to create USB MSC mount task");
+        MWR_LOG_ERROR("Failed to create USB MSC reboot task");
         return false;
     }
     return true;
@@ -2470,10 +2334,10 @@ bool playerCoreUsbStorageUnmount() {
 #if MWR_USB_MSC_SUPPORTED
     if (s_usbStorageState != UsbStorageState::Mounted || s_usbStorageBusy) return false;
     s_usbStorageBusy = true;
-    const BaseType_t created = xTaskCreate(usbStorageUnmountTask, "usbMscOff", 6144, nullptr, 2, nullptr);
+    const BaseType_t created = xTaskCreate(usbStorageRebootToNormalTask, "usbMscOff", 4096, nullptr, 2, nullptr);
     if (created != pdPASS) {
         s_usbStorageBusy = false;
-        MWR_LOG_ERROR("Failed to create USB MSC unmount task");
+        MWR_LOG_ERROR("Failed to create USB MSC reboot task");
         return false;
     }
     return true;
@@ -3770,14 +3634,42 @@ static bool setupLvglRuntime() {
     if (!init_SD_card()) return false;
     ensureLocalMusicDir();
 #if MWR_USB_MSC_SUPPORTED
-    if (!usbStoragePrepareMsc(kUsbMscBootPresentProbe)) {
-        MWR_LOG_ERROR("USB MSC boot initialization failed");
-        s_usbStorageState = UsbStorageState::Error;
-    } else if (kUsbMscBootPresentProbe) {
+    if (usbMscModeFlag()) {
+        // USB storage mode: expose the SD card to the host immediately.
+        // TinyUSB must be initialized at boot (runtime USB.begin() is
+        // unsafe -- ESP_RST_USB, see DEV_LOG 2026-07-31), so this mode is
+        // entered by writing an NVS flag and rebooting. Skip WiFi, audio
+        // and the music scan; keep only the minimal USB page.
+        s_usbMscModeActive = true;
+        if (!usbStoragePrepareMsc(true)) {
+            MWR_LOG_ERROR("USB storage mode init failed -- clearing flag and rebooting to normal mode");
+            usbMscSetModeFlag(false);
+            s_usbMscModeActive = false;
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ESP.restart();
+            return false;
+        }
         s_usbStorageState = UsbStorageState::Mounted;
+        printfln(s_tag.setup, ANSI_ESC_GREEN "[LVGL] display begin (USB storage mode)");
+        if (!lvglRuntimeBegin()) {
+            MWR_LOG_ERROR("LVGL display begin failed in USB storage mode");
+            usbMscSetModeFlag(false);
+            s_usbMscModeActive = false;
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ESP.restart();
+            return false;
+        }
+        lvglRuntimeShowUsbStoragePage();
+        return true;
+    }
+    // Normal mode: never start TinyUSB at boot (the single USB-C port
+    // stays a serial console). Only probe the SD geometry/format so the
+    // USB page can display FAT/allocation/capacity before mount.
+    if (!usbStorageProbeGeometry()) {
+        MWR_LOG_WARN("USB storage geometry probe failed (SD may be absent)");
     }
 #endif
-    if (!kUsbMscBootPresentProbe) startLocalMusicScan();
+    startLocalMusicScan();
     if (!defaultsettings()) return false;
     if (ESP.getFlashChipSize() > 80000000) FFat.begin();
     logMemoryState("after_sd_init");
@@ -3846,6 +3738,15 @@ static bool setupLvglRuntime() {
 
 static void loopLvglRuntime() {
     processUsbStorage();
+#if MWR_USB_MSC_SUPPORTED
+    if (s_usbMscModeActive) {
+        // USB storage mode: no audio/WiFi/web/dlna ticks -- just keep the
+        // minimal USB page alive and watch for host eject (processUsbStorage
+        // above turns that into a reboot back to normal mode).
+        lvglRuntimeTick();
+        return;
+    }
+#endif
     dlna.loop();
     audio.loop();
     if (s_lvglNetworkReady && !usbStorageBlocksSdAppAccess()) {

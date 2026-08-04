@@ -762,6 +762,10 @@ lv_obj_t* HifiUi::makeCard(lv_obj_t* parent, const char* icon, const char* label
     return card;
 }
 
+void HifiUi::showUsbStoragePage() {
+    if (s_instance) s_instance->show(Page::UsbStorage);
+}
+
 void HifiUi::show(Page page) {
     // Genuinely entering the WiFi settings page from elsewhere (not
     // refreshSettingsWifi() rebuilding it in place after a saved-list change)
@@ -2841,7 +2845,7 @@ void HifiUi::buildUsbStorage() {
 
         lv_obj_t* usbPanel = lv_obj_create(usbScreen);
         lv_obj_set_pos(usbPanel, 10, 30);
-        lv_obj_set_size(usbPanel, 300, 72);
+        lv_obj_set_size(usbPanel, 300, 86);
         lv_obj_set_style_radius(usbPanel, 8, 0);
         lv_obj_set_style_bg_color(usbPanel, kPanel, 0);
         lv_obj_set_style_bg_opa(usbPanel, LV_OPA_COVER, 0);
@@ -2862,21 +2866,25 @@ void HifiUi::buildUsbStorage() {
         lv_obj_clear_flag(usbIcon, LV_OBJ_FLAG_SCROLLABLE);
         makeText(usbIcon, LV_SYMBOL_USB, &lv_font_montserrat_16, kAccentBright, LV_ALIGN_CENTER, 0, 0);
 
-        m_usbStorageStatus = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_TOP_LEFT, 60, 8);
+        m_usbStorageStatus = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_TOP_LEFT, 60, 4);
         lv_obj_set_width(m_usbStorageStatus, 146);
         lv_label_set_long_mode(m_usbStorageStatus, LV_LABEL_LONG_DOT);
 
-        m_usbStorageDetail = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInkDim, LV_ALIGN_TOP_LEFT, 60, 30);
+        m_usbStorageDetail = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInkDim, LV_ALIGN_TOP_LEFT, 60, 22);
         lv_obj_set_width(m_usbStorageDetail, 226);
         lv_label_set_long_mode(m_usbStorageDetail, LV_LABEL_LONG_DOT);
 
-        m_usbStorageHint = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInkFaint, LV_ALIGN_TOP_LEFT, 12, 53);
+        m_usbStorageHint = makeText(usbPanel, "", HIFI_FONT_DYNAMIC_TEXT, kInkFaint, LV_ALIGN_TOP_LEFT, 12, 40);
         lv_obj_set_width(m_usbStorageHint, 276);
         lv_label_set_long_mode(m_usbStorageHint, LV_LABEL_LONG_DOT);
 
+        m_usbStorageDebug = makeText(usbPanel, "", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 12, 58);
+        lv_obj_set_width(m_usbStorageDebug, 276);
+        lv_label_set_long_mode(m_usbStorageDebug, LV_LABEL_LONG_WRAP);
+
         auto makeUsbInfoBox = [&](int16_t x, const char* icon, const char* label) {
             lv_obj_t* box = lv_obj_create(usbScreen);
-            lv_obj_set_pos(box, x, 108);
+            lv_obj_set_pos(box, x, 118);
             lv_obj_set_size(box, 145, 24);
             lv_obj_set_style_radius(box, 7, 0);
             lv_obj_set_style_bg_color(box, kPanelDeep, 0);
@@ -2903,7 +2911,7 @@ void HifiUi::buildUsbStorage() {
         lv_label_set_long_mode(m_usbStorageCapacity, LV_LABEL_LONG_DOT);
 
         m_usbStorageButton = lv_btn_create(usbScreen);
-        lv_obj_set_pos(m_usbStorageButton, 10, 138);
+        lv_obj_set_pos(m_usbStorageButton, 10, 140);
         lv_obj_set_size(m_usbStorageButton, 300, 26);
         lv_obj_set_style_radius(m_usbStorageButton, 8, 0);
         lv_obj_set_style_border_width(m_usbStorageButton, 0, 0);
@@ -2976,8 +2984,12 @@ void HifiUi::refreshUsbStorage() {
     {
         if (!m_usbStorageStatus || !m_usbStorageDetail || !m_usbStorageFormat || !m_usbStorageCapacity || !m_usbStorageHint || !m_usbStorageButton || !m_usbStorageButtonLabel) return;
         const UsbStorageState state = playerService.usbStorageState();
-        if (state == m_lastUsbStorageState && state != UsbStorageState::Scanning) return;
+        if (m_usbStorageConfirmArmed && millis() - m_usbStorageConfirmArmedAt > 5000) m_usbStorageConfirmArmed = false;
+        const bool confirmArmed = (state == UsbStorageState::Idle || state == UsbStorageState::Error) && m_usbStorageConfirmArmed;
+        const bool confirmChanged = confirmArmed != m_lastUsbStorageConfirmArmed;
+        if (state == m_lastUsbStorageState && state != UsbStorageState::Scanning && !confirmChanged) return;
         m_lastUsbStorageState = state;
+        m_lastUsbStorageConfirmArmed = confirmArmed;
 
         const char* title = "准备共享";
         const char* detail = "点击后电脑将显示 SD 卡";
@@ -3041,6 +3053,12 @@ void HifiUi::refreshUsbStorage() {
                 break;
         }
 
+        if (confirmArmed) {
+            button = "再次点击确认挂载";
+            hint = "将停止播放并重启进入U盘模式";
+            buttonColor = kAccent;
+        }
+
         UsbStorageFormatInfo formatInfo;
         const bool hasFormat = playerService.usbStorageFormatInfo(&formatInfo);
         char formatText[32] = "--";
@@ -3059,6 +3077,19 @@ void HifiUi::refreshUsbStorage() {
             formatStorageSize(formatInfo.usedBytes, used, sizeof(used));
             formatStorageSize(formatInfo.totalBytes, total, sizeof(total));
             snprintf(capacityText, sizeof(capacityText), "%s/%s", used, total);
+        }
+
+        if (m_usbStorageDebug) {
+            UsbStorageStats stats;
+            if (playerService.usbStorageStats(&stats)) {
+                char debug[96];
+                snprintf(debug, sizeof(debug), "R%lu/%lu W%lu/%lu S%lu R%ld M%lu",
+                         static_cast<unsigned long>(stats.readCount), static_cast<unsigned long>(stats.readFailCount),
+                         static_cast<unsigned long>(stats.writeCount), static_cast<unsigned long>(stats.writeFailCount),
+                         static_cast<unsigned long>(stats.lastSize), static_cast<long>(stats.lastResult),
+                         static_cast<unsigned long>(stats.maxSize));
+                lv_label_set_text(m_usbStorageDebug, debug);
+            }
         }
 
         lv_label_set_text(m_usbStorageStatus, title);
@@ -4163,8 +4194,18 @@ void HifiUi::onUsbStorageAction(lv_event_t* event) {
     if (!s_instance) return;
     const UsbStorageState state = playerService.usbStorageState();
     if (state == UsbStorageState::Idle || state == UsbStorageState::Error) {
-        playerService.usbStorageMount();
+        // Two-tap confirmation: mounting stops playback and reboots into
+        // USB storage mode, so the first tap only arms the button.
+        const uint32_t now = millis();
+        if (!s_instance->m_usbStorageConfirmArmed || now - s_instance->m_usbStorageConfirmArmedAt > 5000) {
+            s_instance->m_usbStorageConfirmArmed = true;
+            s_instance->m_usbStorageConfirmArmedAt = now;
+        } else {
+            s_instance->m_usbStorageConfirmArmed = false;
+            playerService.usbStorageMount();
+        }
     } else if (state == UsbStorageState::Mounted) {
+        s_instance->m_usbStorageConfirmArmed = false;
         playerService.usbStorageUnmount();
     }
     s_instance->refreshUsbStorage();
