@@ -854,6 +854,9 @@ void HifiUi::show(Page page) {
     m_usbStorageDebug = nullptr;
     m_usbStorageButton = m_usbStorageButtonLabel = nullptr;
     m_lastUsbStorageState = UsbStorageState::Unsupported;
+    m_cloudBaseUrlField = m_cloudDeviceKeyField = m_cloudKeyboard = nullptr;
+    m_cloudStatusLabel = m_cloudHintLabel = nullptr;
+    m_lastCloudServiceState = CloudServiceState::Unknown;
     for (auto& slider : m_audioEqSliders) slider = nullptr;
     for (auto& label : m_audioEqValueLabels) label = nullptr;
     for (auto& button : m_audioEqPresetButtons) button = nullptr;
@@ -892,6 +895,7 @@ void HifiUi::show(Page page) {
     else if (page == Page::AudioEqBand) buildAudioEqBand();
     else if (page == Page::AudioEffects) buildAudioEffects();
     else if (page == Page::AudioDac) buildAudioDac();
+    else if (page == Page::CloudMusicSettings) buildCloudMusicSettings();
     else buildPlaceholder("SETTINGS / EQ", "Audio, EQ, network and sleep");
 }
 
@@ -2828,14 +2832,22 @@ void HifiUi::buildSettings() {
     buildStatusBar(screen);
     makeText(screen, "设置", &lv_font_cjk_16, kInk, LV_ALIGN_TOP_LEFT, 12, 28);
 
-    lv_obj_t* wifiCard = makeCard(screen, LV_SYMBOL_WIFI, "WiFi", Page::SettingsWifi, 10, 56, 66, 76);
+    // 5 cards across, evenly spaced (54px wide, 10px gaps, 5px margins --
+    // was 4 cards at 66px/10px/10px before 在线音乐 needed a slot).
+    lv_obj_t* wifiCard = makeCard(screen, LV_SYMBOL_WIFI, "WiFi", Page::SettingsWifi, 5, 56, 54, 76);
     (void)wifiCard;
-    lv_obj_t* fontCard = makeCard(screen, LV_SYMBOL_EYE_OPEN, "字体", Page::FontPreview, 88, 56, 66, 76);
+    lv_obj_t* fontCard = makeCard(screen, LV_SYMBOL_EYE_OPEN, "字体", Page::FontPreview, 69, 56, 54, 76);
     (void)fontCard;
-    lv_obj_t* audioCard = makeCard(screen, LV_SYMBOL_AUDIO, "音频", Page::AudioHome, 166, 56, 66, 76);
+    lv_obj_t* audioCard = makeCard(screen, LV_SYMBOL_AUDIO, "音频", Page::AudioHome, 133, 56, 54, 76);
     (void)audioCard;
-    lv_obj_t* usbCard = makeCard(screen, LV_SYMBOL_USB, "U盘", Page::UsbStorage, 244, 56, 66, 76);
+    lv_obj_t* usbCard = makeCard(screen, LV_SYMBOL_USB, "U盘", Page::UsbStorage, 197, 56, 54, 76);
     (void)usbCard;
+    // LV_SYMBOL_GPS reads as "network/online" -- LVGL 8's symbol set has no
+    // literal cloud/note glyph; revisit once the online-music feature has
+    // its own hand-drawn icon (see buildAudioMetricIcon's precedent) in a
+    // later phase.
+    lv_obj_t* cloudCard = makeCard(screen, LV_SYMBOL_GPS, "在线音乐", Page::CloudMusicSettings, 261, 56, 54, 76);
+    (void)cloudCard;
 }
 
 void HifiUi::buildUsbStorage() {
@@ -3190,6 +3202,162 @@ void HifiUi::refreshUsbStorage() {
     lv_obj_set_style_bg_opa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
     if (enabled) lv_obj_clear_state(m_usbStorageButton, LV_STATE_DISABLED);
     else lv_obj_add_state(m_usbStorageButton, LV_STATE_DISABLED);
+}
+
+// Settings > 在线音乐: gateway URL + device key entry, plus a manual
+// "测试连接" trigger for the health/wake state machine
+// (playerCoreCloudMusicWakeStart(), see main.cpp). Phase 2 scope only --
+// no search/browse/playback here, see docs spec's phased plan.
+//
+// Packed the same way buildSettingsWifi()'s password-entry sub-view is:
+// both text fields + the save button share two compact 20px rows up top so
+// the on-screen keyboard (which needs real room to be usable, see that
+// sub-view's own comment on the stock 4-row map being too cramped) gets
+// almost the entire rest of the 170px-tall screen.
+void HifiUi::buildCloudMusicSettings() {
+    lv_obj_t* screen = lv_scr_act();
+
+    lv_obj_t* backBtn = lv_btn_create(screen);
+    lv_obj_set_pos(backBtn, 2, 0);
+    lv_obj_set_size(backBtn, 18, 20);
+    lv_obj_set_style_bg_opa(backBtn, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(backBtn, 0, 0);
+    lv_obj_set_style_shadow_width(backBtn, 0, 0);
+    lv_obj_set_style_pad_all(backBtn, 0, 0);
+    lv_obj_clear_flag(backBtn, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(backBtn);
+    lv_obj_add_event_cb(backBtn, onTransportAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(kActionBack));
+    lv_obj_t* backLabel = makeText(backBtn, LV_SYMBOL_LEFT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(backLabel, LV_OBJ_FLAG_CLICKABLE);
+
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+
+    m_cloudBaseUrlField = lv_textarea_create(screen);
+    lv_obj_set_pos(m_cloudBaseUrlField, 22, 0);
+    lv_obj_set_size(m_cloudBaseUrlField, 296, 20);
+    lv_textarea_set_one_line(m_cloudBaseUrlField, true);
+    lv_textarea_set_placeholder_text(m_cloudBaseUrlField, "网关地址 https://...");
+    lv_textarea_set_max_length(m_cloudBaseUrlField, sizeof(CloudMusicConfig::baseUrl) - 1);
+    lv_obj_set_style_text_font(m_cloudBaseUrlField, &lv_font_cjk_13, 0);
+    lv_obj_set_style_pad_ver(m_cloudBaseUrlField, 2, 0);
+    if (cfg.baseUrl[0]) lv_textarea_set_text(m_cloudBaseUrlField, cfg.baseUrl);
+    lv_obj_add_event_cb(m_cloudBaseUrlField, onCloudMusicFieldFocusAction, LV_EVENT_FOCUSED, nullptr);
+
+    m_cloudDeviceKeyField = lv_textarea_create(screen);
+    lv_obj_set_pos(m_cloudDeviceKeyField, 0, 20);
+    lv_obj_set_size(m_cloudDeviceKeyField, 254, 20);
+    lv_textarea_set_one_line(m_cloudDeviceKeyField, true);
+    lv_textarea_set_password_mode(m_cloudDeviceKeyField, true); // same posture as a WiFi password -- see CloudMusicConfig's comment
+    lv_textarea_set_placeholder_text(m_cloudDeviceKeyField, "设备密钥");
+    lv_textarea_set_max_length(m_cloudDeviceKeyField, sizeof(CloudMusicConfig::deviceKey) - 1);
+    lv_obj_set_style_text_font(m_cloudDeviceKeyField, &lv_font_cjk_13, 0);
+    lv_obj_set_style_pad_ver(m_cloudDeviceKeyField, 2, 0);
+    if (cfg.deviceKey[0]) lv_textarea_set_text(m_cloudDeviceKeyField, cfg.deviceKey);
+    lv_obj_add_event_cb(m_cloudDeviceKeyField, onCloudMusicFieldFocusAction, LV_EVENT_FOCUSED, nullptr);
+
+    lv_obj_t* saveBtn = lv_btn_create(screen);
+    lv_obj_set_pos(saveBtn, 256, 20);
+    lv_obj_set_size(saveBtn, 62, 20);
+    lv_obj_set_style_radius(saveBtn, 8, 0);
+    lv_obj_set_style_bg_color(saveBtn, kAccentBright, 0);
+    lv_obj_set_style_bg_opa(saveBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(saveBtn, 0, 0);
+    lv_obj_set_style_pad_all(saveBtn, 0, 0);
+    lv_obj_clear_flag(saveBtn, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(saveBtn);
+    lv_obj_add_event_cb(saveBtn, onCloudMusicSaveAction, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* saveLabel = makeText(saveBtn, "保存", &lv_font_cjk_13, lv_color_black(), LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(saveLabel, LV_OBJ_FLAG_CLICKABLE);
+
+    m_cloudStatusLabel = makeText(screen, "", &lv_font_montserrat_12, kInkDim, LV_ALIGN_TOP_LEFT, 4, 41);
+    lv_obj_set_width(m_cloudStatusLabel, 232);
+    lv_label_set_long_mode(m_cloudStatusLabel, LV_LABEL_LONG_DOT);
+
+    lv_obj_t* testBtn = lv_btn_create(screen);
+    lv_obj_set_pos(testBtn, 240, 40);
+    lv_obj_set_size(testBtn, 78, 14);
+    lv_obj_set_style_radius(testBtn, 6, 0);
+    lv_obj_set_style_bg_color(testBtn, kPanelDeep, 0);
+    lv_obj_set_style_bg_opa(testBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(testBtn, kAccent, 0);
+    lv_obj_set_style_border_width(testBtn, 1, 0);
+    lv_obj_set_style_shadow_width(testBtn, 0, 0);
+    lv_obj_set_style_pad_all(testBtn, 0, 0);
+    lv_obj_clear_flag(testBtn, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(testBtn);
+    lv_obj_add_event_cb(testBtn, onCloudMusicTestAction, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* testLabel = makeText(testBtn, "测试连接", &lv_font_montserrat_12, kInkDim, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(testLabel, LV_OBJ_FLAG_CLICKABLE);
+
+    // Same custom 3-row map as buildSettingsWifi()'s password keyboard (see
+    // that comment for why: the stock 4-row map's last row comes out too
+    // cramped on this screen height). Reused verbatim rather than pulled
+    // into a shared helper -- two call sites doesn't justify the
+    // indirection yet.
+    static const char* const kCloudKbMap[] = {
+        "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", LV_SYMBOL_BACKSPACE, "\n",
+        "a", "s", "d", "f", "g", "h", "j", "k", "l", LV_SYMBOL_NEW_LINE, "\n",
+        "1#", "z", "x", "c", "v", "b", "n", "m", " ", ""
+    };
+    static const lv_btnmatrix_ctrl_t kCloudKbCtrl[30] = {
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 4
+    };
+    m_cloudKeyboard = lv_keyboard_create(screen);
+    lv_obj_set_pos(m_cloudKeyboard, 0, 56);
+    lv_obj_set_size(m_cloudKeyboard, 320, 114);
+    lv_obj_set_style_pad_all(m_cloudKeyboard, 0, 0);
+    lv_obj_set_style_pad_row(m_cloudKeyboard, 2, 0);
+    lv_obj_set_style_pad_column(m_cloudKeyboard, 2, 0);
+    lv_keyboard_set_map(m_cloudKeyboard, LV_KEYBOARD_MODE_TEXT_LOWER, (const char**)kCloudKbMap, kCloudKbCtrl);
+    lv_keyboard_set_textarea(m_cloudKeyboard, m_cloudBaseUrlField); // focus events above retarget this as the user taps fields
+    lv_obj_add_event_cb(m_cloudKeyboard, onCloudMusicSaveAction, LV_EVENT_READY, nullptr);
+
+    playerService.cloudMusicWakeStart(); // spec 8.2: entering this page triggers a health check on its own
+    refreshCloudMusicSettings();
+}
+
+void HifiUi::refreshCloudMusicSettings() {
+    if (!m_cloudStatusLabel) return;
+    const CloudServiceState state = playerService.cloudServiceState();
+    if (state == m_lastCloudServiceState) return;
+    m_lastCloudServiceState = state;
+
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    const char* text = "未配置网关";
+    lv_color_t color = kInkFaint;
+    if (cfg.configured) {
+        switch (state) {
+            case CloudServiceState::Unknown: text = "点击测试连接"; color = kInkDim; break;
+            case CloudServiceState::Waking: text = "正在唤醒音乐服务…"; color = kAccentBright; break;
+            case CloudServiceState::Ready: text = "已连接"; color = kLive; break;
+            case CloudServiceState::Offline: text = "音乐服务暂时不可用"; color = kMute; break;
+        }
+    }
+    lv_label_set_text(m_cloudStatusLabel, text);
+    lv_obj_set_style_text_color(m_cloudStatusLabel, color, 0);
+}
+
+void HifiUi::onCloudMusicFieldFocusAction(lv_event_t* event) {
+    if (!s_instance || !s_instance->m_cloudKeyboard) return;
+    lv_obj_t* field = static_cast<lv_obj_t*>(lv_event_get_target(event));
+    lv_keyboard_set_textarea(s_instance->m_cloudKeyboard, field);
+}
+
+void HifiUi::onCloudMusicSaveAction(lv_event_t* event) {
+    (void)event;
+    if (!s_instance || !s_instance->m_cloudBaseUrlField || !s_instance->m_cloudDeviceKeyField) return;
+    const char* baseUrl = lv_textarea_get_text(s_instance->m_cloudBaseUrlField);
+    const char* deviceKey = lv_textarea_get_text(s_instance->m_cloudDeviceKeyField);
+    if (playerService.setCloudMusicConfig(baseUrl, deviceKey)) {
+        playerService.cloudMusicWakeStart();
+        s_instance->m_lastCloudServiceState = CloudServiceState::Unknown; // force refreshCloudMusicSettings() to re-render even if the polled state hasn't changed yet
+        s_instance->refreshCloudMusicSettings();
+    }
+}
+
+void HifiUi::onCloudMusicTestAction(lv_event_t* event) {
+    (void)event;
+    playerService.cloudMusicWakeStart();
 }
 
 void HifiUi::buildAudioTopBar(const char* title, const char* rightText, bool rightOk, const char* rightIcon) {
@@ -4572,6 +4740,7 @@ void HifiUi::refresh() {
     else if (m_page == Page::LocalNowPlaying) refreshLocalNowPlaying(state);
     else if (m_page == Page::SettingsWifi) refreshSettingsWifi(state);
     else if (m_page == Page::UsbStorage) refreshUsbStorage();
+    else if (m_page == Page::CloudMusicSettings) refreshCloudMusicSettings();
     refreshCoverSpin(state);
 }
 

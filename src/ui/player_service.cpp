@@ -49,6 +49,10 @@ extern const char* playerCoreCurrentLyricLine(uint32_t positionMs);
 extern bool playerCoreLyricsOnlineReady(uint16_t* outIndex);
 extern uint8_t playerCoreLyricsFetchState(uint16_t index);
 extern void playerCoreRetryLyricsFetch(uint16_t index);
+extern CloudMusicConfig playerCoreCloudMusicConfig();
+extern bool playerCoreSetCloudMusicConfig(const char* baseUrl, const char* deviceKey);
+extern uint8_t playerCoreCloudServiceState();
+extern void playerCoreCloudMusicWakeStart();
 
 PlayerService playerService;
 
@@ -249,6 +253,18 @@ void PlayerService::retryLyricsFetch(uint16_t index) { playerCoreRetryLyricsFetc
 bool PlayerService::decodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight) const {
     return playerCoreDecodeLocalTrackCover(index, scaleFactor, outPixels, outWidth, outHeight);
 }
+
+CloudMusicConfig PlayerService::cloudMusicConfig() const { return playerCoreCloudMusicConfig(); }
+
+bool PlayerService::setCloudMusicConfig(const char* baseUrl, const char* deviceKey) {
+    return playerCoreSetCloudMusicConfig(baseUrl, deviceKey);
+}
+
+CloudServiceState PlayerService::cloudServiceState() const {
+    return static_cast<CloudServiceState>(playerCoreCloudServiceState());
+}
+
+void PlayerService::cloudMusicWakeStart() { playerCoreCloudMusicWakeStart(); }
 
 void PlayerService::onMetadata(const char* station, const char* title) {
     if (station && station[0]) copyText(m_snapshot.title, sizeof(m_snapshot.title), station);

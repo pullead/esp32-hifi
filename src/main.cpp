@@ -3261,6 +3261,161 @@ const char* playerCoreCurrentLyricLine(uint32_t positionMs) {
     return lineBuf;
 }
 
+// ---- Cloud Music (在线音乐 / 网易云) -- Render Music Gateway -------------
+// Phase 2 scope only: config storage + gateway health/wake check, per the
+// project's own phased NCM spec. No search, resolve, or playback wiring yet
+// (that's phases 3-4) -- see services/ncm-gateway/README.md for the backend
+// this talks to, and PlayerSource::CloudMusic's own comment (added in a
+// later phase) for how this eventually plugs into the existing
+// Radio/Sd mutual-exclusion in PlayerService.
+
+static constexpr const char* kCloudBaseUrlPrefKey = "cm_base_url";
+static constexpr const char* kCloudDeviceKeyPrefKey = "cm_dev_key";
+
+static volatile CloudServiceState s_cloudServiceState = CloudServiceState::Unknown;
+static SemaphoreHandle_t s_cloudMusicMutex = nullptr; // guards s_cloudConfig across the LVGL thread and cloudMusicWakeTask
+static CloudMusicConfig s_cloudConfig;
+static volatile bool s_cloudWakeTaskRunning = false;
+
+static bool cloudMusicLock(TickType_t timeout = pdMS_TO_TICKS(250)) {
+    return !s_cloudMusicMutex || xSemaphoreTake(s_cloudMusicMutex, timeout) == pdTRUE;
+}
+static void cloudMusicUnlock() {
+    if (s_cloudMusicMutex) xSemaphoreGive(s_cloudMusicMutex);
+}
+
+// Loads the saved gateway URL/key from NVS into s_cloudConfig. Called once
+// at boot (see setup()) -- afterwards s_cloudConfig is the source of truth,
+// updated in lockstep with NVS by playerCoreSetCloudMusicConfig().
+static void cloudMusicLoadConfig() {
+    if (!lockPreferences()) return;
+    const String baseUrl = pref.getString(kCloudBaseUrlPrefKey, "");
+    const String deviceKey = pref.getString(kCloudDeviceKeyPrefKey, "");
+    unlockPreferences();
+    if (cloudMusicLock()) {
+        strlcpy(s_cloudConfig.baseUrl, baseUrl.c_str(), sizeof(s_cloudConfig.baseUrl));
+        strlcpy(s_cloudConfig.deviceKey, deviceKey.c_str(), sizeof(s_cloudConfig.deviceKey));
+        s_cloudConfig.configured = s_cloudConfig.baseUrl[0] != '\0' && s_cloudConfig.deviceKey[0] != '\0';
+        cloudMusicUnlock();
+    }
+}
+
+CloudMusicConfig playerCoreCloudMusicConfig() {
+    CloudMusicConfig out;
+    if (cloudMusicLock()) {
+        out = s_cloudConfig;
+        cloudMusicUnlock();
+    }
+    return out;
+}
+
+// Trims whitespace and a trailing slash, requires an http(s) scheme and
+// both fields non-empty -- rejecting an obviously-broken config here (rather
+// than saving it and letting the first health check fail) means the
+// settings UI can tell "you typed something wrong" apart from "the gateway
+// is unreachable".
+bool playerCoreSetCloudMusicConfig(const char* baseUrl, const char* deviceKey) {
+    if (!baseUrl || !deviceKey) return false;
+    String trimmedUrl(baseUrl);
+    trimmedUrl.trim();
+    while (trimmedUrl.endsWith("/")) trimmedUrl.remove(trimmedUrl.length() - 1);
+    String trimmedKey(deviceKey);
+    trimmedKey.trim();
+    if (trimmedUrl.isEmpty() || trimmedKey.isEmpty()) return false;
+    if (!trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://")) return false;
+    if (trimmedUrl.length() >= sizeof(CloudMusicConfig::baseUrl)) return false;
+    if (trimmedKey.length() >= sizeof(CloudMusicConfig::deviceKey)) return false;
+
+    if (lockPreferences(pdMS_TO_TICKS(1000))) {
+        pref.putString(kCloudBaseUrlPrefKey, trimmedUrl);
+        pref.putString(kCloudDeviceKeyPrefKey, trimmedKey);
+        unlockPreferences();
+    }
+    if (cloudMusicLock(pdMS_TO_TICKS(1000))) {
+        strlcpy(s_cloudConfig.baseUrl, trimmedUrl.c_str(), sizeof(s_cloudConfig.baseUrl));
+        strlcpy(s_cloudConfig.deviceKey, trimmedKey.c_str(), sizeof(s_cloudConfig.deviceKey));
+        s_cloudConfig.configured = true;
+        cloudMusicUnlock();
+    }
+    s_cloudServiceState = CloudServiceState::Unknown; // old Ready/Offline no longer describes this config
+    return true;
+}
+
+uint8_t playerCoreCloudServiceState() { return static_cast<uint8_t>(s_cloudServiceState); }
+
+// One health-check attempt: GET {baseUrl}/esp/v1/health with the device key
+// header, 3s timeout (spec 8.2: "2~3秒超时"). Checks for a real
+// {"ok":true,...} body, not just HTTP 200 -- a captive portal or a
+// still-cold-starting Render placeholder response could return 200 with the
+// wrong body. No JSON library in this project (see jsonNumber/
+// jsonStringField's own comments) and "ok" is a bare JSON boolean, not a
+// number or string, so this checks for the literal the gateway always emits
+// rather than adding a one-off jsonBool() helper.
+static bool cloudMusicHealthCheckOnce(const CloudMusicConfig& cfg) {
+    if (!WiFi.isConnected() || !cfg.configured) return false;
+    WiFiClientSecure client;
+    client.setInsecure(); // matches this project's existing HTTPS convention (weather/radio-icon fetches)
+    HTTPClient http;
+    const String url = String(cfg.baseUrl) + "/esp/v1/health";
+    if (!http.begin(client, url)) return false;
+    http.setTimeout(3000);
+    http.addHeader("X-Device-Key", cfg.deviceKey);
+    const int code = http.GET();
+    bool ok = false;
+    if (code == HTTP_CODE_OK) {
+        const String body = http.getString();
+        ok = body.indexOf("\"ok\":true") >= 0 || body.indexOf("\"ok\": true") >= 0;
+    }
+    http.end();
+    return ok;
+}
+
+// Cold-start wake sequence (spec 8.2): try immediately, then retry every 7s,
+// for up to ~70s total, before giving up as Offline. Runs on its own
+// one-shot task (mirrors radioIconSyncTask/wifiScanTask's pattern) so the
+// LVGL thread never blocks on network I/O -- the UI polls
+// playerCoreCloudServiceState() the same way it already polls
+// UsbStorageState for USB MSC mount progress.
+static void cloudMusicWakeTask(void*) {
+    const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
+    if (!cfg.configured) {
+        s_cloudServiceState = CloudServiceState::Offline;
+        s_cloudWakeTaskRunning = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+    s_cloudServiceState = CloudServiceState::Waking;
+    const uint32_t deadlineMs = millis() + 70000;
+    bool ready = false;
+    for (;;) {
+        ready = cloudMusicHealthCheckOnce(cfg);
+        printf("[CLOUDMUSIC] health check %s\n", ready ? "ok" : "failed");
+        if (ready || millis() >= deadlineMs) break;
+        vTaskDelay(pdMS_TO_TICKS(7000));
+    }
+    s_cloudServiceState = ready ? CloudServiceState::Ready : CloudServiceState::Offline;
+    s_cloudWakeTaskRunning = false;
+    vTaskDelete(nullptr);
+}
+
+// Entry point: called when the user opens 在线音乐 settings/home (spec 8.2:
+// "进入'在线音乐' -> 请求 /health"). No-op while a wake is already in
+// flight; safe to call repeatedly (e.g. re-entering the page).
+void playerCoreCloudMusicWakeStart() {
+    if (s_cloudWakeTaskRunning) return;
+    const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
+    if (!cfg.configured) {
+        s_cloudServiceState = CloudServiceState::Offline;
+        return;
+    }
+    s_cloudWakeTaskRunning = true;
+    if (xTaskCreate(cloudMusicWakeTask, "cloudWake", 8192, nullptr, 1, nullptr) != pdPASS) {
+        s_cloudWakeTaskRunning = false;
+        s_cloudServiceState = CloudServiceState::Offline;
+        MWR_LOG_ERROR("Failed to create cloud music wake task");
+    }
+}
+
 // setAudioFilePosition() takes a byte offset, not seconds -- approximates a
 // target byte from a linear time/size ratio (exact for CBR MP3, a close
 // enough estimate for VBR, same tradeoff any simple player's seek bar
@@ -3844,8 +3999,11 @@ void setup() {
     mutex_display = xSemaphoreCreateMutex();
     s_prefMutex = xSemaphoreCreateMutex();
     s_wifiOpMutex = xSemaphoreCreateMutex();
+    s_cloudMusicMutex = xSemaphoreCreateMutex();
     if (!s_prefMutex) MWR_LOG_ERROR("Failed to create Preferences mutex");
     if (!s_wifiOpMutex) MWR_LOG_ERROR("Failed to create WiFi operation mutex");
+    if (!s_cloudMusicMutex) MWR_LOG_ERROR("Failed to create cloud music config mutex");
+    cloudMusicLoadConfig();
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting
     // like weatherTask) since local playback -- and playerCoreLoadLyrics()'s
     // mutex-guarded cache -- can happen with WiFi never up. fetchLyricsOnline()

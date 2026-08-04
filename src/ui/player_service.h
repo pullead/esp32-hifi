@@ -13,6 +13,26 @@ enum class PlayerTransport : uint8_t { Stopped, Buffering, Playing, Paused, Erro
 enum class LyricFetchState : uint8_t { Idle, Pending, Found, NotFound };
 enum class UsbStorageState : uint8_t { Idle, Mounting, Mounted, Restoring, Scanning, Error, Unsupported };
 
+// Render Music Gateway connection lifecycle (see docs spec section 8.1).
+// Unknown: no health check attempted yet this boot / since config changed.
+// Waking: first (or a retry) health check is in flight or the free-tier
+// service looked asleep -- see cloudMusicWakeStart()'s comment for the
+// retry/backoff shape. Ready: last health check succeeded. Offline: gave up
+// after ~70s of retries, or the config is missing/invalid.
+enum class CloudServiceState : uint8_t { Unknown, Waking, Ready, Offline };
+
+// Settings > 在线音乐 config -- gateway base URL (no trailing slash, e.g.
+// "https://esp32-ncm-gateway.onrender.com") and the X-Device-Key it expects.
+// Neither value is ever a NetEase account credential (see the gateway's own
+// README) -- this is only this device's own key to the gateway, analogous
+// to a saved WiFi password, and is stored the same way (NVS via
+// Preferences, see main.cpp's lockPreferences()).
+struct CloudMusicConfig {
+    char baseUrl[128]{};
+    char deviceKey[80]{};
+    bool configured = false; // true once both fields have been saved at least once
+};
+
 struct UsbStorageStats {
     uint32_t readCount = 0;
     uint32_t writeCount = 0;
@@ -222,6 +242,19 @@ class PlayerService {
     // RGB565 buffer. Caller owns *outPixels and must free() it. scaleFactor
     // is tjpgd's downscale divisor: 1/2/4/8.
     bool decodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight) const;
+
+    // Render Music Gateway (在线音乐/网易云) -- phase 2 scope: config storage
+    // and connection/wake testing only, no search/playback yet (see
+    // src/cloud_music.h). baseUrl/deviceKey are trimmed and persisted to NVS
+    // on save; an empty baseUrl or deviceKey is rejected (returns false)
+    // rather than silently saving an unusable config.
+    CloudMusicConfig cloudMusicConfig() const;
+    bool setCloudMusicConfig(const char* baseUrl, const char* deviceKey);
+    CloudServiceState cloudServiceState() const;
+    // Starts (or restarts, if already Waking/Offline) the health-check/wake
+    // sequence -- see cloudMusicWakeTask()'s comment in main.cpp for the
+    // retry schedule. No-op if cloudMusicConfig().configured is false.
+    void cloudMusicWakeStart();
 
     // Called by the MiniWebRadio audio callback, never from an LVGL handler.
     void onMetadata(const char* station, const char* title);

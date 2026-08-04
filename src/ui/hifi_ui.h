@@ -34,7 +34,11 @@ class HifiUi {
         AudioEq,
         AudioEqBand,
         AudioEffects,
-        AudioDac
+        AudioDac,
+        // Phase 2 of the online-music (在线音乐/网易云) feature: gateway
+        // URL + device key entry and connection/wake test only -- no
+        // search/browse/playback pages yet (those land in later phases).
+        CloudMusicSettings
     };
     // Cycled by tapping the play-mode button: 顺序播放 (stop at the end of
     // the filtered list) -> 列表循环 (wrap back to the start) -> 单曲循环
@@ -65,6 +69,9 @@ class HifiUi {
     static void onWifiScanRowAction(lv_event_t* event);
     static void onWifiAddSaveAction(lv_event_t* event);
     static void onUsbStorageAction(lv_event_t* event);
+    static void onCloudMusicFieldFocusAction(lv_event_t* event);
+    static void onCloudMusicSaveAction(lv_event_t* event);
+    static void onCloudMusicTestAction(lv_event_t* event);
     static void onQuickVolumeAction(lv_event_t* event);
     static void onQuickBrightnessAction(lv_event_t* event);
     static void onQuickEqAction(lv_event_t* event);
@@ -99,6 +106,8 @@ class HifiUi {
     void buildSettingsWifi();
     void buildUsbStorage();
     void refreshUsbStorage();
+    void buildCloudMusicSettings();
+    void refreshCloudMusicSettings();
     void buildFontPreview();
     void buildAudioHome();
     void buildAudioDecode();
@@ -355,6 +364,15 @@ class HifiUi {
     bool m_usbStorageConfirmArmed = false;
     uint32_t m_usbStorageConfirmArmedAt = 0;
     bool m_lastUsbStorageConfirmArmed = false;
+
+    // Settings > 在线音乐 (Cloud Music gateway config -- phase 2 scope, see
+    // buildCloudMusicSettings()/refreshCloudMusicSettings()).
+    lv_obj_t* m_cloudBaseUrlField = nullptr;
+    lv_obj_t* m_cloudDeviceKeyField = nullptr;
+    lv_obj_t* m_cloudKeyboard = nullptr;
+    lv_obj_t* m_cloudStatusLabel = nullptr;
+    lv_obj_t* m_cloudHintLabel = nullptr;
+    CloudServiceState m_lastCloudServiceState = CloudServiceState::Unknown;
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to
