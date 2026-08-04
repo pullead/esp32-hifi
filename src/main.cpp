@@ -1072,6 +1072,7 @@ void connecttohost(ps_ptr<char> host) {
     s_icyBitRate = 0;
     s_decoderBitRate = 0;
     s_f_webFailed = false;
+    s_f_pauseResume = false;
     s_f_isFSConnected = false;
 
     idx1 = host.index_of("|", 0);
@@ -1127,6 +1128,7 @@ void connecttoFS(const char* FS, const char* filename, uint32_t fileStartTime) {
     s_decoderBitRate = 0;
     s_cur_Codec = 0;
     s_f_webFailed = false;
+    s_f_pauseResume = false;
     s_f_isFSConnected = audio.connecttoFS(SD_MMC, filename, fileStartTime);
     s_f_isWebConnected = false;
     if (!startsWith(filename, "/audiofiles/")) { return; }
@@ -1221,8 +1223,14 @@ bool playerCorePlaySdFile(const char* path, uint32_t positionSeconds) {
 
 void playerCoreStop() { stopSong(); }
 
+static bool audioPauseResumeAndUpdateState() {
+    const bool accepted = audio.pauseResume();
+    if (accepted) s_f_pauseResume = !audio.isRunning();
+    return accepted;
+}
+
 bool playerCoreTogglePause() {
-    s_f_pauseResume = audio.pauseResume();
+    audioPauseResumeAndUpdateState();
     return s_f_pauseResume;
 }
 
@@ -5316,8 +5324,7 @@ void loop() {
         r.replace("\n", "");
         printfln(s_tag.terminal, ANSI_ESC_YELLOW "{}", r.c_str());
         if (r.startsWith("pr")) {
-            s_f_pauseResume = audio.pauseResume();
-            if (s_f_pauseResume) {
+            if (audioPauseResumeAndUpdateState()) {
                 printfln(s_tag.terminal, ANSI_ESC_YELLOW "Pause-Resume");
             } else {
                 printfln(s_tag.terminal, ANSI_ESC_YELLOW "Pause-Resume not possible");
@@ -6145,7 +6152,7 @@ void ir_short_key(int8_t key) {
             break;
         case 18: // PAUSE/RESUME  --------------------------------------------------------------------------------------------------------------------
             if (s_state == PLAYER) {
-                if (s_f_isFSConnected) s_f_pauseResume = audio.pauseResume();
+                if (s_f_isFSConnected) audioPauseResumeAndUpdateState();
             }
             break;
         case 19: // STOP  ----------------------------------------------------------------------------------------------------------------------------
@@ -6657,7 +6664,7 @@ void WEBSRV_onCommand(ps_ptr<char> cmd, ps_ptr<char> param, ps_ptr<char> arg){  
                                         return;}
 
     CMD_EQUALS("pause_resume"){         if(!s_f_isFSConnected && !s_f_isWebConnected) {webSrv.send("resumefile=", "There is no audio file active"); return;}
-                                        s_f_pauseResume = audio.pauseResume();
+                                        audioPauseResumeAndUpdateState();
                                         if(audio.isRunning()){webSrv.send("resumefile=", "audiofile resumed"); btn_PL_pause.setOff(); btn_PL_pause.show();}
                                         else {                webSrv.send("resumefile=", "audiofile paused");  btn_PL_pause.setOn(); btn_PL_pause.show();}
                                         return;}
@@ -7325,7 +7332,7 @@ void graphicObjects_OnRelease(ps_ptr<char> name, releasedArg ra) {
     }
     if (s_state == PLAYER) {
         if (name.equals("btn_PL_mute"))     { muteChanged(btn_PL_mute.getValue()); goto exit; }
-        if (name.equals("btn_PL_pause"))    { if (s_f_isFSConnected) { s_f_pauseResume = audio.pauseResume(); } goto exit; }
+        if (name.equals("btn_PL_pause"))    { if (s_f_isFSConnected) { audioPauseResumeAndUpdateState(); } goto exit; }
         if (name.equals("btn_PL_cancel"))   { stopSong(); changeState(PLAYER, 0); if(s_f_ok_from_ir) { s_ir_btn_select = 0; set_ir_pos_PL(0); } goto exit; }
         if (name.equals("btn_PL_prevFile")) { if(s_ir_btn_select == 0) set_ir_pos_PL(0); goto exit; }
         if (name.equals("btn_PL_nextFile")) { if(s_ir_btn_select == 1) set_ir_pos_PL(0); goto exit; }
@@ -7362,7 +7369,7 @@ void graphicObjects_OnRelease(ps_ptr<char> name, releasedArg ra) {
     }
     if (s_state == DLNA) {
         if (name.equals("btn_DL_mute"))     { muteChanged(btn_DL_mute.getValue());   if(s_ir_btn_select == 0) set_ir_pos_DL(0); goto exit; }
-        if (name.equals("btn_DL_pause"))    { s_f_pauseResume = audio.pauseResume(); if(s_ir_btn_select == 1) set_ir_pos_DL(0); goto exit; }
+        if (name.equals("btn_DL_pause"))    { audioPauseResumeAndUpdateState(); if(s_ir_btn_select == 1) set_ir_pos_DL(0); goto exit; }
         if (name.equals("btn_DL_cancel"))   { stopSong();
                                               txt_DL_fName.setText("");
                                               txt_DL_fName.show();
