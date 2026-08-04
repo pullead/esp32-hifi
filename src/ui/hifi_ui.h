@@ -51,6 +51,12 @@ class HifiUi {
     // Sequential. Drives both findLocalTrack()'s search behavior and the
     // auto-advance-on-track-end logic in refresh() (see m_lastEofCount).
     enum class LocalPlayMode : uint8_t { Sequential, RepeatAll, RepeatOne, Shuffle };
+    // CloudMusicSettings sub-views -- same one-field-at-a-time shape as
+    // WifiAddStage (see buildCloudMusicSettings()): editing either field
+    // gets the field its own full-width row and the keyboard its full
+    // 150px, instead of both fields + keyboard fighting for room on one
+    // screen at once (which is what produced garbled/clipped input before).
+    enum class CloudMusicConfigStage : uint8_t { Overview, EditBaseUrl, EditDeviceKey };
 
     static void onHomeAction(lv_event_t* event);
     static void onHomeNowPlayingAction(lv_event_t* event);
@@ -74,7 +80,9 @@ class HifiUi {
     static void onWifiScanRowAction(lv_event_t* event);
     static void onWifiAddSaveAction(lv_event_t* event);
     static void onUsbStorageAction(lv_event_t* event);
-    static void onCloudMusicFieldFocusAction(lv_event_t* event);
+    static void onCloudMusicEditBaseUrlAction(lv_event_t* event);
+    static void onCloudMusicEditDeviceKeyAction(lv_event_t* event);
+    static void onCloudMusicConfigBackAction(lv_event_t* event);
     static void onCloudMusicSaveAction(lv_event_t* event);
     static void onCloudMusicTestAction(lv_event_t* event);
     static void onCloudMusicPlaylistOpenAction(lv_event_t* event);
@@ -388,12 +396,16 @@ class HifiUi {
 
     // Settings > 在线音乐 (Cloud Music gateway config -- phase 2 scope, see
     // buildCloudMusicSettings()/refreshCloudMusicSettings()).
-    lv_obj_t* m_cloudBaseUrlField = nullptr;
-    lv_obj_t* m_cloudDeviceKeyField = nullptr;
+    // One field at a time (see CloudMusicConfigStage) -- EditBaseUrl/
+    // EditDeviceKey each create exactly one textarea here, never both at
+    // once, so a single shared pointer is enough (same idea as
+    // m_coverArtPixels being shared between radio/local art).
+    lv_obj_t* m_cloudEditField = nullptr;
     lv_obj_t* m_cloudKeyboard = nullptr;
     lv_obj_t* m_cloudStatusLabel = nullptr;
     lv_obj_t* m_cloudHintLabel = nullptr;
     CloudServiceState m_lastCloudServiceState = CloudServiceState::Unknown;
+    CloudMusicConfigStage m_cloudConfigStage = CloudMusicConfigStage::Overview;
     // Phase 3 browse pages (hot playlists / search / playlist detail).
     // m_cloudListArea is reused across all three build functions' own list
     // container (only one of these pages is ever on screen at once, same
