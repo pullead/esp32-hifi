@@ -3,7 +3,7 @@
 #include <Arduino.h>
 
 // The UI only sees this value object.  It never calls the decoder directly.
-enum class PlayerSource : uint8_t { None, Radio, Sd, Dlna };
+enum class PlayerSource : uint8_t { None, Radio, Sd, Dlna, CloudMusic };
 enum class PlayerTransport : uint8_t { Stopped, Buffering, Playing, Paused, Error };
 // Online-lyrics-lookup lifecycle for whichever local track is loaded --
 // defined here (not main.cpp) since both sides need it: main.cpp's
@@ -307,6 +307,12 @@ class PlayerService {
     CloudPlaylistItem cloudMusicPlaylistDetailInfo() const;
     uint8_t cloudMusicPlaylistTrackCount() const;
     bool cloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) const;
+
+    // Phase 4: resolve + play (see main.cpp's cloudMusicControllerTask).
+    // Mutual exclusion with Radio/Sd works the same way playRadioUrl()/
+    // playSdFile() already do it -- see this method's own definition.
+    bool cloudMusicPlayTrackStart(const char* trackId);
+    CloudMusicRequestState cloudMusicResolveState() const;
 
     // Called by the MiniWebRadio audio callback, never from an LVGL handler.
     void onMetadata(const char* station, const char* title);

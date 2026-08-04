@@ -135,6 +135,13 @@ bool s_f_sleeping = false;
 bool s_f_isWebConnected = false;
 bool s_f_WiFi_lost = false;
 bool s_f_isFSConnected = false;
+// Disambiguates PlayerSource::Radio vs ::CloudMusic when s_f_isWebConnected
+// is true -- both play via the same connecttohost() stream connect (see
+// playerCorePlayCloudUrl()), so playerCoreReadSnapshot() can't tell them
+// apart from s_f_isWebConnected alone. Set true only by
+// playerCorePlayCloudUrl(); every other connecttohost() call site
+// (playerCorePlayRadioUrl, playerCorePlayStationNumber) resets it false.
+bool s_cloudMusicPlaying = false;
 bool s_f_eof = false;
 bool s_f_reconnect = false;
 bool s_f_eof_alarm = false;
@@ -1166,6 +1173,7 @@ void connecttoFS(const char* FS, const char* filename, uint32_t fileStartTime) {
     // the alarm clock, time announcements, playerCorePlaySdFile) funnels
     // through this one function, so guarding here covers all of them.
     if (usbStorageBlocksSdAppAccess()) return;
+    s_cloudMusicPlaying = false; // s_f_isFSConnected takes ternary precedence anyway, but keep this honest for anything reading the raw flag
     dispFooter.updateBitRate(0);
     s_icyBitRate = 0;
     s_decoderBitRate = 0;
@@ -1210,6 +1218,7 @@ void stopSong() {
 // decoder task and its connection bookkeeping remain owned by upstream code.
 bool playerCorePlayRadioUrl(const char* url) {
     if (!url || !url[0]) return false;
+    s_cloudMusicPlaying = false;
     ps_ptr<char> host;
     host.assign(url);
     s_stationURL = host;
@@ -1219,11 +1228,30 @@ bool playerCorePlayRadioUrl(const char* url) {
     return s_f_isWebConnected;
 }
 
+// Cloud Music phase 4: plays a resolved direct-CDN URL through the exact
+// same connecttohost() path as internet radio -- no separate decoder (see
+// docs spec's "不得为在线音乐再创建一套独立 I2S、DMA 或音频解码器").
+// s_cloudMusicPlaying is what lets playerCoreReadSnapshot() report
+// PlayerSource::CloudMusic instead of ::Radio afterwards. Unlike
+// playerCorePlayRadioUrl(), s_stationName_air is deliberately left alone --
+// the caller (PlayerService::playCloudUrl()) sets title/artist straight
+// from the gateway's resolve response, no need to wait for ICY metadata
+// text that a plain CDN file URL wouldn't send anyway.
+bool playerCorePlayCloudUrl(const char* url) {
+    if (!url || !url[0]) return false;
+    s_cloudMusicPlaying = true;
+    ps_ptr<char> host;
+    host.assign(url);
+    connecttohost(host);
+    return s_f_isWebConnected;
+}
+
 static bool playerCorePlayStationNumber(uint16_t stationNumber) {
     if (stationNumber == 0 || stationNumber > staMgnt.getSumStations()) return false;
     const char* url = staMgnt.getStationUrl(stationNumber);
     if (!url || !url[0] || !strcmp(url, "unknown")) return false;
     const char* name = staMgnt.getStationName(stationNumber);
+    s_cloudMusicPlaying = false;
     s_cur_station = stationNumber;
     s_stationURL = url;
     s_stationName_air = name && name[0] ? name : url;
@@ -3432,7 +3460,7 @@ static constexpr uint8_t kCloudSearchMaxResults = 10;
 static constexpr uint8_t kCloudHotPlaylistMax = 8;
 static constexpr uint8_t kCloudPlaylistTrackMax = 20;
 
-enum class CloudCommandType : uint8_t { Search, LoadHotPlaylists, LoadPlaylist };
+enum class CloudCommandType : uint8_t { Search, LoadHotPlaylists, LoadPlaylist, ResolveAndPlay };
 struct CloudCommand {
     CloudCommandType type;
     uint32_t generation;
@@ -3457,6 +3485,20 @@ static CloudMusicRequestState s_cloudPlaylistState = CloudMusicRequestState::Idl
 static CloudPlaylistItem s_cloudPlaylistInfo;
 static CloudTrackItem s_cloudPlaylistTracks[kCloudPlaylistTrackMax];
 static uint8_t s_cloudPlaylistTrackCount = 0;
+
+// Phase 4: resolve + play. s_cloudResolveState is polled by the UI (a
+// track row's tap feedback); the actual connecttohost() happens on
+// cloudMusicControllerTask itself once resolve succeeds (background tasks
+// already do this elsewhere in this codebase -- e.g. usbStorageMountTask
+// calls stopSong() -- so this isn't a new pattern), not routed back through
+// the LVGL thread first.
+static CloudMusicRequestState s_cloudResolveState = CloudMusicRequestState::Idle;
+// Title/artist/album/cover for whatever cloud track is currently playing --
+// set once resolve succeeds, read by PlayerService::tick() to fill
+// PlayerSnapshot's title/detail/durationSeconds fields for CloudMusic
+// (there's no ICY metadata on a plain CDN file URL to wait for, unlike
+// internet radio).
+static CloudTrackItem s_cloudNowPlaying;
 
 static bool cloudResultLock(TickType_t timeout = pdMS_TO_TICKS(250)) {
     return !s_cloudResultMutex || xSemaphoreTake(s_cloudResultMutex, timeout) == pdTRUE;
@@ -3625,7 +3667,7 @@ static void cloudMusicControllerTask(void*) {
                 }
                 cloudResultUnlock();
             }
-        } else { // LoadPlaylist
+        } else if (cmd.type == CloudCommandType::LoadPlaylist) {
             if (cloudResultLock()) {
                 s_cloudPlaylistState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
@@ -3648,6 +3690,59 @@ static void cloudMusicControllerTask(void*) {
                 } else {
                     s_cloudPlaylistTrackCount = 0;
                     s_cloudPlaylistState = CloudMusicRequestState::Error;
+                }
+                cloudResultUnlock();
+            }
+        } else { // ResolveAndPlay
+            if (cloudResultLock()) {
+                s_cloudResolveState = CloudMusicRequestState::Loading;
+                cloudResultUnlock();
+            }
+            char path[64];
+            snprintf(path, sizeof(path), "/esp/v1/tracks/%s/resolve?bitrate=128", cmd.param);
+            String body;
+            const bool ok = cloudMusicHttpGet(path, body);
+            if (cmd.generation != s_cloudRequestGeneration) continue; // user moved on to a different track before this resolved
+            if (!ok) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudResolveState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
+            }
+            // "track" and "stream" objects have no overlapping key names
+            // (id/title/artist/album/duration_ms/cover_url vs
+            // url/codec/bitrate_kbps/expires_at/seekable_hint), so these can
+            // read straight off the whole response body without slicing out
+            // either sub-object first.
+            CloudTrackItem track{};
+            parseCloudTrackItem(body, &track);
+            String streamUrl;
+            const bool hasUrl = jsonStringField(body, "url", streamUrl) && streamUrl.length() > 0;
+            if (!hasUrl) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudResolveState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
+            }
+            // Actually start playback right here on this background task --
+            // connecttohost() is already called from non-LVGL tasks
+            // elsewhere in this codebase (e.g. usbStorageMountTask's
+            // stopSong()), so this isn't a new concurrency pattern. Re-check
+            // the generation once more right before committing to the
+            // switch, in case the user tapped a different track during the
+            // parsing above (unlikely given how fast it is, but cheap to
+            // guard).
+            if (cmd.generation != s_cloudRequestGeneration) continue;
+            const bool started = playerCorePlayCloudUrl(streamUrl.c_str());
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                if (started) {
+                    s_cloudNowPlaying = track;
+                    s_cloudResolveState = CloudMusicRequestState::Loaded;
+                } else {
+                    s_cloudResolveState = CloudMusicRequestState::Error;
+                    strlcpy(s_cloudLastError, "无法连接音乐 CDN", sizeof(s_cloudLastError));
                 }
                 cloudResultUnlock();
             }
@@ -3756,6 +3851,40 @@ bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) {
     return ok;
 }
 
+// Phase 4: resolve + play a track by id (from a search result or playlist
+// row). Enqueues CloudCommandType::ResolveAndPlay -- see
+// cloudMusicControllerTask's own comment for why actual playback is kicked
+// off from that background task rather than routed back through the LVGL
+// thread.
+bool playerCoreCloudMusicPlayTrackStart(const char* trackId) {
+    if (!trackId || !trackId[0]) return false;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        s_cloudResolveState = CloudMusicRequestState::Loading;
+        cloudResultUnlock();
+    }
+    return cloudMusicEnqueue(CloudCommandType::ResolveAndPlay, trackId);
+}
+
+uint8_t playerCoreCloudMusicResolveState() { return static_cast<uint8_t>(s_cloudResolveState); }
+
+// Consume-once (same idiom as playerCoreLyricsOnlineReady): true exactly
+// once per successfully-started cloud track, after which PlayerService::
+// tick() has applied *outTrack to the snapshot and this returns false again
+// until the next resolve succeeds.
+bool playerCoreCloudMusicConsumeNowPlaying(CloudTrackItem* outTrack) {
+    if (!outTrack) return false;
+    bool ready = false;
+    if (cloudResultLock()) {
+        if (s_cloudResolveState == CloudMusicRequestState::Loaded) {
+            *outTrack = s_cloudNowPlaying;
+            s_cloudResolveState = CloudMusicRequestState::Idle; // consumed
+            ready = true;
+        }
+        cloudResultUnlock();
+    }
+    return ready;
+}
+
 // setAudioFilePosition() takes a byte offset, not seconds -- approximates a
 // target byte from a linear time/size ratio (exact for CBR MP3, a close
 // enough estimate for VBR, same tradeoff any simple player's seek bar
@@ -3794,7 +3923,9 @@ void playerCoreReadSnapshot(PlayerSnapshot* snapshot) {
     audio.getSpectrumBands(snapshot->spectrumBands);
     snapshot->positionSeconds = audio.getAudioCurrentTime();
     snapshot->durationSeconds = audio.getAudioFileDuration();
-    snapshot->source = s_f_isFSConnected ? PlayerSource::Sd : (s_f_isWebConnected ? PlayerSource::Radio : PlayerSource::None);
+    snapshot->source = s_f_isFSConnected
+                            ? PlayerSource::Sd
+                            : (s_f_isWebConnected ? (s_cloudMusicPlaying ? PlayerSource::CloudMusic : PlayerSource::Radio) : PlayerSource::None);
 
     if (s_f_webFailed) {
         snapshot->transport = PlayerTransport::Error;

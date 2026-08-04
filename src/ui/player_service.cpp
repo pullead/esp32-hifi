@@ -68,6 +68,9 @@ extern uint8_t playerCoreCloudMusicPlaylistDetailState();
 extern CloudPlaylistItem playerCoreCloudMusicPlaylistDetailInfo();
 extern uint8_t playerCoreCloudMusicPlaylistTrackCount();
 extern bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item);
+extern bool playerCoreCloudMusicPlayTrackStart(const char* trackId);
+extern uint8_t playerCoreCloudMusicResolveState();
+extern bool playerCoreCloudMusicConsumeNowPlaying(CloudTrackItem* outTrack);
 
 PlayerService playerService;
 
@@ -80,7 +83,23 @@ void copyText(char* destination, size_t destinationSize, const char* source) {
 
 void PlayerService::begin() { tick(); }
 
-void PlayerService::tick() { playerCoreReadSnapshot(&m_snapshot); }
+void PlayerService::tick() {
+    playerCoreReadSnapshot(&m_snapshot);
+    // Cloud Music phase 4: a resolve that just succeeded already told
+    // main.cpp to connecttohost() the CDN URL directly (see
+    // cloudMusicControllerTask) -- playerCoreReadSnapshot() above already
+    // picks up source=CloudMusic from that (via s_cloudMusicPlaying). All
+    // that's left is the metadata a plain CDN file URL never sends as ICY
+    // tags: title/artist/duration came from the gateway's resolve response
+    // instead, applied here once per completed resolve.
+    CloudTrackItem nowPlaying{};
+    if (playerCoreCloudMusicConsumeNowPlaying(&nowPlaying)) {
+        copyText(m_snapshot.title, sizeof(m_snapshot.title), nowPlaying.title);
+        copyText(m_snapshot.detail, sizeof(m_snapshot.detail), nowPlaying.artist);
+        m_snapshot.durationSeconds = nowPlaying.durationMs / 1000;
+        m_snapshot.error[0] = '\0';
+    }
+}
 
 PlayerSnapshot PlayerService::snapshot() const { return m_snapshot; }
 
@@ -92,7 +111,7 @@ bool PlayerService::playRadioUrl(const char* url) {
     // page is on screen. Only triggered here, at the actual moment playback
     // starts -- just opening/looking at the Radio page must NOT stop
     // anything the user hasn't asked to replace yet.
-    if (m_snapshot.source == PlayerSource::Sd) stop();
+    if (m_snapshot.source == PlayerSource::Sd || m_snapshot.source == PlayerSource::CloudMusic) stop();
     const bool started = playerCorePlayRadioUrl(url);
     if (started) {
         m_snapshot.source = PlayerSource::Radio;
@@ -106,7 +125,7 @@ bool PlayerService::playRadioUrl(const char* url) {
 bool PlayerService::playSdFile(const char* path, uint32_t positionSeconds) {
     // See playRadioUrl()'s comment -- same single-decoder reasoning, mirror
     // image: starting local playback stops a radio stream still running.
-    if (m_snapshot.source == PlayerSource::Radio) stop();
+    if (m_snapshot.source == PlayerSource::Radio || m_snapshot.source == PlayerSource::CloudMusic) stop();
     const bool started = playerCorePlaySdFile(path, positionSeconds);
     if (started) {
         m_snapshot.source = PlayerSource::Sd;
@@ -323,6 +342,21 @@ uint8_t PlayerService::cloudMusicPlaylistTrackCount() const { return playerCoreC
 
 bool PlayerService::cloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) const {
     return playerCoreCloudMusicPlaylistTrack(index, item);
+}
+
+bool PlayerService::cloudMusicPlayTrackStart(const char* trackId) {
+    // Same reasoning as playRadioUrl()/playSdFile(): stop whatever's
+    // playing now, at the moment playback is actually requested (not
+    // just browsing/looking at a list). The resolve itself is async
+    // (main.cpp's cloudMusicControllerTask), so unlike those two this
+    // doesn't set m_snapshot.source itself -- tick() picks that up from
+    // playerCoreReadSnapshot() once the resolve actually connects.
+    if (m_snapshot.source == PlayerSource::Radio || m_snapshot.source == PlayerSource::Sd) stop();
+    return playerCoreCloudMusicPlayTrackStart(trackId);
+}
+
+CloudMusicRequestState PlayerService::cloudMusicResolveState() const {
+    return static_cast<CloudMusicRequestState>(playerCoreCloudMusicResolveState());
 }
 
 void PlayerService::onMetadata(const char* station, const char* title) {

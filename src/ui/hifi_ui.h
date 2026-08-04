@@ -123,6 +123,12 @@ class HifiUi {
     void refreshCloudMusicSearch();
     void buildCloudMusicPlaylist();
     void refreshCloudMusicPlaylist();
+    // Shared by refreshCloudMusicSearch()/refreshCloudMusicPlaylist(): a
+    // resolve triggered by tapping a track row overlays Loading/Error text
+    // on m_cloudListHint without touching the list itself. Returns true if
+    // it changed anything (caller can use this to know whether the rest of
+    // its own refresh logic should still run this tick).
+    bool refreshCloudResolveOverlay();
     void buildFontPreview();
     void buildAudioHome();
     void buildAudioDecode();
@@ -401,6 +407,11 @@ class HifiUi {
     char m_cloudSelectedPlaylistId[24]{};
     char m_cloudSelectedPlaylistName[96]{};
     CloudMusicRequestState m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
+    // Tracked separately from m_lastCloudSearchState/m_lastCloudPlaylistState
+    // -- a resolve (triggered by tapping a track row) overlays its own
+    // Loading/Error text on m_cloudListHint without touching the list
+    // itself, see refreshCloudMusicSearch()/refreshCloudMusicPlaylist().
+    CloudMusicRequestState m_lastCloudResolveState = CloudMusicRequestState::Idle;
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to

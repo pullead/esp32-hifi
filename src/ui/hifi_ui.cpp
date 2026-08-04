@@ -862,6 +862,7 @@ void HifiUi::show(Page page) {
     m_cloudSearchField = m_cloudSearchKeyboard = nullptr;
     m_lastCloudSearchState = CloudMusicRequestState::Idle;
     m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
+    m_lastCloudResolveState = CloudMusicRequestState::Idle;
     for (auto& slider : m_audioEqSliders) slider = nullptr;
     for (auto& label : m_audioEqValueLabels) label = nullptr;
     for (auto& button : m_audioEqPresetButtons) button = nullptr;
@@ -3580,8 +3581,27 @@ void HifiUi::buildCloudMusicSearch() {
     refreshCloudMusicSearch();
 }
 
+bool HifiUi::refreshCloudResolveOverlay() {
+    const CloudMusicRequestState state = playerService.cloudMusicResolveState();
+    if (state == m_lastCloudResolveState) return false;
+    m_lastCloudResolveState = state;
+    if (!m_cloudListHint) return true;
+    if (state == CloudMusicRequestState::Error) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "播放失败：%s", playerService.cloudMusicLastError());
+        lv_label_set_text(m_cloudListHint, msg);
+    } else if (state == CloudMusicRequestState::Idle) {
+        // Loaded transitions straight back to Idle once PlayerService::
+        // tick() consumes the result (see playerCoreCloudMusicConsumeNowPlaying)
+        // -- clear the "正在解析…" hint set by onCloudMusicTrackRowAction.
+        lv_label_set_text(m_cloudListHint, "");
+    }
+    return true;
+}
+
 void HifiUi::refreshCloudMusicSearch() {
     if (!m_cloudListArea || !m_cloudListHint) return; // entry sub-view has neither -- nothing to refresh
+    refreshCloudResolveOverlay();
     const CloudMusicRequestState state = playerService.cloudMusicSearchState();
     if (state == m_lastCloudSearchState) return;
     m_lastCloudSearchState = state;
@@ -3661,6 +3681,7 @@ void HifiUi::buildCloudMusicPlaylist() {
 
 void HifiUi::refreshCloudMusicPlaylist() {
     if (!m_cloudListArea || !m_cloudListHint) return;
+    refreshCloudResolveOverlay();
     const CloudMusicRequestState state = playerService.cloudMusicPlaylistDetailState();
     if (state == m_lastCloudPlaylistState) return;
     m_lastCloudPlaylistState = state;
@@ -3741,10 +3762,24 @@ void HifiUi::onCloudMusicSearchGoAction(lv_event_t* event) {
 }
 
 void HifiUi::onCloudMusicTrackRowAction(lv_event_t* event) {
-    // Phase 3 is browse-only -- tapping a track has no player action yet.
-    // Wired up now (rather than left unbound) so phase 4 only has to fill
-    // this in, not also go find every row's event_cb call site.
-    (void)event;
+    if (!s_instance) return;
+    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    // Which list `index` refers to depends on which page this row lives on
+    // -- search results and playlist tracks are two separate arrays on the
+    // core side (see main.cpp), this is the one place that has to know
+    // which page is currently showing the row that got tapped.
+    CloudTrackItem item{};
+    bool found = false;
+    if (s_instance->m_page == Page::CloudMusicSearch) found = playerService.cloudMusicSearchResult(index, &item);
+    else if (s_instance->m_page == Page::CloudMusicPlaylist) found = playerService.cloudMusicPlaylistTrack(index, &item);
+    if (!found || !item.id[0]) return;
+    playerService.cloudMusicPlayTrackStart(item.id);
+    // Immediate feedback before the async resolve completes -- both list
+    // pages' refresh functions poll cloudMusicResolveState() each tick and
+    // will replace this with an error message (or clear it) once resolve
+    // finishes, same overlay-on-m_cloudListHint mechanism the loading/error
+    // states already use.
+    if (s_instance->m_cloudListHint) lv_label_set_text(s_instance->m_cloudListHint, "正在解析播放地址…");
 }
 
 void HifiUi::buildAudioTopBar(const char* title, const char* rightText, bool rightOk, const char* rightIcon) {
