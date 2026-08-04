@@ -38,7 +38,12 @@ class HifiUi {
         // Phase 2 of the online-music (在线音乐/网易云) feature: gateway
         // URL + device key entry and connection/wake test only -- no
         // search/browse/playback pages yet (those land in later phases).
-        CloudMusicSettings
+        CloudMusicSettings,
+        // Phase 3: browse-only (hot playlists / search / playlist detail),
+        // no playback wiring yet -- see docs spec's phased plan.
+        CloudMusicHome,
+        CloudMusicSearch,
+        CloudMusicPlaylist
     };
     // Cycled by tapping the play-mode button: 顺序播放 (stop at the end of
     // the filtered list) -> 列表循环 (wrap back to the start) -> 单曲循环
@@ -72,6 +77,10 @@ class HifiUi {
     static void onCloudMusicFieldFocusAction(lv_event_t* event);
     static void onCloudMusicSaveAction(lv_event_t* event);
     static void onCloudMusicTestAction(lv_event_t* event);
+    static void onCloudMusicPlaylistOpenAction(lv_event_t* event);
+    static void onCloudMusicSearchOpenAction(lv_event_t* event);
+    static void onCloudMusicSearchGoAction(lv_event_t* event);
+    static void onCloudMusicTrackRowAction(lv_event_t* event);
     static void onQuickVolumeAction(lv_event_t* event);
     static void onQuickBrightnessAction(lv_event_t* event);
     static void onQuickEqAction(lv_event_t* event);
@@ -108,6 +117,12 @@ class HifiUi {
     void refreshUsbStorage();
     void buildCloudMusicSettings();
     void refreshCloudMusicSettings();
+    void buildCloudMusicHome();
+    void refreshCloudMusicHome();
+    void buildCloudMusicSearch();
+    void refreshCloudMusicSearch();
+    void buildCloudMusicPlaylist();
+    void refreshCloudMusicPlaylist();
     void buildFontPreview();
     void buildAudioHome();
     void buildAudioDecode();
@@ -373,6 +388,19 @@ class HifiUi {
     lv_obj_t* m_cloudStatusLabel = nullptr;
     lv_obj_t* m_cloudHintLabel = nullptr;
     CloudServiceState m_lastCloudServiceState = CloudServiceState::Unknown;
+    // Phase 3 browse pages (hot playlists / search / playlist detail).
+    // m_cloudListArea is reused across all three build functions' own list
+    // container (only one of these pages is ever on screen at once, same
+    // reasoning as m_coverArtPixels being shared between radio/local art).
+    lv_obj_t* m_cloudListArea = nullptr;
+    lv_obj_t* m_cloudListHint = nullptr;
+    CloudMusicRequestState m_lastCloudHotState = CloudMusicRequestState::Idle;
+    lv_obj_t* m_cloudSearchField = nullptr;
+    lv_obj_t* m_cloudSearchKeyboard = nullptr;
+    CloudMusicRequestState m_lastCloudSearchState = CloudMusicRequestState::Idle;
+    char m_cloudSelectedPlaylistId[24]{};
+    char m_cloudSelectedPlaylistName[96]{};
+    CloudMusicRequestState m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to

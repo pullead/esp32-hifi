@@ -3416,6 +3416,346 @@ void playerCoreCloudMusicWakeStart() {
     }
 }
 
+// ---- Cloud Music phase 3: search / hot playlists / playlist detail ------
+// Browse-only, per the project's phased NCM spec -- no playback wiring
+// (that's phase 4). One background controller task processes one command
+// at a time (mirrors lyricsFetchTask's queue+task shape); each *Start()
+// bumps s_cloudRequestGeneration and stamps its command with the new value,
+// and a finishing command only writes its result into the shared arrays if
+// that generation is still current -- otherwise a newer request has since
+// superseded it and the stale result is silently dropped (same idea as
+// lyricsFetchTask checking s_lyricTrackIndex before applying a result, one
+// generation counter shared across all three lookup kinds since only one of
+// them is ever visible on screen at a time in this UI).
+
+static constexpr uint8_t kCloudSearchMaxResults = 10;
+static constexpr uint8_t kCloudHotPlaylistMax = 8;
+static constexpr uint8_t kCloudPlaylistTrackMax = 20;
+
+enum class CloudCommandType : uint8_t { Search, LoadHotPlaylists, LoadPlaylist };
+struct CloudCommand {
+    CloudCommandType type;
+    uint32_t generation;
+    char param[128]; // search query, or playlist id
+};
+
+static QueueHandle_t s_cloudCommandQueue = nullptr;
+static SemaphoreHandle_t s_cloudResultMutex = nullptr;
+static volatile uint32_t s_cloudRequestGeneration = 0;
+static char s_cloudLastError[96] = "";
+
+static CloudMusicRequestState s_cloudSearchState = CloudMusicRequestState::Idle;
+static CloudTrackItem s_cloudSearchResults[kCloudSearchMaxResults];
+static uint8_t s_cloudSearchResultCount = 0;
+static bool s_cloudSearchHasMore = false;
+
+static CloudMusicRequestState s_cloudHotState = CloudMusicRequestState::Idle;
+static CloudPlaylistItem s_cloudHotPlaylists[kCloudHotPlaylistMax];
+static uint8_t s_cloudHotPlaylistCount = 0;
+
+static CloudMusicRequestState s_cloudPlaylistState = CloudMusicRequestState::Idle;
+static CloudPlaylistItem s_cloudPlaylistInfo;
+static CloudTrackItem s_cloudPlaylistTracks[kCloudPlaylistTrackMax];
+static uint8_t s_cloudPlaylistTrackCount = 0;
+
+static bool cloudResultLock(TickType_t timeout = pdMS_TO_TICKS(250)) {
+    return !s_cloudResultMutex || xSemaphoreTake(s_cloudResultMutex, timeout) == pdTRUE;
+}
+static void cloudResultUnlock() {
+    if (s_cloudResultMutex) xSemaphoreGive(s_cloudResultMutex);
+}
+
+// Finds "key":[ ... ] in body and returns up to maxItems top-level {...}
+// object slices from inside it (raw JSON text per item, for
+// jsonStringField()/jsonNumber() to run on directly). Same hand-scan
+// approach as jsonStringField (no JSON library in this project), extended
+// to walk balanced brace depth -- respecting quoted strings and \" escapes
+// so a brace or comma inside a title/name string doesn't desync it.
+static uint8_t jsonArrayItems(const String& body, const char* key, String* outItems, uint8_t maxItems) {
+    const String needle = String("\"") + key + "\":[";
+    const int start = body.indexOf(needle);
+    if (start < 0) return 0;
+    int pos = start + static_cast<int>(needle.length());
+    const int len = static_cast<int>(body.length());
+    uint8_t count = 0;
+    while (count < maxItems && pos < len) {
+        while (pos < len && (isspace(static_cast<unsigned char>(body[pos])) || body[pos] == ',')) ++pos;
+        if (pos >= len || body[pos] == ']') break;
+        if (body[pos] != '{') break; // malformed / not an object array -- stop rather than misparse
+        const int objStart = pos;
+        int depth = 0;
+        bool inString = false;
+        for (; pos < len; ++pos) {
+            const char c = body[pos];
+            if (inString) {
+                if (c == '\\') { ++pos; continue; } // loop's own ++pos advances past the escaped char too
+                if (c == '"') inString = false;
+                continue;
+            }
+            if (c == '"') { inString = true; continue; }
+            if (c == '{') ++depth;
+            else if (c == '}') {
+                --depth;
+                if (depth == 0) { ++pos; break; }
+            }
+        }
+        outItems[count++] = body.substring(objStart, pos);
+    }
+    return count;
+}
+
+static void parseCloudTrackItem(const String& itemJson, CloudTrackItem* out) {
+    *out = CloudTrackItem{};
+    String s;
+    if (jsonStringField(itemJson, "id", s)) strlcpy(out->id, s.c_str(), sizeof(out->id));
+    if (jsonStringField(itemJson, "title", s)) strlcpy(out->title, s.c_str(), sizeof(out->title));
+    if (jsonStringField(itemJson, "artist", s)) strlcpy(out->artist, s.c_str(), sizeof(out->artist));
+    if (jsonStringField(itemJson, "album", s)) strlcpy(out->album, s.c_str(), sizeof(out->album));
+    if (jsonStringField(itemJson, "cover_url", s)) strlcpy(out->coverUrl, s.c_str(), sizeof(out->coverUrl));
+    double num = 0;
+    if (jsonNumber(itemJson, "duration_ms", &num)) out->durationMs = static_cast<uint32_t>(num);
+    out->playableHint = itemJson.indexOf("\"playable_hint\":false") < 0;
+}
+
+static void parseCloudPlaylistItem(const String& itemJson, CloudPlaylistItem* out) {
+    *out = CloudPlaylistItem{};
+    String s;
+    if (jsonStringField(itemJson, "id", s)) strlcpy(out->id, s.c_str(), sizeof(out->id));
+    if (jsonStringField(itemJson, "name", s)) strlcpy(out->name, s.c_str(), sizeof(out->name));
+    if (jsonStringField(itemJson, "creator", s)) strlcpy(out->creator, s.c_str(), sizeof(out->creator));
+    if (jsonStringField(itemJson, "cover_url", s)) strlcpy(out->coverUrl, s.c_str(), sizeof(out->coverUrl));
+    double num = 0;
+    if (jsonNumber(itemJson, "track_count", &num)) out->trackCount = static_cast<uint16_t>(num);
+}
+
+// One GET against the configured gateway, with the device key header and
+// this project's existing HTTPS posture (setInsecure(), see
+// cloudMusicHealthCheckOnce's comment). On a gateway error response
+// ({"ok":false,"error":{...}}), fills s_cloudLastError from the "message"
+// field so callers don't need to re-parse the error envelope themselves.
+static bool cloudMusicHttpGet(const String& path, String& outBody) {
+    const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
+    if (!WiFi.isConnected()) {
+        strlcpy(s_cloudLastError, "WiFi 未连接", sizeof(s_cloudLastError));
+        return false;
+    }
+    if (!cfg.configured) {
+        strlcpy(s_cloudLastError, "未配置在线音乐网关", sizeof(s_cloudLastError));
+        return false;
+    }
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    const String url = String(cfg.baseUrl) + path;
+    if (!http.begin(client, url)) {
+        strlcpy(s_cloudLastError, "无法连接网关", sizeof(s_cloudLastError));
+        return false;
+    }
+    http.setTimeout(10000);
+    http.addHeader("X-Device-Key", cfg.deviceKey);
+    const int code = http.GET();
+    if (code <= 0) {
+        http.end();
+        strlcpy(s_cloudLastError, "网络请求失败", sizeof(s_cloudLastError));
+        return false;
+    }
+    outBody = http.getString();
+    http.end();
+    const bool ok = outBody.indexOf("\"ok\":true") >= 0 || outBody.indexOf("\"ok\": true") >= 0;
+    if (!ok) {
+        String message;
+        if (!jsonStringField(outBody, "message", message) || message.isEmpty()) message = "请求失败";
+        strlcpy(s_cloudLastError, message.c_str(), sizeof(s_cloudLastError));
+        return false;
+    }
+    return true;
+}
+
+static void cloudMusicControllerTask(void*) {
+    CloudCommand cmd;
+    for (;;) {
+        if (xQueueReceive(s_cloudCommandQueue, &cmd, portMAX_DELAY) != pdTRUE) continue;
+
+        if (cmd.type == CloudCommandType::Search) {
+            if (cloudResultLock()) {
+                s_cloudSearchState = CloudMusicRequestState::Loading;
+                cloudResultUnlock();
+            }
+            String query;
+            urlEncodeAppend(query, cmd.param);
+            char path[192];
+            snprintf(path, sizeof(path), "/esp/v1/search?q=%s&limit=%u", query.c_str(), kCloudSearchMaxResults);
+            String body;
+            const bool ok = cloudMusicHttpGet(path, body);
+            if (cmd.generation != s_cloudRequestGeneration) continue; // superseded while the request was in flight
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                if (ok) {
+                    String items[kCloudSearchMaxResults];
+                    const uint8_t n = jsonArrayItems(body, "items", items, kCloudSearchMaxResults);
+                    for (uint8_t i = 0; i < n; ++i) parseCloudTrackItem(items[i], &s_cloudSearchResults[i]);
+                    s_cloudSearchResultCount = n;
+                    s_cloudSearchHasMore = body.indexOf("\"has_more\":true") >= 0;
+                    s_cloudSearchState = CloudMusicRequestState::Loaded;
+                } else {
+                    s_cloudSearchResultCount = 0;
+                    s_cloudSearchState = CloudMusicRequestState::Error;
+                }
+                cloudResultUnlock();
+            }
+        } else if (cmd.type == CloudCommandType::LoadHotPlaylists) {
+            if (cloudResultLock()) {
+                s_cloudHotState = CloudMusicRequestState::Loading;
+                cloudResultUnlock();
+            }
+            char path[64];
+            snprintf(path, sizeof(path), "/esp/v1/playlists/hot?limit=%u", kCloudHotPlaylistMax);
+            String body;
+            const bool ok = cloudMusicHttpGet(path, body);
+            if (cmd.generation != s_cloudRequestGeneration) continue;
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                if (ok) {
+                    String items[kCloudHotPlaylistMax];
+                    const uint8_t n = jsonArrayItems(body, "items", items, kCloudHotPlaylistMax);
+                    for (uint8_t i = 0; i < n; ++i) parseCloudPlaylistItem(items[i], &s_cloudHotPlaylists[i]);
+                    s_cloudHotPlaylistCount = n;
+                    s_cloudHotState = CloudMusicRequestState::Loaded;
+                } else {
+                    s_cloudHotPlaylistCount = 0;
+                    s_cloudHotState = CloudMusicRequestState::Error;
+                }
+                cloudResultUnlock();
+            }
+        } else { // LoadPlaylist
+            if (cloudResultLock()) {
+                s_cloudPlaylistState = CloudMusicRequestState::Loading;
+                cloudResultUnlock();
+            }
+            char path[160];
+            snprintf(path, sizeof(path), "/esp/v1/playlists/%s?limit=%u", cmd.param, kCloudPlaylistTrackMax);
+            String body;
+            const bool ok = cloudMusicHttpGet(path, body);
+            if (cmd.generation != s_cloudRequestGeneration) continue;
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                if (ok) {
+                    // "playlist" is a single object, not an array -- jsonStringField/
+                    // jsonNumber already find the first (only) match directly.
+                    parseCloudPlaylistItem(body, &s_cloudPlaylistInfo);
+                    String items[kCloudPlaylistTrackMax];
+                    const uint8_t n = jsonArrayItems(body, "tracks", items, kCloudPlaylistTrackMax);
+                    for (uint8_t i = 0; i < n; ++i) parseCloudTrackItem(items[i], &s_cloudPlaylistTracks[i]);
+                    s_cloudPlaylistTrackCount = n;
+                    s_cloudPlaylistState = CloudMusicRequestState::Loaded;
+                } else {
+                    s_cloudPlaylistTrackCount = 0;
+                    s_cloudPlaylistState = CloudMusicRequestState::Error;
+                }
+                cloudResultUnlock();
+            }
+        }
+    }
+}
+
+static bool cloudMusicEnqueue(CloudCommandType type, const char* param) {
+    if (!s_cloudCommandQueue) return false;
+    CloudCommand cmd{};
+    cmd.type = type;
+    cmd.generation = ++s_cloudRequestGeneration;
+    if (param) strlcpy(cmd.param, param, sizeof(cmd.param));
+    // Queue depth 1 (see its xQueueCreate call in setup()): a command still
+    // waiting to be picked up gets overwritten by a newer one of any kind,
+    // same as lyricsFetchTask's single-slot queue. A command already being
+    // processed can't be aborted mid-HTTP-request, but its result is
+    // discarded on completion once cmd.generation no longer matches (see
+    // cloudMusicControllerTask).
+    return xQueueOverwrite(s_cloudCommandQueue, &cmd) == pdTRUE;
+}
+
+bool playerCoreCloudMusicSearchStart(const char* query) {
+    if (!query || !query[0]) return false;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        s_cloudSearchResultCount = 0;
+        s_cloudSearchState = CloudMusicRequestState::Loading;
+        cloudResultUnlock();
+    }
+    return cloudMusicEnqueue(CloudCommandType::Search, query);
+}
+
+uint8_t playerCoreCloudMusicSearchState() { return static_cast<uint8_t>(s_cloudSearchState); }
+
+uint8_t playerCoreCloudMusicSearchResultCount() { return s_cloudSearchResultCount; }
+
+bool playerCoreCloudMusicSearchResult(uint8_t index, CloudTrackItem* item) {
+    if (!item || index >= s_cloudSearchResultCount) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        *item = s_cloudSearchResults[index];
+        ok = true;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
+bool playerCoreCloudMusicSearchHasMore() { return s_cloudSearchHasMore; }
+
+const char* playerCoreCloudMusicLastError() { return s_cloudLastError; }
+
+void playerCoreCloudMusicHotPlaylistsStart() {
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        s_cloudHotState = CloudMusicRequestState::Loading;
+        cloudResultUnlock();
+    }
+    cloudMusicEnqueue(CloudCommandType::LoadHotPlaylists, nullptr);
+}
+
+uint8_t playerCoreCloudMusicHotPlaylistsState() { return static_cast<uint8_t>(s_cloudHotState); }
+
+uint8_t playerCoreCloudMusicHotPlaylistCount() { return s_cloudHotPlaylistCount; }
+
+bool playerCoreCloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item) {
+    if (!item || index >= s_cloudHotPlaylistCount) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        *item = s_cloudHotPlaylists[index];
+        ok = true;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
+bool playerCoreCloudMusicPlaylistDetailStart(const char* playlistId) {
+    if (!playlistId || !playlistId[0]) return false;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        s_cloudPlaylistTrackCount = 0;
+        s_cloudPlaylistState = CloudMusicRequestState::Loading;
+        cloudResultUnlock();
+    }
+    return cloudMusicEnqueue(CloudCommandType::LoadPlaylist, playlistId);
+}
+
+uint8_t playerCoreCloudMusicPlaylistDetailState() { return static_cast<uint8_t>(s_cloudPlaylistState); }
+
+CloudPlaylistItem playerCoreCloudMusicPlaylistDetailInfo() {
+    CloudPlaylistItem out;
+    if (cloudResultLock()) {
+        out = s_cloudPlaylistInfo;
+        cloudResultUnlock();
+    }
+    return out;
+}
+
+uint8_t playerCoreCloudMusicPlaylistTrackCount() { return s_cloudPlaylistTrackCount; }
+
+bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) {
+    if (!item || index >= s_cloudPlaylistTrackCount) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        *item = s_cloudPlaylistTracks[index];
+        ok = true;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
 // setAudioFilePosition() takes a byte offset, not seconds -- approximates a
 // target byte from a linear time/size ratio (exact for CBR MP3, a close
 // enough estimate for VBR, same tradeoff any simple player's seek bar
@@ -4004,6 +4344,12 @@ void setup() {
     if (!s_wifiOpMutex) MWR_LOG_ERROR("Failed to create WiFi operation mutex");
     if (!s_cloudMusicMutex) MWR_LOG_ERROR("Failed to create cloud music config mutex");
     cloudMusicLoadConfig();
+    s_cloudResultMutex = xSemaphoreCreateMutex();
+    s_cloudCommandQueue = xQueueCreate(1, sizeof(CloudCommand));
+    if (!s_cloudResultMutex) MWR_LOG_ERROR("Failed to create cloud music result mutex");
+    if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 10240, nullptr, 1, nullptr) != pdPASS) {
+        MWR_LOG_ERROR("Failed to create cloud music controller task");
+    }
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting
     // like weatherTask) since local playback -- and playerCoreLoadLyrics()'s
     // mutex-guarded cache -- can happen with WiFi never up. fetchLyricsOnline()

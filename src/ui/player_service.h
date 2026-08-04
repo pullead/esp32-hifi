@@ -33,6 +33,35 @@ struct CloudMusicConfig {
     bool configured = false; // true once both fields have been saved at least once
 };
 
+// One track as returned by the gateway's /esp/v1/search, /esp/v1/playlists/*
+// endpoints (see services/ncm-gateway/src/ncmProvider.js's buildSearchItem).
+// `id` is a NetEase track id, kept as text (it's only ever round-tripped
+// back to the gateway in a resolve/lyrics URL, never arithmetic on it).
+struct CloudTrackItem {
+    char id[24]{};
+    char title[80]{};
+    char artist[64]{};
+    char album[64]{};
+    uint32_t durationMs = 0;
+    char coverUrl[200]{};
+    bool playableHint = true;
+};
+
+struct CloudPlaylistItem {
+    char id[24]{};
+    char name[96]{};
+    char creator[48]{};
+    char coverUrl[200]{};
+    uint16_t trackCount = 0;
+};
+
+// Generic request lifecycle for the three phase-3 background lookups
+// (search / hot playlists / playlist detail) -- same shape as
+// LyricFetchState, one instance per lookup kind rather than a single shared
+// one, since e.g. opening a playlist while a search is still loading must
+// not clobber the search's own state.
+enum class CloudMusicRequestState : uint8_t { Idle, Loading, Loaded, Error };
+
 struct UsbStorageStats {
     uint32_t readCount = 0;
     uint32_t writeCount = 0;
@@ -255,6 +284,29 @@ class PlayerService {
     // sequence -- see cloudMusicWakeTask()'s comment in main.cpp for the
     // retry schedule. No-op if cloudMusicConfig().configured is false.
     void cloudMusicWakeStart();
+
+    // Phase 3: browse-only (search/hot playlists/playlist detail), no
+    // playback wiring yet. Each *Start() enqueues a command for the single
+    // background controller task (main.cpp's cloudMusicControllerTask, see
+    // its own comment for the command/generation/cancellation scheme) and
+    // returns immediately; poll the matching *State() from the LVGL tick.
+    bool cloudMusicSearchStart(const char* query);
+    CloudMusicRequestState cloudMusicSearchState() const;
+    uint8_t cloudMusicSearchResultCount() const;
+    bool cloudMusicSearchResult(uint8_t index, CloudTrackItem* item) const;
+    bool cloudMusicSearchHasMore() const;
+    const char* cloudMusicLastError() const; // shared across search/hot/playlist -- only one of them is ever Error at a time in this phase's single-request-at-a-time UI
+
+    void cloudMusicHotPlaylistsStart();
+    CloudMusicRequestState cloudMusicHotPlaylistsState() const;
+    uint8_t cloudMusicHotPlaylistCount() const;
+    bool cloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item) const;
+
+    bool cloudMusicPlaylistDetailStart(const char* playlistId);
+    CloudMusicRequestState cloudMusicPlaylistDetailState() const;
+    CloudPlaylistItem cloudMusicPlaylistDetailInfo() const;
+    uint8_t cloudMusicPlaylistTrackCount() const;
+    bool cloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) const;
 
     // Called by the MiniWebRadio audio callback, never from an LVGL handler.
     void onMetadata(const char* station, const char* title);

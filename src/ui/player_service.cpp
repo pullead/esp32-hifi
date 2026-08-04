@@ -53,6 +53,21 @@ extern CloudMusicConfig playerCoreCloudMusicConfig();
 extern bool playerCoreSetCloudMusicConfig(const char* baseUrl, const char* deviceKey);
 extern uint8_t playerCoreCloudServiceState();
 extern void playerCoreCloudMusicWakeStart();
+extern bool playerCoreCloudMusicSearchStart(const char* query);
+extern uint8_t playerCoreCloudMusicSearchState();
+extern uint8_t playerCoreCloudMusicSearchResultCount();
+extern bool playerCoreCloudMusicSearchResult(uint8_t index, CloudTrackItem* item);
+extern bool playerCoreCloudMusicSearchHasMore();
+extern const char* playerCoreCloudMusicLastError();
+extern void playerCoreCloudMusicHotPlaylistsStart();
+extern uint8_t playerCoreCloudMusicHotPlaylistsState();
+extern uint8_t playerCoreCloudMusicHotPlaylistCount();
+extern bool playerCoreCloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item);
+extern bool playerCoreCloudMusicPlaylistDetailStart(const char* playlistId);
+extern uint8_t playerCoreCloudMusicPlaylistDetailState();
+extern CloudPlaylistItem playerCoreCloudMusicPlaylistDetailInfo();
+extern uint8_t playerCoreCloudMusicPlaylistTrackCount();
+extern bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item);
 
 PlayerService playerService;
 
@@ -265,6 +280,50 @@ CloudServiceState PlayerService::cloudServiceState() const {
 }
 
 void PlayerService::cloudMusicWakeStart() { playerCoreCloudMusicWakeStart(); }
+
+bool PlayerService::cloudMusicSearchStart(const char* query) { return playerCoreCloudMusicSearchStart(query); }
+
+CloudMusicRequestState PlayerService::cloudMusicSearchState() const {
+    return static_cast<CloudMusicRequestState>(playerCoreCloudMusicSearchState());
+}
+
+uint8_t PlayerService::cloudMusicSearchResultCount() const { return playerCoreCloudMusicSearchResultCount(); }
+
+bool PlayerService::cloudMusicSearchResult(uint8_t index, CloudTrackItem* item) const {
+    return playerCoreCloudMusicSearchResult(index, item);
+}
+
+bool PlayerService::cloudMusicSearchHasMore() const { return playerCoreCloudMusicSearchHasMore(); }
+
+const char* PlayerService::cloudMusicLastError() const { return playerCoreCloudMusicLastError(); }
+
+void PlayerService::cloudMusicHotPlaylistsStart() { playerCoreCloudMusicHotPlaylistsStart(); }
+
+CloudMusicRequestState PlayerService::cloudMusicHotPlaylistsState() const {
+    return static_cast<CloudMusicRequestState>(playerCoreCloudMusicHotPlaylistsState());
+}
+
+uint8_t PlayerService::cloudMusicHotPlaylistCount() const { return playerCoreCloudMusicHotPlaylistCount(); }
+
+bool PlayerService::cloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item) const {
+    return playerCoreCloudMusicHotPlaylist(index, item);
+}
+
+bool PlayerService::cloudMusicPlaylistDetailStart(const char* playlistId) {
+    return playerCoreCloudMusicPlaylistDetailStart(playlistId);
+}
+
+CloudMusicRequestState PlayerService::cloudMusicPlaylistDetailState() const {
+    return static_cast<CloudMusicRequestState>(playerCoreCloudMusicPlaylistDetailState());
+}
+
+CloudPlaylistItem PlayerService::cloudMusicPlaylistDetailInfo() const { return playerCoreCloudMusicPlaylistDetailInfo(); }
+
+uint8_t PlayerService::cloudMusicPlaylistTrackCount() const { return playerCoreCloudMusicPlaylistTrackCount(); }
+
+bool PlayerService::cloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) const {
+    return playerCoreCloudMusicPlaylistTrack(index, item);
+}
 
 void PlayerService::onMetadata(const char* station, const char* title) {
     if (station && station[0]) copyText(m_snapshot.title, sizeof(m_snapshot.title), station);

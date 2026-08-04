@@ -857,6 +857,11 @@ void HifiUi::show(Page page) {
     m_cloudBaseUrlField = m_cloudDeviceKeyField = m_cloudKeyboard = nullptr;
     m_cloudStatusLabel = m_cloudHintLabel = nullptr;
     m_lastCloudServiceState = CloudServiceState::Unknown;
+    m_cloudListArea = m_cloudListHint = nullptr;
+    m_lastCloudHotState = CloudMusicRequestState::Idle;
+    m_cloudSearchField = m_cloudSearchKeyboard = nullptr;
+    m_lastCloudSearchState = CloudMusicRequestState::Idle;
+    m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
     for (auto& slider : m_audioEqSliders) slider = nullptr;
     for (auto& label : m_audioEqValueLabels) label = nullptr;
     for (auto& button : m_audioEqPresetButtons) button = nullptr;
@@ -896,6 +901,9 @@ void HifiUi::show(Page page) {
     else if (page == Page::AudioEffects) buildAudioEffects();
     else if (page == Page::AudioDac) buildAudioDac();
     else if (page == Page::CloudMusicSettings) buildCloudMusicSettings();
+    else if (page == Page::CloudMusicHome) buildCloudMusicHome();
+    else if (page == Page::CloudMusicSearch) buildCloudMusicSearch();
+    else if (page == Page::CloudMusicPlaylist) buildCloudMusicPlaylist();
     else buildPlaceholder("SETTINGS / EQ", "Audio, EQ, network and sleep");
 }
 
@@ -1173,11 +1181,14 @@ void HifiUi::buildHome() {
     lv_obj_clear_flag(navBar, LV_OBJ_FLAG_SCROLLABLE);
 
     struct NavItem { const char* icon; const char* label; Page page; };
+    // "解码" (a direct AudioDecode shortcut, itself just a convenience
+    // duplicate of Settings > 音频 > 解码) gave up its slot to 在线音乐 --
+    // still only 5 across, same spacing/tap-target size as before.
     static const NavItem kNavItems[5] = {
         {LV_SYMBOL_PLAY, "音乐", Page::LocalNowPlaying},
         {LV_SYMBOL_AUDIO, "电台", Page::Radio},
         {LV_SYMBOL_SD_CARD, "本地", Page::Sd},
-        {LV_SYMBOL_LIST, "解码", Page::AudioDecode},
+        {LV_SYMBOL_GPS, "在线", Page::CloudMusicHome},
         {LV_SYMBOL_SETTINGS, "设置", Page::Settings},
     };
     constexpr int16_t kNavSlotW = 304 / 5;
@@ -3360,6 +3371,382 @@ void HifiUi::onCloudMusicTestAction(lv_event_t* event) {
     playerService.cloudMusicWakeStart();
 }
 
+// ---- Cloud Music phase 3: hot playlists / search / playlist detail ------
+// Browse-only pages -- tapping a track doesn't play anything yet (see
+// onCloudMusicTrackRowAction's comment, playback lands in phase 4).
+
+void HifiUi::buildCloudMusicHome() {
+    buildAudioTopBar("在线音乐", nullptr, false, nullptr);
+    lv_obj_t* screen = lv_scr_act();
+
+    lv_obj_t* searchBtn = lv_btn_create(screen);
+    lv_obj_set_pos(searchBtn, 280, 2);
+    lv_obj_set_size(searchBtn, 34, 20);
+    lv_obj_set_style_radius(searchBtn, 6, 0);
+    lv_obj_set_style_bg_color(searchBtn, kPanelDeep, 0);
+    lv_obj_set_style_bg_opa(searchBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(searchBtn, 0, 0);
+    lv_obj_set_style_border_width(searchBtn, 0, 0);
+    lv_obj_set_style_pad_all(searchBtn, 0, 0);
+    lv_obj_clear_flag(searchBtn, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(searchBtn);
+    lv_obj_add_event_cb(searchBtn, onCloudMusicSearchOpenAction, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* searchIcon = makeText(searchBtn, LV_SYMBOL_LIST, &lv_font_montserrat_14, kInkDim, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(searchIcon, LV_OBJ_FLAG_CLICKABLE);
+
+    m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_width(m_cloudListHint, 300);
+    lv_label_set_long_mode(m_cloudListHint, LV_LABEL_LONG_WRAP);
+
+    m_cloudListArea = lv_obj_create(screen);
+    lv_obj_set_pos(m_cloudListArea, 8, 32);
+    lv_obj_set_size(m_cloudListArea, 304, 132);
+    lv_obj_set_style_bg_opa(m_cloudListArea, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(m_cloudListArea, 0, 0);
+    lv_obj_set_style_pad_all(m_cloudListArea, 0, 0);
+    lv_obj_set_style_radius(m_cloudListArea, 0, 0);
+    lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(m_cloudListArea, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(m_cloudListArea, LV_SCROLLBAR_MODE_AUTO);
+
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "尚未配置在线音乐网关\n请前往 设置 > 在线音乐 完成配置");
+    } else {
+        playerService.cloudMusicHotPlaylistsStart();
+    }
+    m_lastCloudHotState = CloudMusicRequestState::Idle; // force refreshCloudMusicHome() to render on first tick
+    refreshCloudMusicHome();
+}
+
+void HifiUi::refreshCloudMusicHome() {
+    if (!m_cloudListArea || !m_cloudListHint) return;
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) return; // buildCloudMusicHome() already rendered the "not configured" hint once, nothing polls after that
+
+    const CloudMusicRequestState state = playerService.cloudMusicHotPlaylistsState();
+    if (state == m_lastCloudHotState) return;
+    m_lastCloudHotState = state;
+
+    lv_obj_clean(m_cloudListArea);
+    if (state == CloudMusicRequestState::Loading) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "正在加载热门歌单…");
+        return;
+    }
+    if (state == CloudMusicRequestState::Error) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "加载失败：%s", playerService.cloudMusicLastError());
+        lv_label_set_text(m_cloudListHint, msg);
+        return;
+    }
+    lv_label_set_text(m_cloudListHint, "");
+    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+
+    const uint8_t count = playerService.cloudMusicHotPlaylistCount();
+    if (!count) {
+        makeText(m_cloudListArea, "没有找到热门歌单", &lv_font_montserrat_12, kInkDim, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        CloudPlaylistItem item{};
+        if (!playerService.cloudMusicHotPlaylist(i, &item)) continue;
+        lv_obj_t* row = lv_btn_create(m_cloudListArea);
+        lv_obj_set_pos(row, 0, i * 40);
+        lv_obj_set_size(row, 288, 36);
+        lv_obj_set_style_radius(row, 10, 0);
+        lv_obj_set_style_bg_color(row, kPanel, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(row);
+        lv_obj_add_event_cb(row, onCloudMusicPlaylistOpenAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 10, 4);
+        lv_obj_set_width(nameLabel, 200);
+        lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(nameLabel, LV_OBJ_FLAG_CLICKABLE);
+
+        char sub[64];
+        snprintf(sub, sizeof(sub), "%s · %u首", item.creator[0] ? item.creator : "歌单", item.trackCount);
+        lv_obj_t* subLabel = makeText(row, sub, &lv_font_montserrat_12, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -4);
+        lv_obj_set_width(subLabel, 260);
+        lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(subLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+void HifiUi::buildCloudMusicSearch() {
+    lv_obj_t* screen = lv_scr_act();
+    const CloudMusicRequestState state = playerService.cloudMusicSearchState();
+
+    if (state == CloudMusicRequestState::Idle) {
+        // Entry sub-view: query field + keyboard, same packing as
+        // buildCloudMusicSettings()'s two-row-plus-keyboard layout.
+        lv_obj_t* backBtn = lv_btn_create(screen);
+        lv_obj_set_pos(backBtn, 2, 0);
+        lv_obj_set_size(backBtn, 18, 20);
+        lv_obj_set_style_bg_opa(backBtn, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(backBtn, 0, 0);
+        lv_obj_set_style_shadow_width(backBtn, 0, 0);
+        lv_obj_set_style_pad_all(backBtn, 0, 0);
+        lv_obj_clear_flag(backBtn, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(backBtn);
+        lv_obj_add_event_cb(backBtn, onTransportAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(kActionBack));
+        lv_obj_t* backLabel = makeText(backBtn, LV_SYMBOL_LEFT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(backLabel, LV_OBJ_FLAG_CLICKABLE);
+
+        m_cloudSearchField = lv_textarea_create(screen);
+        lv_obj_set_pos(m_cloudSearchField, 22, 0);
+        lv_obj_set_size(m_cloudSearchField, 234, 20);
+        lv_textarea_set_one_line(m_cloudSearchField, true);
+        lv_textarea_set_placeholder_text(m_cloudSearchField, "搜索歌曲/歌手");
+        lv_textarea_set_max_length(m_cloudSearchField, 63);
+        lv_obj_set_style_text_font(m_cloudSearchField, &lv_font_cjk_13, 0);
+        lv_obj_set_style_pad_ver(m_cloudSearchField, 2, 0);
+
+        lv_obj_t* goBtn = lv_btn_create(screen);
+        lv_obj_set_pos(goBtn, 258, 0);
+        lv_obj_set_size(goBtn, 60, 20);
+        lv_obj_set_style_radius(goBtn, 8, 0);
+        lv_obj_set_style_bg_color(goBtn, kAccentBright, 0);
+        lv_obj_set_style_bg_opa(goBtn, LV_OPA_COVER, 0);
+        lv_obj_set_style_shadow_width(goBtn, 0, 0);
+        lv_obj_set_style_pad_all(goBtn, 0, 0);
+        lv_obj_clear_flag(goBtn, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(goBtn);
+        lv_obj_add_event_cb(goBtn, onCloudMusicSearchGoAction, LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* goLabel = makeText(goBtn, "搜索", &lv_font_cjk_13, lv_color_black(), LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(goLabel, LV_OBJ_FLAG_CLICKABLE);
+
+        static const char* const kSearchKbMap[] = {
+            "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", LV_SYMBOL_BACKSPACE, "\n",
+            "a", "s", "d", "f", "g", "h", "j", "k", "l", LV_SYMBOL_NEW_LINE, "\n",
+            "1#", "z", "x", "c", "v", "b", "n", "m", " ", ""
+        };
+        static const lv_btnmatrix_ctrl_t kSearchKbCtrl[30] = {
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1, 4
+        };
+        m_cloudSearchKeyboard = lv_keyboard_create(screen);
+        lv_obj_set_pos(m_cloudSearchKeyboard, 0, 20);
+        lv_obj_set_size(m_cloudSearchKeyboard, 320, 150);
+        lv_obj_set_style_pad_all(m_cloudSearchKeyboard, 0, 0);
+        lv_obj_set_style_pad_row(m_cloudSearchKeyboard, 2, 0);
+        lv_obj_set_style_pad_column(m_cloudSearchKeyboard, 2, 0);
+        lv_keyboard_set_map(m_cloudSearchKeyboard, LV_KEYBOARD_MODE_TEXT_LOWER, (const char**)kSearchKbMap, kSearchKbCtrl);
+        lv_keyboard_set_textarea(m_cloudSearchKeyboard, m_cloudSearchField);
+        lv_obj_add_event_cb(m_cloudSearchKeyboard, onCloudMusicSearchGoAction, LV_EVENT_READY, nullptr);
+        return; // no refreshCloudMusicSearch() needed -- this sub-view is static until the user taps 搜索
+    }
+
+    // Results sub-view: same list-row treatment as buildCloudMusicHome().
+    buildAudioTopBar("搜索结果", nullptr, false, nullptr);
+
+    lv_obj_t* backBtn = lv_btn_create(screen);
+    lv_obj_set_pos(backBtn, 280, 2);
+    lv_obj_set_size(backBtn, 34, 20);
+    lv_obj_set_style_radius(backBtn, 6, 0);
+    lv_obj_set_style_bg_color(backBtn, kPanelDeep, 0);
+    lv_obj_set_style_bg_opa(backBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_shadow_width(backBtn, 0, 0);
+    lv_obj_set_style_border_width(backBtn, 0, 0);
+    lv_obj_set_style_pad_all(backBtn, 0, 0);
+    lv_obj_clear_flag(backBtn, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(backBtn);
+    lv_obj_add_event_cb(backBtn, onCloudMusicSearchOpenAction, LV_EVENT_CLICKED, nullptr); // re-opens the entry sub-view (state is Idle only right after a fresh navigation, so this reuses the same page via a rebuild)
+    lv_obj_t* backLabel2 = makeText(backBtn, LV_SYMBOL_LEFT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_clear_flag(backLabel2, LV_OBJ_FLAG_CLICKABLE);
+
+    m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_width(m_cloudListHint, 300);
+    lv_label_set_long_mode(m_cloudListHint, LV_LABEL_LONG_WRAP);
+
+    m_cloudListArea = lv_obj_create(screen);
+    lv_obj_set_pos(m_cloudListArea, 8, 32);
+    lv_obj_set_size(m_cloudListArea, 304, 132);
+    lv_obj_set_style_bg_opa(m_cloudListArea, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(m_cloudListArea, 0, 0);
+    lv_obj_set_style_pad_all(m_cloudListArea, 0, 0);
+    lv_obj_set_style_radius(m_cloudListArea, 0, 0);
+    lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(m_cloudListArea, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(m_cloudListArea, LV_SCROLLBAR_MODE_AUTO);
+
+    m_lastCloudSearchState = CloudMusicRequestState::Idle; // force a render on first tick even though the real state is already Loading/Loaded
+    refreshCloudMusicSearch();
+}
+
+void HifiUi::refreshCloudMusicSearch() {
+    if (!m_cloudListArea || !m_cloudListHint) return; // entry sub-view has neither -- nothing to refresh
+    const CloudMusicRequestState state = playerService.cloudMusicSearchState();
+    if (state == m_lastCloudSearchState) return;
+    m_lastCloudSearchState = state;
+
+    lv_obj_clean(m_cloudListArea);
+    if (state == CloudMusicRequestState::Loading) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "正在搜索…");
+        return;
+    }
+    if (state == CloudMusicRequestState::Error) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "搜索失败：%s", playerService.cloudMusicLastError());
+        lv_label_set_text(m_cloudListHint, msg);
+        return;
+    }
+    lv_label_set_text(m_cloudListHint, "");
+    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+
+    const uint8_t count = playerService.cloudMusicSearchResultCount();
+    if (!count) {
+        makeText(m_cloudListArea, "没有找到结果", &lv_font_montserrat_12, kInkDim, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        CloudTrackItem item{};
+        if (!playerService.cloudMusicSearchResult(i, &item)) continue;
+        lv_obj_t* row = lv_btn_create(m_cloudListArea);
+        lv_obj_set_pos(row, 0, i * 36);
+        lv_obj_set_size(row, 288, 32);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_bg_color(row, kPanel, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(row);
+        lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
+        lv_obj_set_width(titleLabel, 268);
+        lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_montserrat_12, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
+        lv_obj_set_width(artistLabel, 268);
+        lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+void HifiUi::buildCloudMusicPlaylist() {
+    buildAudioTopBar(m_cloudSelectedPlaylistName[0] ? m_cloudSelectedPlaylistName : "歌单", nullptr, false, nullptr);
+    lv_obj_t* screen = lv_scr_act();
+
+    m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 30);
+    lv_obj_set_width(m_cloudListHint, 300);
+    lv_label_set_long_mode(m_cloudListHint, LV_LABEL_LONG_WRAP);
+
+    m_cloudListArea = lv_obj_create(screen);
+    lv_obj_set_pos(m_cloudListArea, 8, 28);
+    lv_obj_set_size(m_cloudListArea, 304, 138);
+    lv_obj_set_style_bg_opa(m_cloudListArea, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(m_cloudListArea, 0, 0);
+    lv_obj_set_style_pad_all(m_cloudListArea, 0, 0);
+    lv_obj_set_style_radius(m_cloudListArea, 0, 0);
+    lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(m_cloudListArea, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(m_cloudListArea, LV_SCROLLBAR_MODE_AUTO);
+
+    if (m_cloudSelectedPlaylistId[0]) playerService.cloudMusicPlaylistDetailStart(m_cloudSelectedPlaylistId);
+    m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
+    refreshCloudMusicPlaylist();
+}
+
+void HifiUi::refreshCloudMusicPlaylist() {
+    if (!m_cloudListArea || !m_cloudListHint) return;
+    const CloudMusicRequestState state = playerService.cloudMusicPlaylistDetailState();
+    if (state == m_lastCloudPlaylistState) return;
+    m_lastCloudPlaylistState = state;
+
+    lv_obj_clean(m_cloudListArea);
+    if (state == CloudMusicRequestState::Loading) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "正在加载歌单…");
+        return;
+    }
+    if (state == CloudMusicRequestState::Error) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "加载失败：%s", playerService.cloudMusicLastError());
+        lv_label_set_text(m_cloudListHint, msg);
+        return;
+    }
+    lv_label_set_text(m_cloudListHint, "");
+    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+
+    const uint8_t count = playerService.cloudMusicPlaylistTrackCount();
+    if (!count) {
+        makeText(m_cloudListArea, "这个歌单没有可显示的曲目", &lv_font_montserrat_12, kInkDim, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        CloudTrackItem item{};
+        if (!playerService.cloudMusicPlaylistTrack(i, &item)) continue;
+        lv_obj_t* row = lv_btn_create(m_cloudListArea);
+        lv_obj_set_pos(row, 0, i * 36);
+        lv_obj_set_size(row, 288, 32);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_bg_color(row, kPanel, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(row);
+        lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
+        lv_obj_set_width(titleLabel, 268);
+        lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_montserrat_12, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
+        lv_obj_set_width(artistLabel, 268);
+        lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+void HifiUi::onCloudMusicPlaylistOpenAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    CloudPlaylistItem item{};
+    if (!playerService.cloudMusicHotPlaylist(index, &item)) return;
+    strlcpy(s_instance->m_cloudSelectedPlaylistId, item.id, sizeof(s_instance->m_cloudSelectedPlaylistId));
+    strlcpy(s_instance->m_cloudSelectedPlaylistName, item.name, sizeof(s_instance->m_cloudSelectedPlaylistName));
+    s_instance->show(Page::CloudMusicPlaylist);
+}
+
+void HifiUi::onCloudMusicSearchOpenAction(lv_event_t* event) {
+    (void)event;
+    if (!s_instance) return;
+    s_instance->show(Page::CloudMusicSearch);
+}
+
+void HifiUi::onCloudMusicSearchGoAction(lv_event_t* event) {
+    (void)event;
+    if (!s_instance || !s_instance->m_cloudSearchField) return;
+    const char* query = lv_textarea_get_text(s_instance->m_cloudSearchField);
+    if (!query || !query[0]) return;
+    if (playerService.cloudMusicSearchStart(query)) {
+        s_instance->show(Page::CloudMusicSearch); // rebuilds into the results sub-view (state is now Loading, not Idle)
+    }
+}
+
+void HifiUi::onCloudMusicTrackRowAction(lv_event_t* event) {
+    // Phase 3 is browse-only -- tapping a track has no player action yet.
+    // Wired up now (rather than left unbound) so phase 4 only has to fill
+    // this in, not also go find every row's event_cb call site.
+    (void)event;
+}
+
 void HifiUi::buildAudioTopBar(const char* title, const char* rightText, bool rightOk, const char* rightIcon) {
     lv_obj_t* screen = lv_scr_act();
     lv_obj_t* bar = lv_obj_create(screen);
@@ -4741,6 +5128,9 @@ void HifiUi::refresh() {
     else if (m_page == Page::SettingsWifi) refreshSettingsWifi(state);
     else if (m_page == Page::UsbStorage) refreshUsbStorage();
     else if (m_page == Page::CloudMusicSettings) refreshCloudMusicSettings();
+    else if (m_page == Page::CloudMusicHome) refreshCloudMusicHome();
+    else if (m_page == Page::CloudMusicSearch) refreshCloudMusicSearch();
+    else if (m_page == Page::CloudMusicPlaylist) refreshCloudMusicPlaylist();
     refreshCoverSpin(state);
 }
 
