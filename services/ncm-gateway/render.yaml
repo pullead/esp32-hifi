@@ -1,0 +1,43 @@
+# Render Blueprint for the esp32-ncm-gateway service.
+#
+# This is the THIN wrapper only -- it expects a separately deployed
+# NeteaseCloudMusicApiEnhanced instance and talks to it via NCM_UPSTREAM_URL.
+# See README.md for why these are kept as two services instead of one, and
+# for how to deploy the upstream instance.
+#
+# buildCommand/startCommand/Node version here match this package.json as of
+# when this file was written -- re-check against the actual package.json
+# and Render's currently supported Node runtimes before relying on this,
+# per the project spec's "不要硬编码旧版本" instruction.
+services:
+  - type: web
+    name: esp32-ncm-gateway
+    runtime: node
+    plan: free
+    rootDir: services/ncm-gateway
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /esp/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DEVICE_API_KEY
+        sync: false
+      - key: NCM_UPSTREAM_URL
+        sync: false
+      - key: NCM_COOKIE
+        sync: false
+      - key: ENABLE_GENERAL_UNBLOCK
+        value: "false"
+      - key: ENABLE_RANDOM_CN_IP
+        value: "false"
+      - key: ENABLE_PROXY
+        value: "false"
+      - key: ENABLE_FLAC
+        value: "false"
+      - key: SELECT_MAX_BR
+        value: "false"
+      - key: RATE_LIMIT_METADATA_PER_MIN
+        value: "60"
+      - key: RATE_LIMIT_RESOLVE_PER_MIN
+        value: "20"
