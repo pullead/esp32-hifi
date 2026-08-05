@@ -33,6 +33,16 @@ struct CloudMusicConfig {
     bool configured = false; // true once both fields have been saved at least once
 };
 
+// One saved gateway profile in the on-device history (up to 5, newest
+// first). Every config that was ever saved/used lands here automatically;
+// only cloudMusicHistoryDelete() removes an entry. Persisted in NVS so it
+// survives app-only reflashes.
+struct CloudMusicHistoryEntry {
+    char baseUrl[128]{};
+    char deviceKey[80]{};
+    uint32_t lastUsedEpoch = 0; // Unix seconds (RTC/NTP), 0 if never synced
+};
+
 // One track as returned by the gateway's /esp/v1/search, /esp/v1/playlists/*
 // endpoints (see services/ncm-gateway/src/ncmProvider.js's buildSearchItem).
 // `id` is a NetEase track id, kept as text (it's only ever round-tripped
@@ -279,6 +289,11 @@ class PlayerService {
     // rather than silently saving an unusable config.
     CloudMusicConfig cloudMusicConfig() const;
     bool setCloudMusicConfig(const char* baseUrl, const char* deviceKey);
+    // Gateway history: up to 5 profiles, newest first. Auto-populated by
+    // setCloudMusicConfig(); delete() is the only way to remove an entry.
+    uint8_t cloudMusicHistoryCount() const;
+    bool cloudMusicHistoryEntry(uint8_t index, CloudMusicHistoryEntry* entry) const;
+    bool cloudMusicHistoryDelete(uint8_t index);
     CloudServiceState cloudServiceState() const;
     // Starts (or restarts, if already Waking/Offline) the health-check/wake
     // sequence -- see cloudMusicWakeTask()'s comment in main.cpp for the

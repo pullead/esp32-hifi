@@ -51,6 +51,9 @@ extern uint8_t playerCoreLyricsFetchState(uint16_t index);
 extern void playerCoreRetryLyricsFetch(uint16_t index);
 extern CloudMusicConfig playerCoreCloudMusicConfig();
 extern bool playerCoreSetCloudMusicConfig(const char* baseUrl, const char* deviceKey);
+extern uint8_t playerCoreCloudMusicHistoryCount();
+extern bool playerCoreCloudMusicHistoryEntry(uint8_t index, CloudMusicHistoryEntry* entry);
+extern bool playerCoreCloudMusicHistoryDelete(uint8_t index);
 extern uint8_t playerCoreCloudServiceState();
 extern void playerCoreCloudMusicWakeStart();
 extern bool playerCoreCloudMusicSearchStart(const char* query);
@@ -293,6 +296,14 @@ CloudMusicConfig PlayerService::cloudMusicConfig() const { return playerCoreClou
 bool PlayerService::setCloudMusicConfig(const char* baseUrl, const char* deviceKey) {
     return playerCoreSetCloudMusicConfig(baseUrl, deviceKey);
 }
+
+uint8_t PlayerService::cloudMusicHistoryCount() const { return playerCoreCloudMusicHistoryCount(); }
+
+bool PlayerService::cloudMusicHistoryEntry(uint8_t index, CloudMusicHistoryEntry* entry) const {
+    return playerCoreCloudMusicHistoryEntry(index, entry);
+}
+
+bool PlayerService::cloudMusicHistoryDelete(uint8_t index) { return playerCoreCloudMusicHistoryDelete(index); }
 
 CloudServiceState PlayerService::cloudServiceState() const {
     return static_cast<CloudServiceState>(playerCoreCloudServiceState());

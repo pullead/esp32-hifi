@@ -3304,6 +3304,12 @@ static volatile CloudServiceState s_cloudServiceState = CloudServiceState::Unkno
 static SemaphoreHandle_t s_cloudMusicMutex = nullptr; // guards s_cloudConfig across the LVGL thread and cloudMusicWakeTask
 static CloudMusicConfig s_cloudConfig;
 static volatile bool s_cloudWakeTaskRunning = false;
+// Gateway config history (up to 5, newest first). Every saved/used config
+// is upserted here; only playerCoreCloudMusicHistoryDelete() removes one.
+// Stored in NVS as cm_h<i>u/k/t so it survives app-only reflashes.
+static constexpr uint8_t kCloudHistoryMax = 5;
+static CloudMusicHistoryEntry s_cloudHistory[kCloudHistoryMax];
+static uint8_t s_cloudHistoryCount = 0;
 
 static bool cloudMusicLock(TickType_t timeout = pdMS_TO_TICKS(250)) {
     return !s_cloudMusicMutex || xSemaphoreTake(s_cloudMusicMutex, timeout) == pdTRUE;
@@ -3334,7 +3340,104 @@ CloudMusicConfig playerCoreCloudMusicConfig() {
         out = s_cloudConfig;
         cloudMusicUnlock();
     }
+    // Render only serves https (plain http is a 301 stub) and our HTTPS
+    // clients cannot follow an http->https redirect, so hand every consumer
+    // a normalized https URL -- this also covers configs saved before this
+    // normalization existed.
+    if (strncmp(out.baseUrl, "http://", 7) == 0) {
+        String tmp(out.baseUrl);
+        tmp.remove(0, 7); // drop "http://"
+        tmp = "https://" + tmp;
+        strlcpy(out.baseUrl, tmp.c_str(), sizeof(out.baseUrl));
+    }
     return out;
+}
+
+static void cloudMusicHistoryKey(uint8_t index, char suffix, char* out, size_t outSize) {
+    snprintf(out, outSize, "cm_h%u%c", static_cast<unsigned>(index), suffix);
+}
+
+static void cloudMusicLoadHistory() {
+    if (!lockPreferences()) return;
+    uint8_t count = 0;
+    for (uint8_t i = 0; i < kCloudHistoryMax; ++i) {
+        char kUrl[16], kKey[16], kTs[16];
+        cloudMusicHistoryKey(i, 'u', kUrl, sizeof(kUrl));
+        cloudMusicHistoryKey(i, 'k', kKey, sizeof(kKey));
+        cloudMusicHistoryKey(i, 't', kTs, sizeof(kTs));
+        const String url = pref.getString(kUrl, "");
+        const String key = pref.getString(kKey, "");
+        if (url.isEmpty() || key.isEmpty()) continue;
+        CloudMusicHistoryEntry& e = s_cloudHistory[count];
+        strlcpy(e.baseUrl, url.c_str(), sizeof(e.baseUrl));
+        strlcpy(e.deviceKey, key.c_str(), sizeof(e.deviceKey));
+        e.lastUsedEpoch = pref.getUInt(kTs, 0);
+        ++count;
+    }
+    unlockPreferences();
+    s_cloudHistoryCount = count;
+}
+
+static void cloudMusicSaveHistory() {
+    if (!lockPreferences(pdMS_TO_TICKS(1000))) return;
+    for (uint8_t i = 0; i < kCloudHistoryMax; ++i) {
+        char kUrl[16], kKey[16], kTs[16];
+        cloudMusicHistoryKey(i, 'u', kUrl, sizeof(kUrl));
+        cloudMusicHistoryKey(i, 'k', kKey, sizeof(kKey));
+        cloudMusicHistoryKey(i, 't', kTs, sizeof(kTs));
+        if (i < s_cloudHistoryCount) {
+            pref.putString(kUrl, s_cloudHistory[i].baseUrl);
+            pref.putString(kKey, s_cloudHistory[i].deviceKey);
+            pref.putUInt(kTs, s_cloudHistory[i].lastUsedEpoch);
+        } else {
+            pref.remove(kUrl);
+            pref.remove(kKey);
+            pref.remove(kTs);
+        }
+    }
+    unlockPreferences();
+}
+
+// Insert/refresh a gateway config in the history: same baseUrl refreshes the
+// key + timestamp and moves to the front; a new URL is prepended; keep at
+// most kCloudHistoryMax entries.
+static void cloudMusicHistoryUpsert(const char* baseUrl, const char* deviceKey) {
+    const uint32_t now = static_cast<uint32_t>(time(nullptr));
+    uint8_t existing = kCloudHistoryMax;
+    for (uint8_t i = 0; i < s_cloudHistoryCount; ++i) {
+        if (strcmp(s_cloudHistory[i].baseUrl, baseUrl) == 0) { existing = i; break; }
+    }
+    if (existing == kCloudHistoryMax) {
+        // Shift slots down to make room at the front; when full, the oldest
+        // (last) slot is dropped. Never write past kCloudHistoryMax-1.
+        const uint8_t shiftFrom = (s_cloudHistoryCount < kCloudHistoryMax) ? s_cloudHistoryCount : kCloudHistoryMax - 1;
+        for (uint8_t i = shiftFrom; i > 0; --i) s_cloudHistory[i] = s_cloudHistory[i - 1];
+        if (s_cloudHistoryCount < kCloudHistoryMax) ++s_cloudHistoryCount;
+    } else {
+        const CloudMusicHistoryEntry tmp = s_cloudHistory[existing];
+        for (uint8_t i = existing; i > 0; --i) s_cloudHistory[i] = s_cloudHistory[i - 1];
+        s_cloudHistory[0] = tmp;
+    }
+    strlcpy(s_cloudHistory[0].baseUrl, baseUrl, sizeof(s_cloudHistory[0].baseUrl));
+    strlcpy(s_cloudHistory[0].deviceKey, deviceKey, sizeof(s_cloudHistory[0].deviceKey));
+    s_cloudHistory[0].lastUsedEpoch = now;
+    cloudMusicSaveHistory();
+}
+
+uint8_t playerCoreCloudMusicHistoryCount() { return s_cloudHistoryCount; }
+
+bool playerCoreCloudMusicHistoryEntry(uint8_t index, CloudMusicHistoryEntry* out) {
+    if (!out || index >= s_cloudHistoryCount) return false;
+    *out = s_cloudHistory[index];
+    return true;
+}
+
+bool playerCoreCloudMusicHistoryDelete(uint8_t index) {
+    if (index >= s_cloudHistoryCount) return false;
+    for (uint8_t i = index; i + 1 < s_cloudHistoryCount; ++i) s_cloudHistory[i] = s_cloudHistory[i + 1];
+    --s_cloudHistoryCount;
+    cloudMusicSaveHistory();
+    return true;
 }
 
 // Trims whitespace and a trailing slash, requires an http(s) scheme and
@@ -3350,7 +3453,14 @@ bool playerCoreSetCloudMusicConfig(const char* baseUrl, const char* deviceKey) {
     String trimmedKey(deviceKey);
     trimmedKey.trim();
     if (trimmedUrl.isEmpty() || trimmedKey.isEmpty()) return false;
-    if (!trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://")) return false;
+    // Normalize to https://: Render only serves https (plain http is a 301
+    // stub), and our HTTP clients (WiFiClientSecure) can't ride an
+    // http->https redirect. Also covers typing the bare hostname.
+    if (trimmedUrl.startsWith("http://")) {
+        trimmedUrl.replace("http://", "https://");
+    } else if (!trimmedUrl.startsWith("https://")) {
+        trimmedUrl = "https://" + trimmedUrl;
+    }
     if (trimmedUrl.length() >= sizeof(CloudMusicConfig::baseUrl)) return false;
     if (trimmedKey.length() >= sizeof(CloudMusicConfig::deviceKey)) return false;
 
@@ -3366,6 +3476,7 @@ bool playerCoreSetCloudMusicConfig(const char* baseUrl, const char* deviceKey) {
         cloudMusicUnlock();
     }
     s_cloudServiceState = CloudServiceState::Unknown; // old Ready/Offline no longer describes this config
+    cloudMusicHistoryUpsert(trimmedUrl.c_str(), trimmedKey.c_str()); // remember this gateway for the future
     return true;
 }
 
@@ -3386,7 +3497,7 @@ static bool cloudMusicHealthCheckOnce(const CloudMusicConfig& cfg) {
     HTTPClient http;
     const String url = String(cfg.baseUrl) + "/esp/v1/health";
     if (!http.begin(client, url)) return false;
-    http.setTimeout(3000);
+    http.setTimeout(10000); // Render cold start can take a while
     http.addHeader("X-Device-Key", cfg.deviceKey);
     const int code = http.GET();
     bool ok = false;
@@ -3586,14 +3697,19 @@ static bool cloudMusicHttpGet(const String& path, String& outBody) {
         return false;
     }
     WiFiClientSecure client;
-    client.setInsecure();
+    client.setInsecure(); // matches this project's HTTPS convention (weather/health)
     HTTPClient http;
     const String url = String(cfg.baseUrl) + path;
+    // Explicit TLS client: configs are normalized to https:// (see
+    // playerCoreCloudMusicConfig), so a secure client is always correct.
+    // setFollowRedirects stays as harmless safety for https->https
+    // redirects.
     if (!http.begin(client, url)) {
         strlcpy(s_cloudLastError, "无法连接网关", sizeof(s_cloudLastError));
         return false;
     }
     http.setTimeout(10000);
+    http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
     http.addHeader("X-Device-Key", cfg.deviceKey);
     const int code = http.GET();
     if (code <= 0) {
@@ -3613,6 +3729,24 @@ static bool cloudMusicHttpGet(const String& path, String& outBody) {
     return true;
 }
 
+// Render's free tier sleeps the upstream api-enhanced service after idle
+// and takes up to ~50s to wake it; during that window Render answers with
+// HTTP 502. Retry transient failures with a 7s pause (same spirit as
+// cloudMusicWakeTask) so the first browse/resolve request after a sleep
+// succeeds instead of erroring out instantly. Stops early if a newer
+// command superseded us while we were waiting.
+static constexpr uint8_t kCloudBrowseRetryMax = 8;
+static constexpr uint32_t kCloudBrowseRetryDelayMs = 7000;
+
+static bool cloudMusicHttpGetWithRetry(const String& path, String& outBody, const uint32_t& generation) {
+    for (uint8_t attempt = 0; attempt < kCloudBrowseRetryMax; ++attempt) {
+        if (generation != s_cloudRequestGeneration) return false; // user moved on
+        if (cloudMusicHttpGet(path, outBody)) return true;
+        if (attempt + 1 < kCloudBrowseRetryMax) vTaskDelay(pdMS_TO_TICKS(kCloudBrowseRetryDelayMs));
+    }
+    return false;
+}
+
 static void cloudMusicControllerTask(void*) {
     CloudCommand cmd;
     for (;;) {
@@ -3628,7 +3762,7 @@ static void cloudMusicControllerTask(void*) {
             char path[192];
             snprintf(path, sizeof(path), "/esp/v1/search?q=%s&limit=%u", query.c_str(), kCloudSearchMaxResults);
             String body;
-            const bool ok = cloudMusicHttpGet(path, body);
+            const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
             if (cmd.generation != s_cloudRequestGeneration) continue; // superseded while the request was in flight
             if (cloudResultLock(pdMS_TO_TICKS(1000))) {
                 if (ok) {
@@ -3652,7 +3786,7 @@ static void cloudMusicControllerTask(void*) {
             char path[64];
             snprintf(path, sizeof(path), "/esp/v1/playlists/hot?limit=%u", kCloudHotPlaylistMax);
             String body;
-            const bool ok = cloudMusicHttpGet(path, body);
+            const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
             if (cmd.generation != s_cloudRequestGeneration) continue;
             if (cloudResultLock(pdMS_TO_TICKS(1000))) {
                 if (ok) {
@@ -3675,7 +3809,7 @@ static void cloudMusicControllerTask(void*) {
             char path[160];
             snprintf(path, sizeof(path), "/esp/v1/playlists/%s?limit=%u", cmd.param, kCloudPlaylistTrackMax);
             String body;
-            const bool ok = cloudMusicHttpGet(path, body);
+            const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
             if (cmd.generation != s_cloudRequestGeneration) continue;
             if (cloudResultLock(pdMS_TO_TICKS(1000))) {
                 if (ok) {
@@ -3701,7 +3835,7 @@ static void cloudMusicControllerTask(void*) {
             char path[64];
             snprintf(path, sizeof(path), "/esp/v1/tracks/%s/resolve?bitrate=128", cmd.param);
             String body;
-            const bool ok = cloudMusicHttpGet(path, body);
+            const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
             if (cmd.generation != s_cloudRequestGeneration) continue; // user moved on to a different track before this resolved
             if (!ok) {
                 if (cloudResultLock(pdMS_TO_TICKS(1000))) {
@@ -4474,7 +4608,6 @@ void setup() {
     if (!s_prefMutex) MWR_LOG_ERROR("Failed to create Preferences mutex");
     if (!s_wifiOpMutex) MWR_LOG_ERROR("Failed to create WiFi operation mutex");
     if (!s_cloudMusicMutex) MWR_LOG_ERROR("Failed to create cloud music config mutex");
-    cloudMusicLoadConfig();
     s_cloudResultMutex = xSemaphoreCreateMutex();
     s_cloudCommandQueue = xQueueCreate(1, sizeof(CloudCommand));
     if (!s_cloudResultMutex) MWR_LOG_ERROR("Failed to create cloud music result mutex");
@@ -4518,6 +4651,13 @@ void setup() {
     }
 
     pref.begin("Pref", false); // instance of preferences from AccessPoint (SSID, PW ...)
+
+    // Cloud-music config + history must load AFTER pref.begin() -- before it
+    // the Preferences namespace isn't open and every getString() comes back
+    // empty, which is exactly why the saved gateway info "disappeared" after
+    // every flash/reboot (it was written to NVS fine, just never reloaded).
+    cloudMusicLoadConfig();
+    cloudMusicLoadHistory();
 
     if (!detect_i2_c_devices(&i2cBusOne, I2C_SDA, I2C_SCL, &s_i2c_items)) { printfln(s_tag.setup, "No i2c device found"); }
 
@@ -7029,6 +7169,56 @@ static void serveWifiManagePage() {
     webSrv.show(page, webSrv.TEXT);
 }
 
+// Phone page behind the cloud-music settings QR (Settings > 在线音乐 >
+// 扫码配置): type the gateway URL + device key on the phone, tap save, and
+// the board picks the result up via cloud_config_set. Mirrors the
+// /wifi_manage phone page (same dark card style, same encodeURIComponent
+// GET convention -> cmd?param&arg).
+static void serveCloudConfigPage() {
+    static const char page[] =
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>在线音乐网关配置</title><style>"
+        "body{font-family:-apple-system,sans-serif;background:#0A0B12;color:#F2F3F7;padding:16px;max-width:480px;margin:0 auto}"
+        "h2{color:#C77DFF;font-size:20px;margin:0 0 12px}"
+        ".card{background:#161A2B;border-radius:10px;padding:14px}"
+        "label{display:block;color:#9AA0B4;font-size:13px;margin:10px 0 4px}"
+        "input{width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;border:1px solid #565C70;background:#0E1019;color:#F2F3F7;font-size:14px}"
+        "button{width:100%;background:#6D28D9;color:#F2F3F7;border:none;border-radius:8px;padding:10px;font-size:15px;margin-top:14px}"
+        "#msg{margin-top:10px;font-size:13px;color:#34D399}"
+        "</style></head><body>"
+        "<h2>在线音乐网关配置</h2><div class=\"card\">"
+        "<label>网关地址</label><input id=\"url\" placeholder=\"https://esp32-ncm-gateway...\">"
+        "<label>设备密钥</label><input id=\"key\" type=\"password\" placeholder=\"设备密钥\">"
+        "<button onclick=\"save()\">保存到开发板</button><div id=\"msg\"></div>"
+        "</div><script>"
+        "fetch('cloud_config_json').then(r=>r.json()).then(function(j){"
+        "if(j.configured){document.getElementById('url').value=j.base_url;document.getElementById('key').value=j.device_key;}"
+        "});"
+        "function save(){"
+        "var u=document.getElementById('url').value;var k=document.getElementById('key').value;"
+        "if(!u||!k){document.getElementById('msg').style.color='#E4574B';document.getElementById('msg').textContent='地址和密钥都要填';return;}"
+        "document.getElementById('msg').style.color='#34D399';document.getElementById('msg').textContent='保存中…';"
+        "fetch('cloud_config_set?'+encodeURIComponent(u)+'&'+encodeURIComponent(k)).then(function(r){return r.json();}).then(function(j){"
+        "document.getElementById('msg').textContent=j.ok?('保存成功,请回到开发板查看'):('保存失败:'+j.message);"
+        "});"
+        "}"
+        "</script></body></html>";
+    webSrv.show(page, webSrv.TEXT);
+}
+
+static void serveCloudConfigJson() {
+    const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
+    ps_ptr<char> urlEsc;
+    ps_ptr<char> keyEsc;
+    jsonEscapeAppend(urlEsc, cfg.baseUrl);
+    jsonEscapeAppend(keyEsc, cfg.deviceKey);
+    ps_ptr<char> json(320);
+    json.assignf("{{\"configured\":{},\"base_url\":\"{}\",\"device_key\":\"{}\"}}",
+                 cfg.configured ? "true" : "false", urlEsc.c_get(), keyEsc.c_get());
+    webSrv.show(json.c_get(), webSrv.JSON);
+}
+
 static void serveWifiStatusJson() {
     ps_ptr<char> json(192);
     const bool connected = WiFi.status() == WL_CONNECTED;
@@ -7116,6 +7306,19 @@ void WEBSRV_onCommand(ps_ptr<char> cmd, ps_ptr<char> param, ps_ptr<char> arg){  
 
     CMD_EQUALS("wifi_manage"){          printfln(s_tag.webserver, "Webpage: " ANSI_ESC_ORANGE "wifi manage");
                                         serveWifiManagePage();
+                                        return;}
+
+    CMD_EQUALS("cloud_config"){         printfln(s_tag.webserver, "Webpage: " ANSI_ESC_ORANGE "cloud config (phone)");
+                                        serveCloudConfigPage();
+                                        return;}
+    CMD_EQUALS("cloud_config_json"){    serveCloudConfigJson(); return;}
+    CMD_EQUALS("cloud_config_set"){     printfln(s_tag.webserver, "cloud config set via phone page");
+                                        const bool ok = playerCoreSetCloudMusicConfig(param.c_get(), arg.c_get());
+                                        if (ok) playerCoreCloudMusicWakeStart();
+                                        ps_ptr<char> json(192);
+                                        json.assignf("{{\"ok\":{},\"message\":\"{}\"}}", ok ? "true" : "false",
+                                                     ok ? "saved" : "invalid config (need http(s) URL + key)");
+                                        webSrv.show(json.c_get(), webSrv.JSON);
                                         return;}
 
     CMD_EQUALS("wifi_status_json"){     serveWifiStatusJson(); return;}

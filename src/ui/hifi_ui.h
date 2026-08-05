@@ -85,6 +85,10 @@ class HifiUi {
     static void onCloudMusicConfigBackAction(lv_event_t* event);
     static void onCloudMusicSaveAction(lv_event_t* event);
     static void onCloudMusicTestAction(lv_event_t* event);
+    static void onCloudMusicQrAction(lv_event_t* event);
+    static void onCloudMusicHistoryAction(lv_event_t* event);
+    static void onCloudHistoryUseAction(lv_event_t* event);
+    static void onCloudHistoryDeleteAction(lv_event_t* event);
     static void onCloudMusicPlaylistOpenAction(lv_event_t* event);
     static void onCloudMusicSearchOpenAction(lv_event_t* event);
     static void onCloudMusicSearchGoAction(lv_event_t* event);
@@ -402,8 +406,19 @@ class HifiUi {
     // m_coverArtPixels being shared between radio/local art).
     lv_obj_t* m_cloudEditField = nullptr;
     lv_obj_t* m_cloudKeyboard = nullptr;
+    lv_obj_t* m_cloudEditError = nullptr; // one-line save-failure reason under the edit field
     lv_obj_t* m_cloudStatusLabel = nullptr;
     lv_obj_t* m_cloudHintLabel = nullptr;
+    // Phone-input sub-view: QR encoding http://<ip>/cloud_config -- the
+    // phone opens a web form, types the gateway URL + device key there, and
+    // the board picks the result up from NVS on return. Same pattern as the
+    // WiFi manage QR (m_wifiShowManageQr).
+    bool m_cloudShowConfigQr = false;
+    lv_obj_t* m_cloudQr = nullptr;
+    char m_cloudQrLastContent[128]{};
+    // History sub-view: up to 5 previously saved gateway configs, newest
+    // first, tap to reuse / 删除 to remove. Survives app-only reflashes.
+    bool m_cloudShowHistory = false;
     CloudServiceState m_lastCloudServiceState = CloudServiceState::Unknown;
     CloudMusicConfigStage m_cloudConfigStage = CloudMusicConfigStage::Overview;
     // Phase 3 browse pages (hot playlists / search / playlist detail).
