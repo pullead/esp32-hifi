@@ -3570,8 +3570,10 @@ void playerCoreCloudMusicWakeStart() {
 static constexpr uint8_t kCloudSearchMaxResults = 10;
 static constexpr uint8_t kCloudHotPlaylistMax = 8;
 static constexpr uint8_t kCloudPlaylistTrackMax = 20;
+static constexpr uint8_t kCloudRankingMax = 12;
+static constexpr uint8_t kCloudNewSongMax = 20;
 
-enum class CloudCommandType : uint8_t { Search, LoadHotPlaylists, LoadPlaylist, ResolveAndPlay };
+enum class CloudCommandType : uint8_t { Search, LoadHotPlaylists, LoadPlaylist, LoadRankings, LoadNewSongs, ResolveAndPlay };
 struct CloudCommand {
     CloudCommandType type;
     uint32_t generation;
@@ -3597,6 +3599,17 @@ static CloudPlaylistItem s_cloudPlaylistInfo;
 static CloudTrackItem s_cloudPlaylistTracks[kCloudPlaylistTrackMax];
 static uint8_t s_cloudPlaylistTrackCount = 0;
 
+// Phase 5: ranking charts + new-song arrivals (see buildCloudRankings()/
+// buildCloudNewSongs() in the UI). Separate arrays/states, same
+// single-request-at-a-time discipline as the phase-3 lookups.
+static CloudMusicRequestState s_cloudRankingState = CloudMusicRequestState::Idle;
+static CloudRankingItem s_cloudRankings[kCloudRankingMax];
+static uint8_t s_cloudRankingCount = 0;
+
+static CloudMusicRequestState s_cloudNewSongState = CloudMusicRequestState::Idle;
+static CloudTrackItem s_cloudNewSongs[kCloudNewSongMax];
+static uint8_t s_cloudNewSongCount = 0;
+
 // Phase 4: resolve + play. s_cloudResolveState is polled by the UI (a
 // track row's tap feedback); the actual connecttohost() happens on
 // cloudMusicControllerTask itself once resolve succeeds (background tasks
@@ -3610,6 +3623,11 @@ static CloudMusicRequestState s_cloudResolveState = CloudMusicRequestState::Idle
 // (there's no ICY metadata on a plain CDN file URL to wait for, unlike
 // internet radio).
 static CloudTrackItem s_cloudNowPlaying;
+// One-shot "playback just started" latch consumed by the LVGL refresh loop:
+// lets the UI jump to the Now Playing page the moment a resolved track
+// actually starts, instead of leaving the user staring at the list with no
+// visible feedback (which reads as "播放不了" even when audio is playing).
+static volatile bool s_cloudPlaybackJustStarted = false;
 
 static bool cloudResultLock(TickType_t timeout = pdMS_TO_TICKS(250)) {
     return !s_cloudResultMutex || xSemaphoreTake(s_cloudResultMutex, timeout) == pdTRUE;
@@ -3668,6 +3686,8 @@ static void parseCloudTrackItem(const String& itemJson, CloudTrackItem* out) {
     double num = 0;
     if (jsonNumber(itemJson, "duration_ms", &num)) out->durationMs = static_cast<uint32_t>(num);
     out->playableHint = itemJson.indexOf("\"playable_hint\":false") < 0;
+    out->vip = itemJson.indexOf("\"vip\":true") >= 0;
+    out->paid = itemJson.indexOf("\"paid\":true") >= 0;
 }
 
 static void parseCloudPlaylistItem(const String& itemJson, CloudPlaylistItem* out) {
@@ -3679,6 +3699,15 @@ static void parseCloudPlaylistItem(const String& itemJson, CloudPlaylistItem* ou
     if (jsonStringField(itemJson, "cover_url", s)) strlcpy(out->coverUrl, s.c_str(), sizeof(out->coverUrl));
     double num = 0;
     if (jsonNumber(itemJson, "track_count", &num)) out->trackCount = static_cast<uint16_t>(num);
+}
+
+static void parseCloudRankingItem(const String& itemJson, CloudRankingItem* out) {
+    *out = CloudRankingItem{};
+    String s;
+    if (jsonStringField(itemJson, "id", s)) strlcpy(out->id, s.c_str(), sizeof(out->id));
+    if (jsonStringField(itemJson, "name", s)) strlcpy(out->name, s.c_str(), sizeof(out->name));
+    if (jsonStringField(itemJson, "cover_url", s)) strlcpy(out->coverUrl, s.c_str(), sizeof(out->coverUrl));
+    if (jsonStringField(itemJson, "update_freq", s)) strlcpy(out->updateFreq, s.c_str(), sizeof(out->updateFreq));
 }
 
 // One GET against the configured gateway, with the device key header and
@@ -3827,6 +3856,52 @@ static void cloudMusicControllerTask(void*) {
                 }
                 cloudResultUnlock();
             }
+        } else if (cmd.type == CloudCommandType::LoadRankings) {
+            if (cloudResultLock()) {
+                s_cloudRankingState = CloudMusicRequestState::Loading;
+                cloudResultUnlock();
+            }
+            char path[64];
+            snprintf(path, sizeof(path), "/esp/v1/rankings?limit=%u", kCloudRankingMax);
+            String body;
+            const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
+            if (cmd.generation != s_cloudRequestGeneration) continue;
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                if (ok) {
+                    String items[kCloudRankingMax];
+                    const uint8_t n = jsonArrayItems(body, "items", items, kCloudRankingMax);
+                    for (uint8_t i = 0; i < n; ++i) parseCloudRankingItem(items[i], &s_cloudRankings[i]);
+                    s_cloudRankingCount = n;
+                    s_cloudRankingState = CloudMusicRequestState::Loaded;
+                } else {
+                    s_cloudRankingCount = 0;
+                    s_cloudRankingState = CloudMusicRequestState::Error;
+                }
+                cloudResultUnlock();
+            }
+        } else if (cmd.type == CloudCommandType::LoadNewSongs) {
+            if (cloudResultLock()) {
+                s_cloudNewSongState = CloudMusicRequestState::Loading;
+                cloudResultUnlock();
+            }
+            char path[64];
+            snprintf(path, sizeof(path), "/esp/v1/new-songs?limit=%u", kCloudNewSongMax);
+            String body;
+            const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
+            if (cmd.generation != s_cloudRequestGeneration) continue;
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                if (ok) {
+                    String items[kCloudNewSongMax];
+                    const uint8_t n = jsonArrayItems(body, "items", items, kCloudNewSongMax);
+                    for (uint8_t i = 0; i < n; ++i) parseCloudTrackItem(items[i], &s_cloudNewSongs[i]);
+                    s_cloudNewSongCount = n;
+                    s_cloudNewSongState = CloudMusicRequestState::Loaded;
+                } else {
+                    s_cloudNewSongCount = 0;
+                    s_cloudNewSongState = CloudMusicRequestState::Error;
+                }
+                cloudResultUnlock();
+            }
         } else { // ResolveAndPlay
             if (cloudResultLock()) {
                 s_cloudResolveState = CloudMusicRequestState::Loading;
@@ -3874,6 +3949,7 @@ static void cloudMusicControllerTask(void*) {
                 if (started) {
                     s_cloudNowPlaying = track;
                     s_cloudResolveState = CloudMusicRequestState::Loaded;
+                    s_cloudPlaybackJustStarted = true;
                 } else {
                     s_cloudResolveState = CloudMusicRequestState::Error;
                     strlcpy(s_cloudLastError, "无法连接音乐 CDN", sizeof(s_cloudLastError));
@@ -3985,6 +4061,52 @@ bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) {
     return ok;
 }
 
+void playerCoreCloudMusicRankingsStart() {
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        s_cloudRankingState = CloudMusicRequestState::Loading;
+        cloudResultUnlock();
+    }
+    cloudMusicEnqueue(CloudCommandType::LoadRankings, nullptr);
+}
+
+uint8_t playerCoreCloudMusicRankingsState() { return static_cast<uint8_t>(s_cloudRankingState); }
+
+uint8_t playerCoreCloudMusicRankingCount() { return s_cloudRankingCount; }
+
+bool playerCoreCloudMusicRanking(uint8_t index, CloudRankingItem* item) {
+    if (!item || index >= s_cloudRankingCount) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        *item = s_cloudRankings[index];
+        ok = true;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
+void playerCoreCloudMusicNewSongsStart() {
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        s_cloudNewSongState = CloudMusicRequestState::Loading;
+        cloudResultUnlock();
+    }
+    cloudMusicEnqueue(CloudCommandType::LoadNewSongs, nullptr);
+}
+
+uint8_t playerCoreCloudMusicNewSongsState() { return static_cast<uint8_t>(s_cloudNewSongState); }
+
+uint8_t playerCoreCloudMusicNewSongCount() { return s_cloudNewSongCount; }
+
+bool playerCoreCloudMusicNewSong(uint8_t index, CloudTrackItem* item) {
+    if (!item || index >= s_cloudNewSongCount) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        *item = s_cloudNewSongs[index];
+        ok = true;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
 // Phase 4: resolve + play a track by id (from a search result or playlist
 // row). Enqueues CloudCommandType::ResolveAndPlay -- see
 // cloudMusicControllerTask's own comment for why actual playback is kicked
@@ -4000,6 +4122,199 @@ bool playerCoreCloudMusicPlayTrackStart(const char* trackId) {
 }
 
 uint8_t playerCoreCloudMusicResolveState() { return static_cast<uint8_t>(s_cloudResolveState); }
+
+// Non-consuming copy of the last resolved cloud track (s_cloudNowPlaying
+// persists after playerCoreCloudMusicConsumeNowPlaying() has reset the
+// resolve state to Idle -- the title/artist/cover stay valid while the
+// track keeps playing).
+bool playerCoreCloudMusicNowPlayingTrack(CloudTrackItem* outTrack) {
+    if (!outTrack) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        *outTrack = s_cloudNowPlaying;
+        ok = true;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
+// ---- Cloud cover thumbnails ----------------------------------------------
+// Same SD-cache pattern as radio station logos: a background task downloads
+// each cover to /cloudimg/ once; the UI decodes on demand. A zero-byte
+// marker means "no cover available" (or the fetch failed) so a dead URL
+// isn't retried on every page open -- same graceful-degradation rule as
+// the radio icon marker.
+
+static bool s_cloudThumbSyncInProgress = false;
+
+static void cloudThumbPath(uint8_t kind, uint8_t index, char* out, size_t outSize) {
+    snprintf(out, outSize, "/cloudimg/%c_%u.jpg", kind == 0 ? 'p' : 'r', index);
+}
+
+static void cloudThumbDownloadOne(const String& url, const char* sdPath) {
+    if (url.length() == 0 || httpDownloadToFileRetrying(url, sdPath, 128 * 1024)) {
+        if (url.length() == 0) {
+            // No cover at all -- leave a marker so we never try again.
+            File marker = SD_MMC.open(sdPath, "w", true);
+            if (marker) marker.close();
+        }
+        return;
+    }
+    File marker = SD_MMC.open(sdPath, "w", true);
+    if (marker) marker.close();
+}
+
+struct CloudThumbJob {
+    char url[200];
+    uint8_t kind;
+    uint8_t index;
+};
+
+static void cloudThumbSyncTask(void*) {
+    if (!SD_MMC.exists("/cloudimg")) SD_MMC.mkdir("/cloudimg");
+    // Snapshot the URLs to fetch under the mutex, then download WITHOUT
+    // holding it -- holding it for the whole loop would stall the UI's
+    // state polls for seconds at a time.
+    CloudThumbJob jobs[kCloudHotPlaylistMax + kCloudRankingMax]{};
+    uint8_t jobCount = 0;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        for (uint8_t i = 0; i < s_cloudHotPlaylistCount && jobCount < kCloudHotPlaylistMax; ++i) {
+            strlcpy(jobs[jobCount].url, s_cloudHotPlaylists[i].coverUrl, sizeof(jobs[jobCount].url));
+            jobs[jobCount].kind = 0;
+            jobs[jobCount].index = i;
+            ++jobCount;
+        }
+        for (uint8_t i = 0; i < s_cloudRankingCount && jobCount < kCloudHotPlaylistMax + kCloudRankingMax; ++i) {
+            strlcpy(jobs[jobCount].url, s_cloudRankings[i].coverUrl, sizeof(jobs[jobCount].url));
+            jobs[jobCount].kind = 1;
+            jobs[jobCount].index = i;
+            ++jobCount;
+        }
+        cloudResultUnlock();
+    }
+    for (uint8_t j = 0; j < jobCount; ++j) {
+        char sdPath[48];
+        cloudThumbPath(jobs[j].kind, jobs[j].index, sdPath, sizeof(sdPath));
+        if (SD_MMC.exists(sdPath)) continue;
+        if (!WiFi.isConnected()) break; // no point continuing a sync that can't reach the network
+        cloudThumbDownloadOne(jobs[j].url, sdPath);
+        vTaskDelay(pdMS_TO_TICKS(50)); // don't hammer the CDN back to back
+    }
+    s_cloudThumbSyncInProgress = false;
+    vTaskDelete(nullptr);
+}
+
+void playerCoreCloudThumbSyncStart() {
+    if (s_cloudThumbSyncInProgress) return;
+    s_cloudThumbSyncInProgress = true;
+    if (xTaskCreate(cloudThumbSyncTask, "cloudThumb", 8192, nullptr, 1, nullptr) != pdPASS) {
+        s_cloudThumbSyncInProgress = false;
+        MWR_LOG_ERROR("Failed to create cloud thumb sync task");
+    }
+}
+
+bool playerCoreCloudThumbSyncInProgress() { return s_cloudThumbSyncInProgress; }
+
+bool playerCoreCloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor, uint16_t** outPixels,
+                                uint16_t* outWidth, uint16_t* outHeight) {
+    *outPixels = nullptr;
+    *outWidth = 0;
+    *outHeight = 0;
+    char sdPath[48];
+    cloudThumbPath(kind, index, sdPath, sizeof(sdPath));
+    File in = SD_MMC.open(sdPath, "r");
+    if (!in) return false;
+    const size_t len = in.size();
+    if (len == 0) { // zero-byte marker -- "no cover", not an error
+        in.close();
+        return false;
+    }
+    uint8_t* data = static_cast<uint8_t*>(ps_malloc(len));
+    if (!data) {
+        in.close();
+        return false;
+    }
+    const size_t readLen = in.read(data, len);
+    in.close();
+    if (readLen != len) {
+        free(data);
+        return false;
+    }
+    const bool ok = getTFT().decodeJpgFromMemory(data, len, scaleFactor, outPixels, outWidth, outHeight);
+    free(data);
+    return ok;
+}
+
+// Now-playing cover: one-shot fetch of the current cloud track's cover,
+// cached as /cloudimg/np_<trackId>.jpg (keyed by track id so switching
+// tracks never shows a stale cached cover). Missing/dead covers fall back
+// to the UI's music-note tile.
+static bool s_cloudNowPlayingCoverRequested = false;
+
+static void cloudNowPlayingCoverTask(void*) {
+    if (!SD_MMC.exists("/cloudimg")) SD_MMC.mkdir("/cloudimg");
+    CloudTrackItem track{};
+    playerCoreCloudMusicNowPlayingTrack(&track);
+    if (track.id[0]) {
+        char sdPath[48];
+        snprintf(sdPath, sizeof(sdPath), "/cloudimg/np_%s.jpg", track.id);
+        cloudThumbDownloadOne(track.coverUrl, sdPath);
+    }
+    s_cloudNowPlayingCoverRequested = false;
+    vTaskDelete(nullptr);
+}
+
+void playerCoreCloudNowPlayingCoverStart() {
+    if (s_cloudNowPlayingCoverRequested) return;
+    CloudTrackItem track{};
+    if (!playerCoreCloudMusicNowPlayingTrack(&track) || !track.id[0]) return;
+    char sdPath[48];
+    snprintf(sdPath, sizeof(sdPath), "/cloudimg/np_%s.jpg", track.id);
+    if (SD_MMC.exists(sdPath) || !track.coverUrl[0]) {
+        if (!track.coverUrl[0] && !SD_MMC.exists(sdPath)) {
+            File marker = SD_MMC.open(sdPath, "w", true);
+            if (marker) marker.close();
+        }
+        return; // already cached (or nothing to fetch) -- no task needed
+    }
+    s_cloudNowPlayingCoverRequested = true;
+    if (xTaskCreate(cloudNowPlayingCoverTask, "npCover", 8192, nullptr, 1, nullptr) != pdPASS) {
+        s_cloudNowPlayingCoverRequested = false;
+        MWR_LOG_ERROR("Failed to create now-playing cover task");
+    }
+}
+
+bool playerCoreCloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
+                                          uint16_t* outHeight) {
+    *outPixels = nullptr;
+    *outWidth = 0;
+    *outHeight = 0;
+    CloudTrackItem track{};
+    if (!playerCoreCloudMusicNowPlayingTrack(&track) || !track.id[0]) return false;
+    char sdPath[48];
+    snprintf(sdPath, sizeof(sdPath), "/cloudimg/np_%s.jpg", track.id);
+    File in = SD_MMC.open(sdPath, "r");
+    if (!in) return false;
+    const size_t len = in.size();
+    if (len == 0) {
+        in.close();
+        return false;
+    }
+    uint8_t* data = static_cast<uint8_t*>(ps_malloc(len));
+    if (!data) {
+        in.close();
+        return false;
+    }
+    const size_t readLen = in.read(data, len);
+    in.close();
+    if (readLen != len) {
+        free(data);
+        return false;
+    }
+    const bool ok = getTFT().decodeJpgFromMemory(data, len, scaleFactor, outPixels, outWidth, outHeight);
+    free(data);
+    return ok;
+}
 
 // Consume-once (same idiom as playerCoreLyricsOnlineReady): true exactly
 // once per successfully-started cloud track, after which PlayerService::
@@ -4017,6 +4332,19 @@ bool playerCoreCloudMusicConsumeNowPlaying(CloudTrackItem* outTrack) {
         cloudResultUnlock();
     }
     return ready;
+}
+
+bool playerCoreCloudMusicJustStarted() {
+    // Read-modify-write under the same mutex the controller task uses when
+    // setting the latch -- otherwise a cleared-false race could eat the
+    // "jump to Now Playing" navigation for a track that just started.
+    bool v = false;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        v = s_cloudPlaybackJustStarted;
+        s_cloudPlaybackJustStarted = false;
+        cloudResultUnlock();
+    }
+    return v;
 }
 
 // setAudioFilePosition() takes a byte offset, not seconds -- approximates a
@@ -4086,6 +4414,21 @@ void playerCoreReadSnapshot(PlayerSnapshot* snapshot) {
         strlcpy(snapshot->title, station.c_get(), sizeof(snapshot->title));
         strlcpy(snapshot->detail, s_streamTitle.c_get(), sizeof(snapshot->detail));
         snapshot->radioStationIndex = s_cur_station;
+    }
+    if (snapshot->source == PlayerSource::CloudMusic) {
+        // Cloud track title/artist come from the last resolve response (set
+        // once at play time by cloudMusicControllerTask) -- the audio lib
+        // reports no ICY-style metadata for a plain CDN file URL, so leave
+        // the values alone here instead of overwriting with station data.
+        if (cloudResultLock()) {
+            strlcpy(snapshot->title, s_cloudNowPlaying.title, sizeof(snapshot->title));
+            if (s_cloudNowPlaying.artist[0]) {
+                snprintf(snapshot->detail, sizeof(snapshot->detail), "%s", s_cloudNowPlaying.artist);
+            } else {
+                snapshot->detail[0] = '\0';
+            }
+            cloudResultUnlock();
+        }
     }
     if (s_f_webFailed) strlcpy(snapshot->error, s_streamTitle.c_get(), sizeof(snapshot->error));
 
@@ -4611,7 +4954,12 @@ void setup() {
     s_cloudResultMutex = xSemaphoreCreateMutex();
     s_cloudCommandQueue = xQueueCreate(1, sizeof(CloudCommand));
     if (!s_cloudResultMutex) MWR_LOG_ERROR("Failed to create cloud music result mutex");
-    if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 10240, nullptr, 1, nullptr) != pdPASS) {
+    // Stack is sized generously: this task runs the full TLS resolve HTTP
+    // request AND audio.connecttohost() (DNS/TLS/network stack all use a
+    // lot of stack) synchronously, unlike tasks that only queue work. 10K
+    // was enough to boot but is a suspected overflow source when a real
+    // connect starts, crashing the device back to a fresh boot (Home).
+    if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 20480, nullptr, 1, nullptr) != pdPASS) {
         MWR_LOG_ERROR("Failed to create cloud music controller task");
     }
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting

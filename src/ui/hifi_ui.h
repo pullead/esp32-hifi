@@ -43,7 +43,14 @@ class HifiUi {
         // no playback wiring yet -- see docs spec's phased plan.
         CloudMusicHome,
         CloudMusicSearch,
-        CloudMusicPlaylist
+        CloudMusicPlaylist,
+        // Phase 5: dedicated online-music player (same core as radio/local)
+        // plus the category sub-pages it links to: hot playlists (with
+        // cover thumbnails), song-ranking charts, and new-song arrivals.
+        CloudNowPlaying,
+        CloudHotPlaylists,
+        CloudRankings,
+        CloudNewSongs
     };
     // Cycled by tapping the play-mode button: 顺序播放 (stop at the end of
     // the filtered list) -> 列表循环 (wrap back to the start) -> 单曲循环
@@ -93,6 +100,10 @@ class HifiUi {
     static void onCloudMusicSearchOpenAction(lv_event_t* event);
     static void onCloudMusicSearchGoAction(lv_event_t* event);
     static void onCloudMusicTrackRowAction(lv_event_t* event);
+    static void onCloudCategoryAction(lv_event_t* event);
+    static void onCloudRankingRowAction(lv_event_t* event);
+    static void onCloudTransportAction(lv_event_t* event);
+    static void onCloudHomeAction(lv_event_t* event);
     static void onQuickVolumeAction(lv_event_t* event);
     static void onQuickBrightnessAction(lv_event_t* event);
     static void onQuickEqAction(lv_event_t* event);
@@ -135,6 +146,16 @@ class HifiUi {
     void refreshCloudMusicSearch();
     void buildCloudMusicPlaylist();
     void refreshCloudMusicPlaylist();
+    void buildCloudHotPlaylists();
+    void refreshCloudHotPlaylists();
+    void buildCloudRankings();
+    void refreshCloudRankings();
+    void buildCloudNewSongs();
+    void refreshCloudNewSongs();
+    void buildCloudNowPlaying();
+    void refreshCloudNowPlaying(const struct PlayerSnapshot& state);
+    void loadCloudCover();
+    void clearCloudRowThumbs();
     // Shared by refreshCloudMusicSearch()/refreshCloudMusicPlaylist(): a
     // resolve triggered by tapping a track row overlays Loading/Error text
     // on m_cloudListHint without touching the list itself. Returns true if
@@ -420,6 +441,12 @@ class HifiUi {
     // first, tap to reuse / 删除 to remove. Survives app-only reflashes.
     bool m_cloudShowHistory = false;
     CloudServiceState m_lastCloudServiceState = CloudServiceState::Unknown;
+    // Deferred page navigation: show() must not run from inside a page's
+    // refresh() (it deletes the widgets that refresh() is still touching ->
+    // use-after-free crash). Set this during refresh and apply it at the end
+    // of refresh() instead.
+    Page m_pendingNavigate = Page::Home;
+    bool m_pendingNavigateSet = false;
     CloudMusicConfigStage m_cloudConfigStage = CloudMusicConfigStage::Overview;
     // Phase 3 browse pages (hot playlists / search / playlist detail).
     // m_cloudListArea is reused across all three build functions' own list
@@ -428,6 +455,8 @@ class HifiUi {
     lv_obj_t* m_cloudListArea = nullptr;
     lv_obj_t* m_cloudListHint = nullptr;
     CloudMusicRequestState m_lastCloudHotState = CloudMusicRequestState::Idle;
+    CloudMusicRequestState m_lastCloudRankingState = CloudMusicRequestState::Idle;
+    CloudMusicRequestState m_lastCloudNewSongState = CloudMusicRequestState::Idle;
     lv_obj_t* m_cloudSearchField = nullptr;
     lv_obj_t* m_cloudSearchKeyboard = nullptr;
     CloudMusicRequestState m_lastCloudSearchState = CloudMusicRequestState::Idle;
@@ -439,6 +468,31 @@ class HifiUi {
     // Loading/Error text on m_cloudListHint without touching the list
     // itself, see refreshCloudMusicSearch()/refreshCloudMusicPlaylist().
     CloudMusicRequestState m_lastCloudResolveState = CloudMusicRequestState::Idle;
+
+    // Which list the cloud player's prev/next walks, set when a track row
+    // is tapped (see onCloudMusicTrackRowAction) and used by
+    // onCloudTransportAction -- mirrors m_currentLocalTrackIndex's role for
+    // local playback, except the cloud "queue" is just the page the user
+    // is browsing (search results / playlist detail / new-song arrivals),
+    // since the core keeps those arrays alive while their page is open.
+    enum class CloudQueueSource : uint8_t { None, Search, Playlist, NewSongs };
+    CloudQueueSource m_cloudQueueSource = CloudQueueSource::None;
+    uint8_t m_cloudQueueIndex = 0;
+    // Edge-detect "the background cover-thumbnail sync just finished" so
+    // the hot-playlists/rankings pages rebuild their rows one extra time
+    // (rows built before a thumb arrived otherwise keep their placeholder).
+    bool m_cloudThumbSyncing = false;
+    // Decoded cover thumbnails for the hot-playlist / ranking list rows --
+    // owned heap allocations, freed in show() alongside m_radioListIconPixels.
+    static constexpr uint8_t kCloudRowThumbMax = 12;
+    uint16_t* m_cloudRowThumbPixels[kCloudRowThumbMax]{};
+    // Which cloud track's cover is (or is being) loaded into the shared
+    // m_coverArtPixels slot, and whether it's actually decoded yet -- the
+    // now-playing page starts a background fetch when a new track starts
+    // and rebuilds itself once the cover lands (see loadCloudCover()).
+    char m_cloudCoverTrackId[24]{};
+    bool m_cloudCoverReady = false;
+    uint32_t m_lastCloudCoverRetry = 0;
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to

@@ -111,6 +111,46 @@ router.get(
   })
 );
 
+// GET /esp/v1/rankings -- song-ranking charts (id/name/cover/update_freq).
+// Tapping a chart on the device then opens /playlists/:id with the chart's
+// id, since rankings are playlists upstream.
+router.get(
+  '/rankings',
+  rateLimit('metadata', config.rateLimitMetadataPerMin),
+  withValidation(async (req, res) => {
+    const limit = validators.parseLimit(req.query.limit, { max: 15, defaultValue: 8 });
+    const offset = validators.parseOffset(req.query.offset);
+
+    const key = cacheKey('rankings', limit, offset);
+    let result = cache.rankingsCache.get(key);
+    if (!result) {
+      result = await ncmProvider.rankings(limit, offset);
+      cache.rankingsCache.set(key, result);
+    }
+    res.json({ ok: true, ...result });
+  })
+);
+
+// GET /esp/v1/new-songs -- newest-song arrivals, normalized to the same
+// track-item shape as search results (so the firmware renders one track
+// list style for both).
+router.get(
+  '/new-songs',
+  rateLimit('metadata', config.rateLimitMetadataPerMin),
+  withValidation(async (req, res) => {
+    const limit = validators.parseLimit(req.query.limit, { max: 20, defaultValue: 20 });
+    const offset = validators.parseOffset(req.query.offset);
+
+    const key = cacheKey('newSongs', limit, offset);
+    let result = cache.newSongsCache.get(key);
+    if (!result) {
+      result = await ncmProvider.newSongs(limit, offset);
+      cache.newSongsCache.set(key, result);
+    }
+    res.json({ ok: true, ...result });
+  })
+);
+
 router.get(
   '/tracks/:id/resolve',
   rateLimit('resolve', config.rateLimitResolvePerMin),

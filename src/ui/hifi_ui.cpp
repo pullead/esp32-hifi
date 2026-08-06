@@ -110,6 +110,40 @@ static lv_obj_t* buildSharedKb(lv_obj_t* parent, lv_obj_t* textarea,
     return kb;
 }
 
+// Translate the most common gateway/upstream error strings into short
+// Chinese so list/play errors read clearly on the panel.
+static const char* cloudErrToCn(const char* msg) {
+    if (!msg || !msg[0]) return "未知错误";
+    if (strstr(msg, "purchase or VIP") || strstr(msg, "VIP access")) return "该曲目需要VIP或付费";
+    if (strstr(msg, "NO_PLAYABLE_URL") || strstr(msg, "没有可用播放地址")) return "当前账号或地区无播放权限";
+    if (strstr(msg, "HTTP 502") || strstr(msg, "HTTP 504")) return "上游服务暂不可用,请稍后重试";
+    return msg;
+}
+
+// Small right-aligned VIP / 付费 badge on a track row -- a display-only
+// label, never an unlock (the gateway refuses to resolve these tracks, and
+// playableHint keeps the row's text dimmed as well).
+static void addCloudVipBadge(lv_obj_t* row, const CloudTrackItem& item) {
+    if (!item.vip && !item.paid) return;
+    lv_obj_t* badge = lv_obj_create(row);
+    lv_obj_set_pos(badge, 250, 9);
+    lv_obj_set_size(badge, 32, 14);
+    lv_obj_set_style_radius(badge, 7, 0);
+    lv_obj_set_style_bg_color(badge, item.vip ? kMagenta : lv_color_hex(0xF59E0B), 0);
+    lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(badge, 0, 0);
+    lv_obj_set_style_pad_all(badge, 0, 0);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+    // makeText is a HifiUi member; this free helper builds the label directly.
+    lv_obj_t* text = lv_label_create(badge);
+    lv_label_set_text(text, item.vip ? "VIP" : "付费");
+    lv_obj_set_style_text_font(text, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(text, lv_color_white(), 0);
+    lv_obj_center(text);
+    lv_obj_clear_flag(text, LV_OBJ_FLAG_CLICKABLE);
+}
+
 const char* audioOutputPolicyLabel(AudioOutputPolicy policy) {
     switch (policy) {
         case AudioOutputPolicy::Fixed44100: return "固定44.1k";
@@ -821,6 +855,12 @@ void HifiUi::showUsbStoragePage() {
 }
 
 void HifiUi::show(Page page) {
+    // A pending navigate (set during this tick's refresh, e.g. cloud music
+    // resolve finished -> jump to Now Playing) must not survive into the
+    // next tick -- show() itself is the application point, so consume it
+    // here. This also prevents an older pending flag from re-firing after
+    // the user has already navigated somewhere else.
+    m_pendingNavigateSet = false;
     // Genuinely entering the WiFi settings page from elsewhere (not
     // refreshSettingsWifi() rebuilding it in place after a saved-list change)
     // resets back to the plain saved-network list rather than leaving the
@@ -910,6 +950,9 @@ void HifiUi::show(Page page) {
         if (pixels) free(pixels);
         pixels = nullptr;
     }
+    // Same ownership rule for the cloud hot-playlist / ranking cover
+    // thumbnails (see m_cloudRowThumbPixels).
+    clearCloudRowThumbs();
     m_wifiQr = m_wifiStatusText = m_wifiHintText = nullptr;
     m_wifiQrLastContent[0] = '\0'; // force a fresh lv_qrcode_update on rebuild
     m_wifiNetworkList = nullptr;
@@ -3772,9 +3815,11 @@ void HifiUi::onCloudHistoryDeleteAction(lv_event_t* event) {
     s_instance->show(Page::CloudMusicSettings); // m_cloudShowHistory stays true -> the list rebuilds
 }
 
-// ---- Cloud Music phase 3: hot playlists / search / playlist detail ------
-// Browse-only pages -- tapping a track doesn't play anything yet (see
-// onCloudMusicTrackRowAction's comment, playback lands in phase 4).
+// ---- Cloud Music phase 3-5: categories / hot playlists / rankings / new
+// songs / search / playlist detail. The online-music home is a category
+// launcher (热门歌单 / 歌曲排行榜 / 新歌速递); each category opens its own
+// second-level list page, and tapping a track on any of them starts
+// playback with a queue context for prev/next (see onCloudTransportAction).
 
 void HifiUi::buildCloudMusicHome() {
     buildAudioTopBar("在线音乐", nullptr, false, nullptr);
@@ -3795,6 +3840,64 @@ void HifiUi::buildCloudMusicHome() {
     lv_obj_t* searchIcon = makeText(searchBtn, LV_SYMBOL_LIST, &lv_font_montserrat_14, kInkDim, LV_ALIGN_CENTER, 0, 0);
     lv_obj_clear_flag(searchIcon, LV_OBJ_FLAG_CLICKABLE);
 
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) {
+        makeText(screen, "尚未配置在线音乐网关\n请前往 设置 > 在线音乐 完成配置", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 40);
+        return;
+    }
+
+    // Three category tiles. 42px rows with a leading icon chip, a big name
+    // and a one-line hint -- roomy enough to tap on a 320x170 panel.
+    static const char* const kCatNames[3] = {"热门歌单", "歌曲排行榜", "新歌速递"};
+    static const char* const kCatSubs[3] = {"精选网友歌单，一键开听", "飙升 / 热歌 / 新歌榜", "最新上架歌曲抢先听"};
+    static const char* const kCatIcons[3] = {LV_SYMBOL_LIST, LV_SYMBOL_PLAY, LV_SYMBOL_REFRESH};
+    for (uint8_t i = 0; i < 3; ++i) {
+        lv_obj_t* tile = lv_btn_create(screen);
+        lv_obj_set_pos(tile, 8, 30 + i * 44);
+        lv_obj_set_size(tile, 304, 40);
+        lv_obj_set_style_radius(tile, 10, 0);
+        lv_obj_set_style_bg_color(tile, kPanel, 0);
+        lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(tile, 0, 0);
+        lv_obj_set_style_shadow_width(tile, 0, 0);
+        lv_obj_set_style_pad_all(tile, 0, 0);
+        lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(tile);
+        lv_obj_add_event_cb(tile, onCloudCategoryAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        lv_obj_t* iconChip = lv_obj_create(tile);
+        lv_obj_set_pos(iconChip, 8, 8);
+        lv_obj_set_size(iconChip, 24, 24);
+        lv_obj_set_style_radius(iconChip, 6, 0);
+        lv_obj_set_style_bg_color(iconChip, kPanelDeep, 0);
+        lv_obj_set_style_border_width(iconChip, 0, 0);
+        lv_obj_set_style_pad_all(iconChip, 0, 0);
+        lv_obj_clear_flag(iconChip, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(iconChip, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* icon = makeText(iconChip, kCatIcons[i], &lv_font_montserrat_14, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t* name = makeText(tile, kCatNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 40, 3);
+        lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* sub = makeText(tile, kCatSubs[i], &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 40, -4);
+        lv_obj_clear_flag(sub, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* chevron = makeText(tile, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_RIGHT_MID, -10, 0);
+        lv_obj_clear_flag(chevron, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+void HifiUi::refreshCloudMusicHome() {
+    // The category page is fully static once built (nothing polls), kept as
+    // a no-op so refresh()'s page dispatch stays uniform.
+}
+
+// Hot playlists: the same list that used to live on the home page, now on
+// its own page with a 28px cover thumbnail per row (downloaded/cached by
+// the background cloudThumbSyncTask; a placeholder tile until it lands).
+void HifiUi::buildCloudHotPlaylists() {
+    buildAudioTopBar("热门歌单", nullptr, false, nullptr);
+    lv_obj_t* screen = lv_scr_act();
+
     m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 34);
     lv_obj_set_width(m_cloudListHint, 300);
     lv_label_set_long_mode(m_cloudListHint, LV_LABEL_LONG_WRAP);
@@ -3813,21 +3916,32 @@ void HifiUi::buildCloudMusicHome() {
     const CloudMusicConfig cfg = playerService.cloudMusicConfig();
     if (!cfg.configured) {
         lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(m_cloudListHint, "尚未配置在线音乐网关\n请前往 设置 > 在线音乐 完成配置");
-    } else {
-        playerService.cloudMusicHotPlaylistsStart();
+        lv_label_set_text(m_cloudListHint, "尚未配置在线音乐网关");
+        return;
     }
-    m_lastCloudHotState = CloudMusicRequestState::Idle; // force refreshCloudMusicHome() to render on first tick
-    refreshCloudMusicHome();
+    playerService.cloudMusicHotPlaylistsStart();
+    playerService.cloudThumbSyncStart(); // kick off the playlist-cover downloads
+    m_lastCloudHotState = CloudMusicRequestState::Idle; // force a render on the first tick
+    refreshCloudHotPlaylists();
 }
 
-void HifiUi::refreshCloudMusicHome() {
+void HifiUi::refreshCloudHotPlaylists() {
     if (!m_cloudListArea || !m_cloudListHint) return;
     const CloudMusicConfig cfg = playerService.cloudMusicConfig();
-    if (!cfg.configured) return; // buildCloudMusicHome() already rendered the "not configured" hint once, nothing polls after that
+    if (!cfg.configured) return;
 
     const CloudMusicRequestState state = playerService.cloudMusicHotPlaylistsState();
-    if (state == m_lastCloudHotState) return;
+    if (state == m_lastCloudHotState) {
+        // Data unchanged -- but the cover-thumbnail sync may have just
+        // finished; one extra rebuild makes newly-downloaded thumbs appear
+        // (rows built before a thumb arrived keep their placeholder).
+        if (m_cloudThumbSyncing && !playerService.cloudThumbSyncInProgress()) {
+            m_cloudThumbSyncing = false;
+            m_lastCloudHotState = CloudMusicRequestState::Idle; // force the rebuild below
+        } else {
+            return;
+        }
+    }
     m_lastCloudHotState = state;
 
     lv_obj_clean(m_cloudListArea);
@@ -3839,7 +3953,7 @@ void HifiUi::refreshCloudMusicHome() {
     if (state == CloudMusicRequestState::Error) {
         lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
         char msg[128];
-        snprintf(msg, sizeof(msg), "加载失败：%s", playerService.cloudMusicLastError());
+        snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
         lv_label_set_text(m_cloudListHint, msg);
         return;
     }
@@ -3851,6 +3965,7 @@ void HifiUi::refreshCloudMusicHome() {
         makeText(m_cloudListArea, "没有找到热门歌单", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
         return;
     }
+    m_cloudThumbSyncing = playerService.cloudThumbSyncInProgress();
     for (uint8_t i = 0; i < count; ++i) {
         CloudPlaylistItem item{};
         if (!playerService.cloudMusicHotPlaylist(i, &item)) continue;
@@ -3867,17 +3982,284 @@ void HifiUi::refreshCloudMusicHome() {
         addPressFx(row);
         lv_obj_add_event_cb(row, onCloudMusicPlaylistOpenAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
-        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 10, 4);
-        lv_obj_set_width(nameLabel, 200);
+        // 28x28 cover thumbnail (decoded from the SD cache; a music-note
+        // placeholder tile until the background download lands).
+        uint16_t* thumb = nullptr;
+        uint16_t tw = 0, th = 0;
+        if (i < kCloudRowThumbMax && playerService.cloudThumbDecode(0, i, 8, &thumb, &tw, &th) && thumb && tw && th) {
+            if (m_cloudRowThumbPixels[i]) free(m_cloudRowThumbPixels[i]);
+            m_cloudRowThumbPixels[i] = thumb;
+            static lv_img_dsc_t dscs[kCloudRowThumbMax];
+            dscs[i] = lv_img_dsc_t{};
+            dscs[i].header.cf = LV_IMG_CF_TRUE_COLOR;
+            dscs[i].header.always_zero = 0;
+            dscs[i].header.w = tw;
+            dscs[i].header.h = th;
+            dscs[i].data_size = static_cast<uint32_t>(tw) * th * 2;
+            dscs[i].data = reinterpret_cast<const uint8_t*>(thumb);
+            lv_obj_t* img = lv_img_create(row);
+            lv_img_set_src(img, &dscs[i]);
+            lv_img_set_pivot(img, 0, 0); // zoom scales from the top-left, so set_pos stays exact
+            const uint16_t longest = tw > th ? tw : th;
+            if (longest > 28) lv_img_set_zoom(img, static_cast<uint16_t>(256u * 28 / longest));
+            lv_obj_set_pos(img, 6, 4);
+            lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_t* tile = lv_obj_create(row);
+            lv_obj_set_pos(tile, 6, 4);
+            lv_obj_set_size(tile, 28, 28);
+            lv_obj_set_style_radius(tile, 4, 0);
+            lv_obj_set_style_bg_color(tile, kPanelDeep, 0);
+            lv_obj_set_style_border_width(tile, 0, 0);
+            lv_obj_set_style_pad_all(tile, 0, 0);
+            lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_t* icon = makeText(tile, LV_SYMBOL_IMAGE, &lv_font_montserrat_12, kInkDim, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+        }
+
+        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 40, 2);
+        lv_obj_set_width(nameLabel, 235);
         lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(nameLabel, LV_OBJ_FLAG_CLICKABLE);
 
         char sub[64];
         snprintf(sub, sizeof(sub), "%s · %u首", item.creator[0] ? item.creator : "歌单", item.trackCount);
-        lv_obj_t* subLabel = makeText(row, sub, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -4);
-        lv_obj_set_width(subLabel, 260);
+        lv_obj_t* subLabel = makeText(row, sub, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 40, -3);
+        lv_obj_set_width(subLabel, 235);
         lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(subLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// Song rankings (歌曲排行榜's second level): a chart picker. Tapping a
+// chart opens its track list through the normal playlist-detail page (a
+// NetEase ranking id IS a playlist id), so no separate track-list UI is
+// needed -- only this picker differs from the hot-playlists page.
+void HifiUi::buildCloudRankings() {
+    buildAudioTopBar("歌曲排行榜", nullptr, false, nullptr);
+    lv_obj_t* screen = lv_scr_act();
+
+    m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_width(m_cloudListHint, 300);
+    lv_label_set_long_mode(m_cloudListHint, LV_LABEL_LONG_WRAP);
+
+    m_cloudListArea = lv_obj_create(screen);
+    lv_obj_set_pos(m_cloudListArea, 8, 32);
+    lv_obj_set_size(m_cloudListArea, 304, 132);
+    lv_obj_set_style_bg_opa(m_cloudListArea, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(m_cloudListArea, 0, 0);
+    lv_obj_set_style_pad_all(m_cloudListArea, 0, 0);
+    lv_obj_set_style_radius(m_cloudListArea, 0, 0);
+    lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(m_cloudListArea, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(m_cloudListArea, LV_SCROLLBAR_MODE_AUTO);
+
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "尚未配置在线音乐网关");
+        return;
+    }
+    playerService.cloudMusicRankingsStart();
+    playerService.cloudThumbSyncStart(); // chart covers use the same SD cache pool (kind 1)
+    m_lastCloudRankingState = CloudMusicRequestState::Idle; // force a render on the first tick
+    refreshCloudRankings();
+}
+
+void HifiUi::refreshCloudRankings() {
+    if (!m_cloudListArea || !m_cloudListHint) return;
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) return;
+
+    const CloudMusicRequestState state = playerService.cloudMusicRankingsState();
+    if (state == m_lastCloudRankingState) {
+        // Same one-extra-rebuild trick as refreshCloudHotPlaylists: let
+        // newly-downloaded chart covers appear once the sync finishes.
+        if (m_cloudThumbSyncing && !playerService.cloudThumbSyncInProgress()) {
+            m_cloudThumbSyncing = false;
+            m_lastCloudRankingState = CloudMusicRequestState::Idle;
+        } else {
+            return;
+        }
+    }
+    m_lastCloudRankingState = state;
+
+    lv_obj_clean(m_cloudListArea);
+    if (state == CloudMusicRequestState::Loading) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "正在加载排行榜…");
+        return;
+    }
+    if (state == CloudMusicRequestState::Error) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
+        lv_label_set_text(m_cloudListHint, msg);
+        return;
+    }
+    lv_label_set_text(m_cloudListHint, "");
+    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+
+    const uint8_t count = playerService.cloudMusicRankingCount();
+    if (!count) {
+        makeText(m_cloudListArea, "没有找到排行榜", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+    m_cloudThumbSyncing = playerService.cloudThumbSyncInProgress();
+    for (uint8_t i = 0; i < count; ++i) {
+        CloudRankingItem item{};
+        if (!playerService.cloudMusicRanking(i, &item)) continue;
+        lv_obj_t* row = lv_btn_create(m_cloudListArea);
+        lv_obj_set_pos(row, 0, i * 40);
+        lv_obj_set_size(row, 288, 36);
+        lv_obj_set_style_radius(row, 10, 0);
+        lv_obj_set_style_bg_color(row, kPanel, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(row);
+        lv_obj_add_event_cb(row, onCloudRankingRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        // Chart cover thumbnail (kind 1 in the shared SD cache pool).
+        uint16_t* thumb = nullptr;
+        uint16_t tw = 0, th = 0;
+        if (i < kCloudRowThumbMax && playerService.cloudThumbDecode(1, i, 8, &thumb, &tw, &th) && thumb && tw && th) {
+            if (m_cloudRowThumbPixels[i]) free(m_cloudRowThumbPixels[i]);
+            m_cloudRowThumbPixels[i] = thumb;
+            static lv_img_dsc_t dscs[kCloudRowThumbMax];
+            dscs[i] = lv_img_dsc_t{};
+            dscs[i].header.cf = LV_IMG_CF_TRUE_COLOR;
+            dscs[i].header.always_zero = 0;
+            dscs[i].header.w = tw;
+            dscs[i].header.h = th;
+            dscs[i].data_size = static_cast<uint32_t>(tw) * th * 2;
+            dscs[i].data = reinterpret_cast<const uint8_t*>(thumb);
+            lv_obj_t* img = lv_img_create(row);
+            lv_img_set_src(img, &dscs[i]);
+            lv_img_set_pivot(img, 0, 0);
+            const uint16_t longest = tw > th ? tw : th;
+            if (longest > 28) lv_img_set_zoom(img, static_cast<uint16_t>(256u * 28 / longest));
+            lv_obj_set_pos(img, 6, 4);
+            lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_t* tile = lv_obj_create(row);
+            lv_obj_set_pos(tile, 6, 4);
+            lv_obj_set_size(tile, 28, 28);
+            lv_obj_set_style_radius(tile, 4, 0);
+            lv_obj_set_style_bg_color(tile, kPanelDeep, 0);
+            lv_obj_set_style_border_width(tile, 0, 0);
+            lv_obj_set_style_pad_all(tile, 0, 0);
+            lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_t* icon = makeText(tile, LV_SYMBOL_IMAGE, &lv_font_montserrat_12, kInkDim, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+        }
+
+        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 40, 2);
+        lv_obj_set_width(nameLabel, 235);
+        lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(nameLabel, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t* subLabel = makeText(row, item.updateFreq[0] ? item.updateFreq : "官方榜单", &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 40, -3);
+        lv_obj_set_width(subLabel, 235);
+        lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(subLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// New-song arrivals (新歌速递): a straight track list, same row style as
+// search results (including the VIP/付费 badge), playing via the shared
+// resolve path.
+void HifiUi::buildCloudNewSongs() {
+    buildAudioTopBar("新歌速递", nullptr, false, nullptr);
+    lv_obj_t* screen = lv_scr_act();
+
+    m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 34);
+    lv_obj_set_width(m_cloudListHint, 300);
+    lv_label_set_long_mode(m_cloudListHint, LV_LABEL_LONG_WRAP);
+
+    m_cloudListArea = lv_obj_create(screen);
+    lv_obj_set_pos(m_cloudListArea, 8, 32);
+    lv_obj_set_size(m_cloudListArea, 304, 132);
+    lv_obj_set_style_bg_opa(m_cloudListArea, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(m_cloudListArea, 0, 0);
+    lv_obj_set_style_pad_all(m_cloudListArea, 0, 0);
+    lv_obj_set_style_radius(m_cloudListArea, 0, 0);
+    lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(m_cloudListArea, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(m_cloudListArea, LV_SCROLLBAR_MODE_AUTO);
+
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "尚未配置在线音乐网关");
+        return;
+    }
+    playerService.cloudMusicNewSongsStart();
+    m_lastCloudNewSongState = CloudMusicRequestState::Idle; // force a render on the first tick
+    refreshCloudNewSongs();
+}
+
+void HifiUi::refreshCloudNewSongs() {
+    if (!m_cloudListArea || !m_cloudListHint) return;
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) return;
+
+    refreshCloudResolveOverlay();
+    const CloudMusicRequestState state = playerService.cloudMusicNewSongsState();
+    if (state == m_lastCloudNewSongState) return;
+    m_lastCloudNewSongState = state;
+
+    lv_obj_clean(m_cloudListArea);
+    if (state == CloudMusicRequestState::Loading) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(m_cloudListHint, "正在加载新歌…");
+        return;
+    }
+    if (state == CloudMusicRequestState::Error) {
+        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        char msg[128];
+        snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
+        lv_label_set_text(m_cloudListHint, msg);
+        return;
+    }
+    lv_label_set_text(m_cloudListHint, "");
+    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+
+    const uint8_t count = playerService.cloudMusicNewSongCount();
+    if (!count) {
+        makeText(m_cloudListArea, "暂时没有新歌", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+    for (uint8_t i = 0; i < count; ++i) {
+        CloudTrackItem item{};
+        if (!playerService.cloudMusicNewSong(i, &item)) continue;
+        lv_obj_t* row = lv_btn_create(m_cloudListArea);
+        lv_obj_set_pos(row, 0, i * 36);
+        lv_obj_set_size(row, 288, 32);
+        lv_obj_set_style_radius(row, 8, 0);
+        lv_obj_set_style_bg_color(row, kPanel, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(row);
+        lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
+        lv_obj_set_width(titleLabel, item.vip || item.paid ? 232 : 268);
+        lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
+        addCloudVipBadge(row, item);
+
+        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
+        lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
+        lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
+        lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
     }
 }
 
@@ -3979,13 +4361,26 @@ void HifiUi::buildCloudMusicSearch() {
 }
 
 bool HifiUi::refreshCloudResolveOverlay() {
+    // A resolved track just started playing: jump to Now Playing so the
+    // user sees the track (title/artist/progress) instead of sitting on the
+    // list with no visible feedback. One-shot, consumed on read.
+    if (playerService.cloudMusicJustStarted()) {
+        // Do NOT call show() directly here: this runs inside one of the
+        // page refresh() functions, which are still touching this page's
+        // widgets afterwards -- deleting them mid-refresh is a use-after-free
+        // (device rebooted back to Home a few seconds after tapping a track).
+        // Defer the navigation to the end of HifiUi::refresh() instead.
+        m_pendingNavigate = Page::CloudNowPlaying;
+        m_pendingNavigateSet = true;
+        return true;
+    }
     const CloudMusicRequestState state = playerService.cloudMusicResolveState();
     if (state == m_lastCloudResolveState) return false;
     m_lastCloudResolveState = state;
     if (!m_cloudListHint) return true;
     if (state == CloudMusicRequestState::Error) {
         char msg[128];
-        snprintf(msg, sizeof(msg), "播放失败：%s", playerService.cloudMusicLastError());
+        snprintf(msg, sizeof(msg), "播放失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
         lv_label_set_text(m_cloudListHint, msg);
     } else if (state == CloudMusicRequestState::Idle) {
         // Loaded transitions straight back to Idle once PlayerService::
@@ -4012,7 +4407,7 @@ void HifiUi::refreshCloudMusicSearch() {
     if (state == CloudMusicRequestState::Error) {
         lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
         char msg[128];
-        snprintf(msg, sizeof(msg), "搜索失败：%s", playerService.cloudMusicLastError());
+        snprintf(msg, sizeof(msg), "搜索失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
         lv_label_set_text(m_cloudListHint, msg);
         return;
     }
@@ -4041,12 +4436,13 @@ void HifiUi::refreshCloudMusicSearch() {
         lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
         lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
-        lv_obj_set_width(titleLabel, 268);
+        lv_obj_set_width(titleLabel, item.vip || item.paid ? 232 : 268);
         lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
+        addCloudVipBadge(row, item);
 
         lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
-        lv_obj_set_width(artistLabel, 268);
+        lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
         lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -4092,7 +4488,7 @@ void HifiUi::refreshCloudMusicPlaylist() {
     if (state == CloudMusicRequestState::Error) {
         lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
         char msg[128];
-        snprintf(msg, sizeof(msg), "加载失败：%s", playerService.cloudMusicLastError());
+        snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
         lv_label_set_text(m_cloudListHint, msg);
         return;
     }
@@ -4121,14 +4517,303 @@ void HifiUi::refreshCloudMusicPlaylist() {
         lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
         lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
-        lv_obj_set_width(titleLabel, 268);
+        lv_obj_set_width(titleLabel, item.vip || item.paid ? 232 : 268);
         lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
+        addCloudVipBadge(row, item);
 
         lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
-        lv_obj_set_width(artistLabel, 268);
+        lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
         lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// Cloud track cover into the shared m_coverArtPixels/m_coverArtDsc slot
+// (same machinery loadRadioIcon/loadCoverArt use). The actual JPEG comes
+// from the SD cache, populated asynchronously by cloudNowPlayingCoverTask
+// -- so this both kicks off the fetch when a new track starts AND retries
+// the decode (throttled) until the cover lands, at which point the caller
+// rebuilds the page to swap the placeholder for the real image.
+void HifiUi::loadCloudCover() {
+    CloudTrackItem track{};
+    if (!playerService.cloudMusicNowPlayingTrack(&track) || !track.id[0]) return;
+    if (m_cloudCoverReady && strcmp(m_cloudCoverTrackId, track.id) == 0) return; // already showing this track's cover
+    if (strcmp(m_cloudCoverTrackId, track.id) != 0) {
+        clearCoverArt();
+        strlcpy(m_cloudCoverTrackId, track.id, sizeof(m_cloudCoverTrackId));
+        m_cloudCoverReady = false;
+        playerService.cloudNowPlayingCoverStart();
+    }
+    if (!m_cloudCoverReady) {
+        const uint32_t now = lv_tick_get();
+        if (now - m_lastCloudCoverRetry < 500) return; // cover still downloading -- don't hammer the SD card
+        m_lastCloudCoverRetry = now;
+    }
+    uint16_t* pixels = nullptr;
+    uint16_t w = 0, h = 0;
+    if (playerService.cloudNowPlayingCoverDecode(8, &pixels, &w, &h) && pixels && w && h) {
+        clearCoverArt();
+        m_coverArtPixels = pixels;
+        m_coverArtDsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+        m_coverArtDsc.header.always_zero = 0;
+        m_coverArtDsc.header.w = w;
+        m_coverArtDsc.header.h = h;
+        m_coverArtDsc.data_size = static_cast<uint32_t>(w) * h * 2;
+        m_coverArtDsc.data = reinterpret_cast<const uint8_t*>(pixels);
+        m_cloudCoverReady = true;
+    }
+}
+
+void HifiUi::clearCloudRowThumbs() {
+    for (auto& pixels : m_cloudRowThumbPixels) {
+        if (pixels) free(pixels);
+        pixels = nullptr;
+    }
+}
+
+// Dedicated online-music player: a port of Local Now Playing's flat card
+// (cover / title / spectrum / progress / control bar), fed by the SAME
+// playback core as radio and local tracks (PlayerSnapshot source
+// CloudMusic). Differences from local: no lyrics line (cloud tracks have
+// none), the progress slider is read-only (byte-range seeking on a CDN
+// stream is unreliable), and the control bar's LIST slot opens the online
+// music categories instead of the local library.
+void HifiUi::buildCloudNowPlaying() {
+    lv_obj_t* screen = lv_scr_act();
+    buildStatusBar(screen);
+
+    // Kick off the cover download for the current cloud track up front;
+    // refreshCloudNowPlaying() rebuilds the page once it arrives.
+    loadCloudCover();
+
+    lv_obj_t* card = makePanel(screen, 8, 26, 304, 106, false);
+    lv_obj_set_style_border_width(card, 0, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_TRANSP, 0);
+
+    const bool haveArt = m_cloudCoverReady && m_coverArtPixels && m_coverArtDsc.header.w && m_coverArtDsc.header.h;
+    if (haveArt) {
+        m_coverArtWrap = lv_obj_create(card);
+        lv_obj_set_pos(m_coverArtWrap, 0, 5);
+        lv_obj_set_size(m_coverArtWrap, 72, 72);
+        lv_obj_set_style_radius(m_coverArtWrap, 0, 0);
+        lv_obj_set_style_clip_corner(m_coverArtWrap, true, 0);
+        lv_obj_set_style_bg_color(m_coverArtWrap, kPanelDeep, 0);
+        lv_obj_set_style_border_width(m_coverArtWrap, 0, 0);
+        lv_obj_set_style_pad_all(m_coverArtWrap, 0, 0);
+        lv_obj_clear_flag(m_coverArtWrap, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(m_coverArtWrap, LV_OBJ_FLAG_CLICKABLE);
+        m_coverArtImg = lv_img_create(m_coverArtWrap);
+        lv_img_set_src(m_coverArtImg, &m_coverArtDsc);
+        lv_img_set_pivot(m_coverArtImg, 0, 0);
+        const uint16_t longest = m_coverArtDsc.header.w > m_coverArtDsc.header.h ? m_coverArtDsc.header.w : m_coverArtDsc.header.h;
+        if (longest > 72) lv_img_set_zoom(m_coverArtImg, static_cast<uint16_t>(256u * 72 / longest));
+        lv_obj_set_pos(m_coverArtImg, 0, 0);
+        lv_obj_center(m_coverArtImg);
+        lv_obj_clear_flag(m_coverArtImg, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        m_cover = lv_obj_create(card);
+        lv_obj_set_pos(m_cover, 0, 5);
+        lv_obj_set_size(m_cover, 72, 72);
+        lv_obj_set_style_radius(m_cover, 0, 0);
+        lv_obj_set_style_bg_color(m_cover, kPanelDeep, 0);
+        lv_obj_set_style_bg_grad_color(m_cover, kAccentDeep, 0);
+        lv_obj_set_style_bg_grad_dir(m_cover, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_border_width(m_cover, 0, 0);
+        lv_obj_set_style_pad_all(m_cover, 0, 0);
+        lv_obj_clear_flag(m_cover, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(m_cover, LV_OBJ_FLAG_CLICKABLE);
+        addMusicNoteIcon(m_cover, 72, kInk);
+    }
+
+    m_title = makeText(card, "", &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 80, 2);
+    lv_label_set_long_mode(m_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_width(m_title, 216);
+
+    // Artist line (no cloud lyrics exist, unlike local playback).
+    m_detail = makeText(card, "", &lv_font_cjk_13, kAccentBright, LV_ALIGN_TOP_LEFT, 80, 19);
+    lv_label_set_long_mode(m_detail, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(m_detail, 216);
+
+    m_elapsed = makeText(card, "00:00", &lv_font_montserrat_12, kInkDim, LV_ALIGN_TOP_LEFT, 0, 76);
+    lv_obj_set_width(m_elapsed, 72);
+    lv_obj_set_style_text_align(m_elapsed, LV_TEXT_ALIGN_CENTER, 0);
+    m_total = makeText(card, "00:00", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 0, 92);
+    lv_obj_set_width(m_total, 72);
+    lv_obj_set_style_text_align(m_total, LV_TEXT_ALIGN_CENTER, 0);
+
+    // Same dot-matrix spectrum geometry as local playback (28x11, 5x3 cells
+    // on 8x4 pitch, x=80..301 / y=39..82) -- shared m_specCanvasBuf.
+    constexpr uint8_t kSpecCols = 28;
+    constexpr uint8_t kSpecRows = 11;
+    constexpr lv_coord_t kSpecCanvasW = 221;
+    if (!m_specCanvasBuf) {
+        m_specCanvasBuf = static_cast<lv_color_t*>(ps_malloc(kSpecCanvasW * kSpecCanvasH * sizeof(lv_color_t)));
+    }
+    m_specCanvas = lv_canvas_create(card);
+    lv_obj_set_pos(m_specCanvas, 80, 39);
+    lv_obj_clear_flag(m_specCanvas, LV_OBJ_FLAG_CLICKABLE);
+    if (m_specCanvasBuf) {
+        lv_canvas_set_buffer(m_specCanvas, m_specCanvasBuf, kSpecCanvasW, kSpecCanvasH, LV_IMG_CF_TRUE_COLOR);
+        lv_canvas_fill_bg(m_specCanvas, kBg, LV_OPA_COVER);
+        for (uint8_t c = 0; c < kSpecCols; ++c) {
+            for (uint8_t r = 0; r < kSpecRows; ++r) drawSpecDot(m_specCanvas, c, r, kSpecCanvasH, kInkFaint);
+        }
+    }
+    m_specCols = kSpecCols;
+    m_specRows = kSpecRows;
+
+    // Read-only progress bar: same look as local's draggable slider but no
+    // seek callback -- CDN byte-range seeking is unreliable.
+    m_progress = lv_slider_create(card);
+    lv_obj_set_pos(m_progress, 80, 87);
+    lv_obj_set_size(m_progress, 221, 12);
+    lv_slider_set_range(m_progress, 0, 1000);
+    lv_obj_set_style_radius(m_progress, 6, LV_PART_MAIN);
+    lv_obj_set_style_radius(m_progress, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(m_progress, kInkFaint, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(m_progress, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(m_progress, kMagenta, LV_PART_INDICATOR);
+    lv_obj_set_style_shadow_color(m_progress, kMagenta, LV_PART_INDICATOR);
+    lv_obj_set_style_shadow_width(m_progress, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_shadow_opa(m_progress, LV_OPA_50, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(m_progress, kInk, LV_PART_KNOB);
+    lv_obj_set_style_pad_all(m_progress, 6, LV_PART_KNOB);
+    // No seek handler attached: dragging the knob does nothing permanent
+    // (refresh() pushes the real playback position back on the next tick).
+
+    // Control bar: prev / play / next / 在线音乐 (list) / close-to-home.
+    // Five evenly-spaced slots; the LIST slot opens the online-music
+    // categories per the "控制栏的播放列表库改成在线音乐" requirement.
+    lv_obj_t* controlBar = lv_obj_create(screen);
+    lv_obj_set_pos(controlBar, 0, 134);
+    lv_obj_set_size(controlBar, 320, 36);
+    lv_obj_set_style_bg_opa(controlBar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(controlBar, 1, 0);
+    lv_obj_set_style_border_side(controlBar, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_color(controlBar, kInkFaint, 0);
+    lv_obj_set_style_border_opa(controlBar, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(controlBar, 0, 0);
+    lv_obj_set_style_radius(controlBar, 0, 0);
+    lv_obj_clear_flag(controlBar, LV_OBJ_FLAG_SCROLLABLE);
+
+    constexpr uint8_t kSlotCount = 5;
+    constexpr int16_t kSlotWidth = 320 / kSlotCount; // 64px
+    static const char* const kSlotSymbols[kSlotCount] = {LV_SYMBOL_PREV, LV_SYMBOL_PLAY, LV_SYMBOL_NEXT, LV_SYMBOL_LIST, LV_SYMBOL_HOME};
+    static const uintptr_t kSlotActions[kSlotCount] = {kActionPrev, kActionPlayPause, kActionNext, 100, 101};
+    for (uint8_t i = 0; i < kSlotCount; ++i) {
+        const bool primary = i == 1;
+        lv_obj_t* slot = lv_btn_create(controlBar);
+        lv_obj_set_pos(slot, i * kSlotWidth, 0);
+        lv_obj_set_size(slot, kSlotWidth, 36);
+        lv_obj_set_style_radius(slot, 10, 0);
+        lv_obj_set_style_bg_opa(slot, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_shadow_width(slot, 0, 0);
+        lv_obj_set_style_border_width(slot, 0, 0);
+        lv_obj_set_style_pad_all(slot, 0, 0);
+        lv_obj_clear_flag(slot, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(slot);
+        if (primary) {
+            lv_obj_add_event_cb(slot, onCloudTransportAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(kActionPlayPause));
+            lv_obj_t* ring = lv_obj_create(slot);
+            lv_obj_set_size(ring, 32, 32);
+            lv_obj_align(ring, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_set_style_radius(ring, 20, 0);
+            lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+            lv_obj_set_style_border_color(ring, kMagenta, 0);
+            lv_obj_set_style_border_width(ring, 2, 0);
+            lv_obj_set_style_shadow_width(ring, 0, 0);
+            lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
+            m_playRing = ring;
+            m_playIcon = makeText(ring, kSlotSymbols[i], &lv_font_montserrat_16, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_clear_flag(m_playIcon, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_add_event_cb(slot, onCloudTransportAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(kSlotActions[i]));
+            lv_obj_t* icon = makeText(slot, kSlotSymbols[i], &lv_font_montserrat_16, kInkDim, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
+        }
+    }
+
+    refreshCloudNowPlaying(playerService.snapshot());
+}
+
+void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
+    // Same guard as refreshLocalNowPlaying(): if the shared decoder is
+    // actually playing something else (radio/local) while this page is on
+    // screen, render as genuinely idle instead of mislabeling the other
+    // source's data as cloud playback.
+    PlayerSnapshot state = rawState;
+    if (state.source != PlayerSource::CloudMusic) {
+        state.transport = PlayerTransport::Stopped;
+        state.title[0] = '\0';
+        state.detail[0] = '\0';
+        state.vuLevel = 0;
+        for (auto& band : state.spectrumBands) band = 0;
+        state.positionSeconds = 0;
+        state.durationSeconds = 0;
+    }
+
+    // Cover may have landed since this page was built -- if so, rebuild the
+    // page (deferred to the end of refresh(), never mid-refresh) so the
+    // placeholder tile swaps for the real image.
+    const bool hadCover = m_cloudCoverReady;
+    loadCloudCover();
+    if (!hadCover && m_cloudCoverReady) {
+        m_pendingNavigate = Page::CloudNowPlaying;
+        m_pendingNavigateSet = true;
+    }
+
+    if (m_title) lv_label_set_text(m_title, state.title[0] ? state.title : "未在播放");
+    if (m_detail) lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+    if (m_elapsed) {
+        char elapsed[16];
+        formatTime(elapsed, sizeof(elapsed), state.positionSeconds);
+        lv_label_set_text(m_elapsed, elapsed);
+    }
+    if (m_total) {
+        char total[16];
+        formatTime(total, sizeof(total), state.durationSeconds);
+        lv_label_set_text(m_total, total);
+    }
+    if (m_progress) {
+        const uint32_t value = state.durationSeconds ? (state.positionSeconds * 1000UL / state.durationSeconds) : 0;
+        lv_slider_set_value(m_progress, value, LV_ANIM_OFF);
+    }
+
+    const bool playing = state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Buffering;
+    if (m_playIcon) lv_label_set_text(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+
+    // Same rainbow spectrum as local playback (see refreshLocalNowPlaying's
+    // comment for the 6-band interpolation rationale).
+    if (m_specCanvas && m_specCols && m_specRows) {
+        static const lv_color_t kRowColors[11] = {
+            lv_color_hex(0x38BDF8), lv_color_hex(0x22D3EE), lv_color_hex(0x2DD4BF), lv_color_hex(0x34D399), lv_color_hex(0xA3E635),
+            lv_color_hex(0xFACC15), lv_color_hex(0xFB923C), lv_color_hex(0xF97316), lv_color_hex(0xEF4444), lv_color_hex(0xEC4899),
+            lv_color_hex(0xF43F5E),
+        };
+        bool anyColumnChanged = false;
+        for (uint8_t c = 0; c < m_specCols; ++c) {
+            uint8_t lit = 0;
+            if (playing) {
+                const float bandPos = static_cast<float>(c) * 5.0f / (m_specCols - 1);
+                const uint8_t bandLo = static_cast<uint8_t>(bandPos);
+                const uint8_t bandHi = std::min<uint8_t>(bandLo + 1, 5);
+                const float frac = bandPos - bandLo;
+                const float level = state.spectrumBands[bandLo] * (1.0f - frac) + state.spectrumBands[bandHi] * frac;
+                uint16_t boosted = static_cast<uint16_t>(level * 1.5f);
+                if (boosted > 255) boosted = 255;
+                lit = static_cast<uint8_t>((boosted * m_specRows) / 255);
+                if (level > 10 && lit == 0) lit = 1;
+            }
+            if (c < 32 && m_specLastLit[c] == lit) continue;
+            if (c < 32) m_specLastLit[c] = lit;
+            anyColumnChanged = true;
+            for (uint8_t r = 0; r < m_specRows; ++r) {
+                drawSpecDot(m_specCanvas, c, r, kSpecCanvasH, r < lit ? kRowColors[r < 11 ? r : 10] : kInkFaint);
+            }
+        }
+        if (anyColumnChanged) lv_obj_invalidate(m_specCanvas);
     }
 }
 
@@ -4167,9 +4852,18 @@ void HifiUi::onCloudMusicTrackRowAction(lv_event_t* event) {
     // which page is currently showing the row that got tapped.
     CloudTrackItem item{};
     bool found = false;
-    if (s_instance->m_page == Page::CloudMusicSearch) found = playerService.cloudMusicSearchResult(index, &item);
-    else if (s_instance->m_page == Page::CloudMusicPlaylist) found = playerService.cloudMusicPlaylistTrack(index, &item);
+    if (s_instance->m_page == Page::CloudMusicSearch) {
+        found = playerService.cloudMusicSearchResult(index, &item);
+        s_instance->m_cloudQueueSource = CloudQueueSource::Search;
+    } else if (s_instance->m_page == Page::CloudMusicPlaylist) {
+        found = playerService.cloudMusicPlaylistTrack(index, &item);
+        s_instance->m_cloudQueueSource = CloudQueueSource::Playlist;
+    } else if (s_instance->m_page == Page::CloudNewSongs) {
+        found = playerService.cloudMusicNewSong(index, &item);
+        s_instance->m_cloudQueueSource = CloudQueueSource::NewSongs;
+    }
     if (!found || !item.id[0]) return;
+    s_instance->m_cloudQueueIndex = index;
     playerService.cloudMusicPlayTrackStart(item.id);
     // Immediate feedback before the async resolve completes -- both list
     // pages' refresh functions poll cloudMusicResolveState() each tick and
@@ -4177,6 +4871,82 @@ void HifiUi::onCloudMusicTrackRowAction(lv_event_t* event) {
     // finishes, same overlay-on-m_cloudListHint mechanism the loading/error
     // states already use.
     if (s_instance->m_cloudListHint) lv_label_set_text(s_instance->m_cloudListHint, "正在解析播放地址…");
+}
+
+void HifiUi::onCloudCategoryAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    if (index == 0) s_instance->show(Page::CloudHotPlaylists);
+    else if (index == 1) s_instance->show(Page::CloudRankings);
+    else if (index == 2) s_instance->show(Page::CloudNewSongs);
+}
+
+void HifiUi::onCloudRankingRowAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    CloudRankingItem item{};
+    if (!playerService.cloudMusicRanking(index, &item)) return;
+    strlcpy(s_instance->m_cloudSelectedPlaylistId, item.id, sizeof(s_instance->m_cloudSelectedPlaylistId));
+    strlcpy(s_instance->m_cloudSelectedPlaylistName, item.name, sizeof(s_instance->m_cloudSelectedPlaylistName));
+    s_instance->show(Page::CloudMusicPlaylist); // a NetEase ranking id IS a playlist id
+}
+
+// Cloud player transport: prev/next walk the queue context captured by
+// onCloudMusicTrackRowAction (search results / playlist tracks / new-song
+// arrivals), wrapping like the local player's RepeatAll; play/pause uses
+// the same shared togglePause() as radio/local; the LIST slot opens the
+// online-music categories; the CLOSE slot returns Home.
+void HifiUi::onCloudTransportAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uintptr_t action = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    if (action == kActionPrev || action == kActionNext) {
+        uint8_t count = 0;
+        bool ok = false;
+        if (s_instance->m_cloudQueueSource == CloudQueueSource::Search) {
+            count = playerService.cloudMusicSearchResultCount();
+        } else if (s_instance->m_cloudQueueSource == CloudQueueSource::Playlist) {
+            count = playerService.cloudMusicPlaylistTrackCount();
+        } else if (s_instance->m_cloudQueueSource == CloudQueueSource::NewSongs) {
+            count = playerService.cloudMusicNewSongCount();
+        }
+        if (!count) return;
+        int32_t next = s_instance->m_cloudQueueIndex;
+        next += (action == kActionNext) ? 1 : -1;
+        if (next < 0) next = count - 1;
+        else if (next >= count) next = 0;
+        CloudTrackItem item{};
+        if (s_instance->m_cloudQueueSource == CloudQueueSource::Search) ok = playerService.cloudMusicSearchResult(static_cast<uint8_t>(next), &item);
+        else if (s_instance->m_cloudQueueSource == CloudQueueSource::Playlist) ok = playerService.cloudMusicPlaylistTrack(static_cast<uint8_t>(next), &item);
+        else if (s_instance->m_cloudQueueSource == CloudQueueSource::NewSongs) ok = playerService.cloudMusicNewSong(static_cast<uint8_t>(next), &item);
+        if (!ok || !item.id[0]) return;
+        s_instance->m_cloudQueueIndex = static_cast<uint8_t>(next);
+        playerService.cloudMusicPlayTrackStart(item.id);
+    } else if (action == kActionPlayPause) {
+        const PlayerSnapshot state = playerService.snapshot();
+        bool showPause = false;
+        if (state.source == PlayerSource::CloudMusic &&
+            (state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Paused ||
+             state.transport == PlayerTransport::Buffering)) {
+            showPause = !playerService.togglePause();
+        } else {
+            // Nothing cloud is playing: restart the current queue entry (or
+            // do nothing if there's no queue context yet).
+            CloudTrackItem item{};
+            bool ok = false;
+            if (s_instance->m_cloudQueueSource == CloudQueueSource::Search) ok = playerService.cloudMusicSearchResult(s_instance->m_cloudQueueIndex, &item);
+            else if (s_instance->m_cloudQueueSource == CloudQueueSource::Playlist) ok = playerService.cloudMusicPlaylistTrack(s_instance->m_cloudQueueIndex, &item);
+            else if (s_instance->m_cloudQueueSource == CloudQueueSource::NewSongs) ok = playerService.cloudMusicNewSong(s_instance->m_cloudQueueIndex, &item);
+            if (ok && item.id[0]) {
+                playerService.cloudMusicPlayTrackStart(item.id);
+                showPause = true;
+            }
+        }
+        if (s_instance->m_playIcon) lv_label_set_text(s_instance->m_playIcon, showPause ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    } else if (action == 100) { // LIST -> online-music categories
+        s_instance->show(Page::CloudMusicHome);
+    } else if (action == 101) { // close -> Home
+        s_instance->show(Page::Home);
+    }
 }
 
 void HifiUi::buildAudioTopBar(const char* title, const char* rightText, bool rightOk, const char* rightIcon) {
@@ -5276,6 +6046,26 @@ void HifiUi::refresh() {
                 // else: Sequential mode reached the end of the list -- stop,
                 // same as a normal player with repeat off.
             }
+        } else if (m_lastSourceSeen == PlayerSource::CloudMusic && m_cloudQueueSource != CloudQueueSource::None) {
+            // Cloud auto-advance: a finished CDN track moves to the next
+            // entry of whichever queue it was played from (search results /
+            // playlist / new-song arrivals), wrapping around like RepeatAll.
+            uint8_t count = 0;
+            if (m_cloudQueueSource == CloudQueueSource::Search) count = playerService.cloudMusicSearchResultCount();
+            else if (m_cloudQueueSource == CloudQueueSource::Playlist) count = playerService.cloudMusicPlaylistTrackCount();
+            else if (m_cloudQueueSource == CloudQueueSource::NewSongs) count = playerService.cloudMusicNewSongCount();
+            if (count) {
+                const uint8_t next = (m_cloudQueueIndex + 1) % count;
+                CloudTrackItem item{};
+                bool ok = false;
+                if (m_cloudQueueSource == CloudQueueSource::Search) ok = playerService.cloudMusicSearchResult(next, &item);
+                else if (m_cloudQueueSource == CloudQueueSource::Playlist) ok = playerService.cloudMusicPlaylistTrack(next, &item);
+                else if (m_cloudQueueSource == CloudQueueSource::NewSongs) ok = playerService.cloudMusicNewSong(next, &item);
+                if (ok && item.id[0]) {
+                    m_cloudQueueIndex = next;
+                    playerService.cloudMusicPlayTrackStart(item.id);
+                }
+            }
         }
     }
     m_lastSourceSeen = state.source;
@@ -5555,7 +6345,20 @@ void HifiUi::refresh() {
     else if (m_page == Page::CloudMusicHome) refreshCloudMusicHome();
     else if (m_page == Page::CloudMusicSearch) refreshCloudMusicSearch();
     else if (m_page == Page::CloudMusicPlaylist) refreshCloudMusicPlaylist();
+    else if (m_page == Page::CloudHotPlaylists) refreshCloudHotPlaylists();
+    else if (m_page == Page::CloudRankings) refreshCloudRankings();
+    else if (m_page == Page::CloudNewSongs) refreshCloudNewSongs();
+    else if (m_page == Page::CloudNowPlaying) refreshCloudNowPlaying(state);
     refreshCoverSpin(state);
+
+    // Apply any navigation that a page-refresh decided to request (see
+    // refreshCloudResolveOverlay()): do it only after every page branch has
+    // finished touching its widgets, then let the next tick render the new
+    // page.
+    if (m_pendingNavigateSet) {
+        m_pendingNavigateSet = false;
+        show(m_pendingNavigate);
+    }
 }
 
 void HifiUi::refreshMediaPage(const PlayerSnapshot& state) {
@@ -5633,7 +6436,7 @@ void HifiUi::refreshCoverSpin(const PlayerSnapshot& state) {
     // Radio Now Playing's m_cover/m_coverArtWrap are a plain square logo
     // slot, not a turntable disc -- same reasoning as LocalNowPlaying below,
     // this must never get a whole-object spin animation.
-    if (m_page == Page::LocalNowPlaying || m_page == Page::Radio) return;
+    if (m_page == Page::LocalNowPlaying || m_page == Page::Radio || m_page == Page::CloudNowPlaying) return;
 
     // Disc spin: only while actually playing, per the animation budget --
     // idle/paused stays still rather than looping forever in the background.

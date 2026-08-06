@@ -88,6 +88,8 @@ function buildSearchItem(song) {
     duration_ms: firstNonEmpty(song.duration, song.dt, 0),
     cover_url: firstNonEmpty(song.album && song.album.picUrl, song.al && song.al.picUrl, ''),
     playable_hint: song.fee !== 1 && song.fee !== 4, // 1=VIP-only, 4=paid album -- not a bypass, just an honest hint
+    vip: song.fee === 1,   // display-only badge: the device shows VIP/paid tags, never unlocks the track
+    paid: song.fee === 4,
   };
 }
 
@@ -153,6 +155,36 @@ async function playlistDetail(playlistId, limit, offset) {
     offset,
     has_more: offset + songs.length < (pl.trackCount || 0),
   };
+}
+
+// Song rankings (歌曲排行榜). The upstream /toplist response already
+// contains every chart's id/name/cover -- enough for the device to render a
+// second-level chart picker. A chart's actual track list is served through
+// the existing /esp/v1/playlists/:id endpoint (a ranking id IS a playlist
+// id in NetEase's data model), so no separate track endpoint is needed.
+async function rankings(limit, offset) {
+  const data = await upstreamGet('/toplist', {});
+  const list = (data && data.list) || [];
+  const items = list.slice(offset, offset + limit).map((r) => ({
+    id: String(r.id),
+    name: r.name || '',
+    cover_url: r.coverImgUrl || '',
+    update_freq: r.updateFrequency || '',
+  }));
+  return { items, offset, has_more: offset + items.length < list.length };
+}
+
+// New-song arrivals (新歌速递) -- upstream /top/song is NetEase's "latest
+// songs" feed. Its response shape varies between deployments (data as a
+// bare song array vs. data.list), so both are handled defensively, same as
+// buildSearchItem's own multi-location field lookups.
+async function newSongs(limit, offset) {
+  const data = await upstreamGet('/top/song', { type: 0, limit: limit + offset });
+  const raw = data && data.data;
+  const songs = Array.isArray(raw) ? raw : (raw && raw.list) || [];
+  const total = songs.length;
+  const items = songs.slice(offset, offset + limit).map(buildSearchItem);
+  return { items, offset, has_more: offset + items.length < total };
 }
 
 // stream.url validation -- spec 5.4/11: must be a direct CDN URL, http(s)
@@ -265,6 +297,8 @@ module.exports = {
   search,
   hotPlaylists,
   playlistDetail,
+  rankings,
+  newSongs,
   resolveTrack,
   lyrics,
 };

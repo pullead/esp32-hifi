@@ -55,6 +55,8 @@ struct CloudTrackItem {
     uint32_t durationMs = 0;
     char coverUrl[200]{};
     bool playableHint = true;
+    bool vip = false;  // display-only badges from the gateway (fee==1 / fee==4)
+    bool paid = false; // the device never unlocks these -- just labels them
 };
 
 struct CloudPlaylistItem {
@@ -63,6 +65,16 @@ struct CloudPlaylistItem {
     char creator[48]{};
     char coverUrl[200]{};
     uint16_t trackCount = 0;
+};
+
+// One song-ranking chart (歌曲排行榜's second-level list). Tapping a chart
+// loads its tracks through the same playlist-detail path, since NetEase
+// ranking ids are playlist ids.
+struct CloudRankingItem {
+    char id[24]{};
+    char name[64]{};
+    char coverUrl[200]{};
+    char updateFreq[48]{};
 };
 
 // Generic request lifecycle for the three phase-3 background lookups
@@ -323,11 +335,44 @@ class PlayerService {
     uint8_t cloudMusicPlaylistTrackCount() const;
     bool cloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) const;
 
+    // Phase 5: ranking charts + new-song arrivals -- same command/generation
+    // scheme as the phase-3 lookups above (see cloudMusicControllerTask).
+    void cloudMusicRankingsStart();
+    CloudMusicRequestState cloudMusicRankingsState() const;
+    uint8_t cloudMusicRankingCount() const;
+    bool cloudMusicRanking(uint8_t index, CloudRankingItem* item) const;
+
+    void cloudMusicNewSongsStart();
+    CloudMusicRequestState cloudMusicNewSongsState() const;
+    uint8_t cloudMusicNewSongCount() const;
+    bool cloudMusicNewSong(uint8_t index, CloudTrackItem* item) const;
+
+    // Cloud cover thumbnails (hot-playlist covers / ranking covers / the
+    // now-playing track's cover), downloaded once to SD by a background
+    // task and decoded on demand -- same pattern as radio station logos.
+    // cloudThumbDecode kind: 0 = hot playlist, 1 = ranking.
+    void cloudThumbSyncStart();
+    bool cloudThumbSyncInProgress() const;
+    bool cloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor, uint16_t** outPixels,
+                          uint16_t* outWidth, uint16_t* outHeight) const;
+    void cloudNowPlayingCoverStart();
+    // Decodes /cloudimg/np_<trackId>.jpg for the currently playing cloud
+    // track (keyed by track id so switching tracks never shows a stale
+    // cached cover).
+    bool cloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
+                                    uint16_t* outHeight) const;
+    // Copy of the last resolved cloud track (title/artist/cover etc.),
+    // non-consuming -- the UI reads it for the now-playing page.
+    bool cloudMusicNowPlayingTrack(CloudTrackItem* item) const;
+
     // Phase 4: resolve + play (see main.cpp's cloudMusicControllerTask).
     // Mutual exclusion with Radio/Sd works the same way playRadioUrl()/
     // playSdFile() already do it -- see this method's own definition.
     bool cloudMusicPlayTrackStart(const char* trackId);
     CloudMusicRequestState cloudMusicResolveState() const;
+    // One-shot true right after a resolved track actually starts playing;
+    // the UI uses it to jump to the Now Playing page (consumed on read).
+    bool cloudMusicJustStarted() const;
 
     // Called by the MiniWebRadio audio callback, never from an LVGL handler.
     void onMetadata(const char* station, const char* title);

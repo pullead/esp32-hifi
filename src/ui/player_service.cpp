@@ -71,8 +71,25 @@ extern uint8_t playerCoreCloudMusicPlaylistDetailState();
 extern CloudPlaylistItem playerCoreCloudMusicPlaylistDetailInfo();
 extern uint8_t playerCoreCloudMusicPlaylistTrackCount();
 extern bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item);
+extern void playerCoreCloudMusicRankingsStart();
+extern uint8_t playerCoreCloudMusicRankingsState();
+extern uint8_t playerCoreCloudMusicRankingCount();
+extern bool playerCoreCloudMusicRanking(uint8_t index, CloudRankingItem* item);
+extern void playerCoreCloudMusicNewSongsStart();
+extern uint8_t playerCoreCloudMusicNewSongsState();
+extern uint8_t playerCoreCloudMusicNewSongCount();
+extern bool playerCoreCloudMusicNewSong(uint8_t index, CloudTrackItem* item);
+extern void playerCoreCloudThumbSyncStart();
+extern bool playerCoreCloudThumbSyncInProgress();
+extern bool playerCoreCloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor, uint16_t** outPixels,
+                                       uint16_t* outWidth, uint16_t* outHeight);
+extern void playerCoreCloudNowPlayingCoverStart();
+extern bool playerCoreCloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
+                                                 uint16_t* outHeight);
+extern bool playerCoreCloudMusicNowPlayingTrack(CloudTrackItem* item);
 extern bool playerCoreCloudMusicPlayTrackStart(const char* trackId);
 extern uint8_t playerCoreCloudMusicResolveState();
+extern bool playerCoreCloudMusicJustStarted();
 extern bool playerCoreCloudMusicConsumeNowPlaying(CloudTrackItem* outTrack);
 
 PlayerService playerService;
@@ -355,6 +372,50 @@ bool PlayerService::cloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item)
     return playerCoreCloudMusicPlaylistTrack(index, item);
 }
 
+void PlayerService::cloudMusicRankingsStart() { playerCoreCloudMusicRankingsStart(); }
+
+CloudMusicRequestState PlayerService::cloudMusicRankingsState() const {
+    return static_cast<CloudMusicRequestState>(playerCoreCloudMusicRankingsState());
+}
+
+uint8_t PlayerService::cloudMusicRankingCount() const { return playerCoreCloudMusicRankingCount(); }
+
+bool PlayerService::cloudMusicRanking(uint8_t index, CloudRankingItem* item) const {
+    return playerCoreCloudMusicRanking(index, item);
+}
+
+void PlayerService::cloudMusicNewSongsStart() { playerCoreCloudMusicNewSongsStart(); }
+
+CloudMusicRequestState PlayerService::cloudMusicNewSongsState() const {
+    return static_cast<CloudMusicRequestState>(playerCoreCloudMusicNewSongsState());
+}
+
+uint8_t PlayerService::cloudMusicNewSongCount() const { return playerCoreCloudMusicNewSongCount(); }
+
+bool PlayerService::cloudMusicNewSong(uint8_t index, CloudTrackItem* item) const {
+    return playerCoreCloudMusicNewSong(index, item);
+}
+
+void PlayerService::cloudThumbSyncStart() { playerCoreCloudThumbSyncStart(); }
+
+bool PlayerService::cloudThumbSyncInProgress() const { return playerCoreCloudThumbSyncInProgress(); }
+
+bool PlayerService::cloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor, uint16_t** outPixels,
+                                     uint16_t* outWidth, uint16_t* outHeight) const {
+    return playerCoreCloudThumbDecode(kind, index, scaleFactor, outPixels, outWidth, outHeight);
+}
+
+void PlayerService::cloudNowPlayingCoverStart() { playerCoreCloudNowPlayingCoverStart(); }
+
+bool PlayerService::cloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
+                                               uint16_t* outHeight) const {
+    return playerCoreCloudNowPlayingCoverDecode(scaleFactor, outPixels, outWidth, outHeight);
+}
+
+bool PlayerService::cloudMusicNowPlayingTrack(CloudTrackItem* item) const {
+    return playerCoreCloudMusicNowPlayingTrack(item);
+}
+
 bool PlayerService::cloudMusicPlayTrackStart(const char* trackId) {
     // Same reasoning as playRadioUrl()/playSdFile(): stop whatever's
     // playing now, at the moment playback is actually requested (not
@@ -369,6 +430,8 @@ bool PlayerService::cloudMusicPlayTrackStart(const char* trackId) {
 CloudMusicRequestState PlayerService::cloudMusicResolveState() const {
     return static_cast<CloudMusicRequestState>(playerCoreCloudMusicResolveState());
 }
+
+bool PlayerService::cloudMusicJustStarted() const { return playerCoreCloudMusicJustStarted(); }
 
 void PlayerService::onMetadata(const char* station, const char* title) {
     if (station && station[0]) copyText(m_snapshot.title, sizeof(m_snapshot.title), station);

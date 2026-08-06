@@ -49,6 +49,8 @@ class TtlCache {
 const searchCache = new TtlCache({ ttlMs: 8 * 60 * 1000, maxEntries: 300 });
 const hotPlaylistsCache = new TtlCache({ ttlMs: 20 * 60 * 1000, maxEntries: 20 });
 const playlistDetailCache = new TtlCache({ ttlMs: 10 * 60 * 1000, maxEntries: 100 });
+const rankingsCache = new TtlCache({ ttlMs: 20 * 60 * 1000, maxEntries: 10 });
+const newSongsCache = new TtlCache({ ttlMs: 10 * 60 * 1000, maxEntries: 20 });
 const trackMetaCache = new TtlCache({ ttlMs: 45 * 60 * 1000, maxEntries: 500 });
 const lyricsCache = new TtlCache({ ttlMs: 45 * 60 * 1000, maxEntries: 500 });
 
@@ -57,6 +59,8 @@ module.exports = {
   searchCache,
   hotPlaylistsCache,
   playlistDetailCache,
+  rankingsCache,
+  newSongsCache,
   trackMetaCache,
   lyricsCache,
 };
