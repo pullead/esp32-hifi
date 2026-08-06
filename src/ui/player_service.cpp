@@ -83,7 +83,7 @@ extern void playerCoreCloudThumbSyncStart();
 extern bool playerCoreCloudThumbSyncInProgress();
 extern bool playerCoreCloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor, uint16_t** outPixels,
                                        uint16_t* outWidth, uint16_t* outHeight);
-extern void playerCoreCloudNowPlayingCoverStart();
+extern void playerCoreCloudNowPlayingCoverStart(const char* fallbackUrl);
 extern bool playerCoreCloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
                                                  uint16_t* outHeight);
 extern bool playerCoreCloudMusicNowPlayingTrack(CloudTrackItem* item);
@@ -405,7 +405,7 @@ bool PlayerService::cloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleF
     return playerCoreCloudThumbDecode(kind, index, scaleFactor, outPixels, outWidth, outHeight);
 }
 
-void PlayerService::cloudNowPlayingCoverStart() { playerCoreCloudNowPlayingCoverStart(); }
+void PlayerService::cloudNowPlayingCoverStart(const char* fallbackUrl) { playerCoreCloudNowPlayingCoverStart(fallbackUrl); }
 
 bool PlayerService::cloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
                                                uint16_t* outHeight) const {

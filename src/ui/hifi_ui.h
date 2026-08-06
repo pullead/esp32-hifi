@@ -116,6 +116,12 @@ class HifiUi {
     static void onAudioOutputPolicyAction(lv_event_t* event);
 
     void show(Page page);
+    // Like show(), but pushes the current page unconditionally instead of
+    // collapsing the stack when the target is an ancestor -- used by the
+    // cloud player's LIST/HOME slots so swiping back from the list returns
+    // to the player (normal show() would truncate the stack to the
+    // ancestor and make back land on Home).
+    void showKeepingStack(Page page);
     void navigateBack();
     void buildHome();
     void buildMediaPage(bool isRadio);
@@ -470,6 +476,11 @@ class HifiUi {
     // 热门歌单 entry is opened directly.
     char m_cloudLanguageCat[16]{};
     char m_cloudLanguageName[24]{};
+    // Cover of whichever playlist/ranking the current cloud track came
+    // from -- used as the now-playing cover fallback when the track itself
+    // has no album art (set in onCloudMusicPlaylistOpenAction /
+    // onCloudRankingRowAction).
+    char m_cloudCurrentPlaylistCover[200]{};
     CloudMusicRequestState m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
     // Tracked separately from m_lastCloudSearchState/m_lastCloudPlaylistState
     // -- a resolve (triggered by tapping a track row) overlays its own

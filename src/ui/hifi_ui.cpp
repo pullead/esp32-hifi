@@ -1024,6 +1024,24 @@ void HifiUi::show(Page page) {
     else buildPlaceholder("SETTINGS / EQ", "Audio, EQ, network and sleep");
 }
 
+void HifiUi::showKeepingStack(Page page) {
+    const Page prev = m_page;
+    if (page == prev) return;
+    // Push `prev` unconditionally so back navigation returns here, even
+    // when `page` is an ancestor of the current page in the stack (normal
+    // show() would truncate the stack to that ancestor, so a later swipe
+    // back would land on Home instead of the cloud player).
+    if (!(m_pageStackDepth && m_pageStack[m_pageStackDepth - 1] == prev)) {
+        if (m_pageStackDepth >= kPageStackCapacity) {
+            memmove(m_pageStack, m_pageStack + 1, sizeof(Page) * (kPageStackCapacity - 1));
+            m_pageStackDepth = kPageStackCapacity - 1;
+        }
+        m_pageStack[m_pageStackDepth++] = prev;
+    }
+    m_navigatingBack = true; // suppresses show()'s own push/truncate
+    show(page);
+}
+
 void HifiUi::navigateBack() {
     if (m_pageStackDepth) {
         const Page target = m_pageStack[--m_pageStackDepth];
@@ -4602,7 +4620,7 @@ void HifiUi::loadCloudCover() {
         clearCoverArt();
         strlcpy(m_cloudCoverTrackId, track.id, sizeof(m_cloudCoverTrackId));
         m_cloudCoverReady = false;
-        playerService.cloudNowPlayingCoverStart();
+        playerService.cloudNowPlayingCoverStart(m_cloudCurrentPlaylistCover);
     }
     if (!m_cloudCoverReady) {
         const uint32_t now = lv_tick_get();
@@ -4611,7 +4629,10 @@ void HifiUi::loadCloudCover() {
     }
     uint16_t* pixels = nullptr;
     uint16_t w = 0, h = 0;
-    if (playerService.cloudNowPlayingCoverDecode(8, &pixels, &w, &h) && pixels && w && h) {
+    // Scale 4 (not 8): a typical 300px cover decodes to ~75px, close to the
+    // 72px slot -- scale 8 would leave a small 37px thumbnail that gets
+    // upscaled and looks wrong (the "封面没铺满" complaint).
+    if (playerService.cloudNowPlayingCoverDecode(4, &pixels, &w, &h) && pixels && w && h) {
         clearCoverArt();
         m_coverArtPixels = pixels;
         m_coverArtDsc.header.cf = LV_IMG_CF_TRUE_COLOR;
@@ -4666,9 +4687,11 @@ void HifiUi::buildCloudNowPlaying() {
         lv_img_set_src(m_coverArtImg, &m_coverArtDsc);
         lv_img_set_pivot(m_coverArtImg, 0, 0);
         const uint16_t longest = m_coverArtDsc.header.w > m_coverArtDsc.header.h ? m_coverArtDsc.header.w : m_coverArtDsc.header.h;
-        if (longest > 72) lv_img_set_zoom(m_coverArtImg, static_cast<uint16_t>(256u * 72 / longest));
-        lv_obj_set_pos(m_coverArtImg, 0, 0);
-        lv_obj_center(m_coverArtImg);
+        // Always scale to the 72px slot (up or down), not just when the
+        // decoded image is larger -- a smaller cover used to sit in the
+        // corner as a thumbnail ("封面没有铺满").
+        lv_img_set_zoom(m_coverArtImg, static_cast<uint16_t>(256u * 72 / longest));
+        lv_obj_align(m_coverArtImg, LV_ALIGN_TOP_LEFT, 0, 0);
         lv_obj_clear_flag(m_coverArtImg, LV_OBJ_FLAG_CLICKABLE);
     } else {
         m_cover = lv_obj_create(card);
@@ -4823,8 +4846,28 @@ void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
         m_pendingNavigateSet = true;
     }
 
-    if (m_title) lv_label_set_text(m_title, state.title[0] ? state.title : "未在播放");
-    if (m_detail) lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+    if (m_title) {
+        if (state.source == PlayerSource::CloudMusic) {
+            lv_label_set_text(m_title, state.title[0] ? state.title : "未在播放");
+        } else {
+            // Not playing yet (user just tapped a track): mirror the
+            // resolve lifecycle so the page gives instant feedback --
+            // 正在连接… while resolve runs, 连接失败 + reason on error.
+            const CloudMusicRequestState rs = playerService.cloudMusicResolveState();
+            if (rs == CloudMusicRequestState::Loading) lv_label_set_text(m_title, "正在连接…");
+            else if (rs == CloudMusicRequestState::Error) lv_label_set_text(m_title, "连接失败");
+            else lv_label_set_text(m_title, "未在播放");
+        }
+    }
+    if (m_detail) {
+        if (state.source == PlayerSource::CloudMusic) {
+            lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+        } else {
+            const CloudMusicRequestState rs = playerService.cloudMusicResolveState();
+            if (rs == CloudMusicRequestState::Error) lv_label_set_text(m_detail, cloudErrToCn(playerService.cloudMusicLastError()));
+            else lv_label_set_text(m_detail, "");
+        }
+    }
     if (m_elapsed) {
         char elapsed[16];
         formatTime(elapsed, sizeof(elapsed), state.positionSeconds);
@@ -4883,6 +4926,9 @@ void HifiUi::onCloudMusicPlaylistOpenAction(lv_event_t* event) {
     if (!playerService.cloudMusicHotPlaylist(index, &item)) return;
     strlcpy(s_instance->m_cloudSelectedPlaylistId, item.id, sizeof(s_instance->m_cloudSelectedPlaylistId));
     strlcpy(s_instance->m_cloudSelectedPlaylistName, item.name, sizeof(s_instance->m_cloudSelectedPlaylistName));
+    // Remember this playlist's cover as the now-playing fallback for tracks
+    // that have no album art of their own.
+    strlcpy(s_instance->m_cloudCurrentPlaylistCover, item.coverUrl, sizeof(s_instance->m_cloudCurrentPlaylistCover));
     s_instance->show(Page::CloudMusicPlaylist);
 }
 
@@ -4924,12 +4970,13 @@ void HifiUi::onCloudMusicTrackRowAction(lv_event_t* event) {
     if (!found || !item.id[0]) return;
     s_instance->m_cloudQueueIndex = index;
     playerService.cloudMusicPlayTrackStart(item.id);
-    // Immediate feedback before the async resolve completes -- both list
-    // pages' refresh functions poll cloudMusicResolveState() each tick and
-    // will replace this with an error message (or clear it) once resolve
-    // finishes, same overlay-on-m_cloudListHint mechanism the loading/error
-    // states already use.
-    if (s_instance->m_cloudListHint) lv_label_set_text(s_instance->m_cloudListHint, "正在解析播放地址…");
+    // Jump straight to the cloud player page: resolve can take a while when
+    // the upstream is cold, and sitting on the list with only a small hint
+    // reads as "点歌没反应". The player page shows 正在连接… until playback
+    // starts (or the resolve error, if it fails) -- see
+    // refreshCloudNowPlaying. Event-handler context, so a direct show() is
+    // safe (unlike inside refresh()).
+    s_instance->show(Page::CloudNowPlaying);
 }
 
 void HifiUi::onCloudCategoryAction(lv_event_t* event) {
@@ -4964,6 +5011,7 @@ void HifiUi::onCloudRankingRowAction(lv_event_t* event) {
     if (!playerService.cloudMusicRanking(index, &item)) return;
     strlcpy(s_instance->m_cloudSelectedPlaylistId, item.id, sizeof(s_instance->m_cloudSelectedPlaylistId));
     strlcpy(s_instance->m_cloudSelectedPlaylistName, item.name, sizeof(s_instance->m_cloudSelectedPlaylistName));
+    strlcpy(s_instance->m_cloudCurrentPlaylistCover, item.coverUrl, sizeof(s_instance->m_cloudCurrentPlaylistCover));
     s_instance->show(Page::CloudMusicPlaylist); // a NetEase ranking id IS a playlist id
 }
 
@@ -5018,10 +5066,17 @@ void HifiUi::onCloudTransportAction(lv_event_t* event) {
             }
         }
         if (s_instance->m_playIcon) lv_label_set_text(s_instance->m_playIcon, showPause ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
-    } else if (action == 100) { // LIST -> online-music categories
-        s_instance->show(Page::CloudMusicHome);
-    } else if (action == 101) { // close -> Home
-        s_instance->show(Page::Home);
+    } else if (action == 100) {
+        // LIST -> the list the current track came from (playlist detail /
+        // search results / new songs). showKeepingStack() preserves the
+        // player in the page stack so a swipe back returns HERE, not Home
+        // (plain show() would truncate the stack to the ancestor).
+        if (s_instance->m_cloudQueueSource == CloudQueueSource::Search) s_instance->showKeepingStack(Page::CloudMusicSearch);
+        else if (s_instance->m_cloudQueueSource == CloudQueueSource::Playlist) s_instance->showKeepingStack(Page::CloudMusicPlaylist);
+        else if (s_instance->m_cloudQueueSource == CloudQueueSource::NewSongs) s_instance->showKeepingStack(Page::CloudNewSongs);
+        else s_instance->showKeepingStack(Page::CloudMusicHome);
+    } else if (action == 101) { // home icon -> online-music categories (stack preserved)
+        s_instance->showKeepingStack(Page::CloudMusicHome);
     }
 }
 

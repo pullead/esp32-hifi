@@ -4534,6 +4534,10 @@ bool playerCoreCloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor
 // tracks never shows a stale cached cover). Missing/dead covers fall back
 // to the UI's music-note tile.
 static bool s_cloudNowPlayingCoverRequested = false;
+// Fallback URL copied at start() time -- used when the track itself has no
+// album art (the UI passes the cover of the playlist/ranking the track
+// came from).
+static char s_cloudNowPlayingCoverFallback[200] = "";
 
 static void cloudNowPlayingCoverTask(void*) {
     if (!SD_MMC.exists("/cloudimg")) SD_MMC.mkdir("/cloudimg");
@@ -4542,20 +4546,23 @@ static void cloudNowPlayingCoverTask(void*) {
     if (track.id[0]) {
         char sdPath[48];
         snprintf(sdPath, sizeof(sdPath), "/cloudimg/np_%s.jpg", track.id);
-        cloudThumbDownloadOne(track.coverUrl, sdPath);
+        const char* url = track.coverUrl[0] ? track.coverUrl : s_cloudNowPlayingCoverFallback;
+        cloudThumbDownloadOne(url, sdPath);
     }
     s_cloudNowPlayingCoverRequested = false;
     vTaskDelete(nullptr);
 }
 
-void playerCoreCloudNowPlayingCoverStart() {
+void playerCoreCloudNowPlayingCoverStart(const char* fallbackUrl) {
     if (s_cloudNowPlayingCoverRequested) return;
     CloudTrackItem track{};
     if (!playerCoreCloudMusicNowPlayingTrack(&track) || !track.id[0]) return;
+    strlcpy(s_cloudNowPlayingCoverFallback, fallbackUrl ? fallbackUrl : "", sizeof(s_cloudNowPlayingCoverFallback));
     char sdPath[48];
     snprintf(sdPath, sizeof(sdPath), "/cloudimg/np_%s.jpg", track.id);
-    if (SD_MMC.exists(sdPath) || !track.coverUrl[0]) {
-        if (!track.coverUrl[0] && !SD_MMC.exists(sdPath)) {
+    const char* url = track.coverUrl[0] ? track.coverUrl : s_cloudNowPlayingCoverFallback;
+    if (SD_MMC.exists(sdPath) || !url[0]) {
+        if (!url[0] && !SD_MMC.exists(sdPath)) {
             File marker = SD_MMC.open(sdPath, "w", true);
             if (marker) marker.close();
         }

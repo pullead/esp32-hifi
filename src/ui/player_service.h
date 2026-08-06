@@ -357,7 +357,9 @@ class PlayerService {
     bool cloudThumbSyncInProgress() const;
     bool cloudThumbDecode(uint8_t kind, uint8_t index, uint8_t scaleFactor, uint16_t** outPixels,
                           uint16_t* outWidth, uint16_t* outHeight) const;
-    void cloudNowPlayingCoverStart();
+    // fallbackUrl: used when the current cloud track has no album art --
+    // the UI passes the cover of the playlist/ranking the track came from.
+    void cloudNowPlayingCoverStart(const char* fallbackUrl = nullptr);
     // Decodes /cloudimg/np_<trackId>.jpg for the currently playing cloud
     // track (keyed by track id so switching tracks never shows a stale
     // cached cover).
