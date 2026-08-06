@@ -105,7 +105,7 @@ class HifiUi {
     static void onCloudRankingRowAction(lv_event_t* event);
     static void onCloudLanguageAction(lv_event_t* event);
     static void onCloudTransportAction(lv_event_t* event);
-    static void onCloudHomeAction(lv_event_t* event);
+    static void onCloudLyricRetryAction(lv_event_t* event);
     static void onQuickVolumeAction(lv_event_t* event);
     static void onQuickBrightnessAction(lv_event_t* event);
     static void onQuickEqAction(lv_event_t* event);
@@ -512,6 +512,10 @@ class HifiUi {
     char m_cloudCoverTrackId[24]{};
     bool m_cloudCoverReady = false;
     uint32_t m_lastCloudCoverRetry = 0;
+    // Which cloud track's lyrics were last requested (mirrors
+    // m_cloudCoverTrackId -- used to trigger the async fetch once per
+    // track change).
+    char m_cloudLyricsTrackId[24]{};
 
     // Settings > WiFi list mode: saved networks only (from NVS) -- no
     // on-device scanning. Discovering/adding brand-new networks moved to

@@ -87,6 +87,10 @@ extern void playerCoreCloudNowPlayingCoverStart(const char* fallbackUrl);
 extern bool playerCoreCloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth,
                                                  uint16_t* outHeight);
 extern bool playerCoreCloudMusicNowPlayingTrack(CloudTrackItem* item);
+extern void playerCoreCloudMusicLyricsStart(const char* trackId);
+extern uint8_t playerCoreCloudMusicLyricsState();
+extern bool playerCoreCloudMusicLyricsForTrack(const char* trackId);
+extern const char* playerCoreCloudMusicCurrentLyricLine(uint32_t positionMs);
 extern bool playerCoreCloudMusicPlayTrackStart(const char* trackId);
 extern uint8_t playerCoreCloudMusicResolveState();
 extern bool playerCoreCloudMusicJustStarted();
@@ -414,6 +418,20 @@ bool PlayerService::cloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** o
 
 bool PlayerService::cloudMusicNowPlayingTrack(CloudTrackItem* item) const {
     return playerCoreCloudMusicNowPlayingTrack(item);
+}
+
+void PlayerService::cloudMusicLyricsStart(const char* trackId) { playerCoreCloudMusicLyricsStart(trackId); }
+
+CloudLyricsState PlayerService::cloudMusicLyricsState() const {
+    return static_cast<CloudLyricsState>(playerCoreCloudMusicLyricsState());
+}
+
+bool PlayerService::cloudMusicLyricsForTrack(const char* trackId) const {
+    return playerCoreCloudMusicLyricsForTrack(trackId);
+}
+
+const char* PlayerService::cloudMusicCurrentLyricLine(uint32_t positionMs) const {
+    return playerCoreCloudMusicCurrentLyricLine(positionMs);
 }
 
 bool PlayerService::cloudMusicPlayTrackStart(const char* trackId) {

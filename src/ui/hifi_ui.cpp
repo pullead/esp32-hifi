@@ -4712,10 +4712,15 @@ void HifiUi::buildCloudNowPlaying() {
     lv_label_set_long_mode(m_title, LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_obj_set_width(m_title, 216);
 
-    // Artist line (no cloud lyrics exist, unlike local playback).
+    // Detail line: shows the current lyric line once 网易云 lyrics are
+    // loaded (same interaction as local playback), the artist until then,
+    // and a tap-to-retry hint when the lookup failed. Clickable so a
+    // NotFound/Error tap re-queues the fetch (see onCloudLyricRetryAction).
     m_detail = makeText(card, "", &lv_font_cjk_13, kAccentBright, LV_ALIGN_TOP_LEFT, 80, 19);
     lv_label_set_long_mode(m_detail, LV_LABEL_LONG_DOT);
     lv_obj_set_width(m_detail, 216);
+    lv_obj_add_flag(m_detail, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(m_detail, onCloudLyricRetryAction, LV_EVENT_CLICKED, nullptr);
 
     m_elapsed = makeText(card, "00:00", &lv_font_montserrat_12, kInkDim, LV_ALIGN_TOP_LEFT, 0, 76);
     lv_obj_set_width(m_elapsed, 72);
@@ -4834,6 +4839,14 @@ void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
         for (auto& band : state.spectrumBands) band = 0;
         state.positionSeconds = 0;
         state.durationSeconds = 0;
+    } else {
+        // A cloud track is playing: kick off the async 网易云 lyrics fetch
+        // once per track change (the core no-ops if already loaded).
+        CloudTrackItem cur{};
+        if (playerService.cloudMusicNowPlayingTrack(&cur) && cur.id[0] && strcmp(m_cloudLyricsTrackId, cur.id) != 0) {
+            strlcpy(m_cloudLyricsTrackId, cur.id, sizeof(m_cloudLyricsTrackId));
+            playerService.cloudMusicLyricsStart(cur.id);
+        }
     }
 
     // Cover may have landed since this page was built -- if so, rebuild the
@@ -4861,7 +4874,19 @@ void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
     }
     if (m_detail) {
         if (state.source == PlayerSource::CloudMusic) {
-            lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+            CloudTrackItem cur{};
+            const bool hasTrack = playerService.cloudMusicNowPlayingTrack(&cur) && cur.id[0];
+            if (hasTrack && playerService.cloudMusicLyricsForTrack(cur.id)) {
+                // Current lyric line -- same interaction as local playback.
+                const char* lyric = playerService.cloudMusicCurrentLyricLine(state.positionSeconds * 1000UL);
+                lv_label_set_text(m_detail, (lyric && lyric[0]) ? lyric : "");
+            } else {
+                const CloudLyricsState ls = playerService.cloudMusicLyricsState();
+                if (ls == CloudLyricsState::Loading) lv_label_set_text(m_detail, "正在加载歌词…");
+                else if (ls == CloudLyricsState::NotFound) lv_label_set_text(m_detail, "未找到歌词,点击重试");
+                else if (ls == CloudLyricsState::Error) lv_label_set_text(m_detail, "歌词加载失败,点击重试");
+                else lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+            }
         } else {
             const CloudMusicRequestState rs = playerService.cloudMusicResolveState();
             if (rs == CloudMusicRequestState::Error) lv_label_set_text(m_detail, cloudErrToCn(playerService.cloudMusicLastError()));
@@ -5078,6 +5103,17 @@ void HifiUi::onCloudTransportAction(lv_event_t* event) {
     } else if (action == 101) { // home icon -> online-music categories (stack preserved)
         s_instance->showKeepingStack(Page::CloudMusicHome);
     }
+}
+
+void HifiUi::onCloudLyricRetryAction(lv_event_t* event) {
+    (void)event;
+    if (!s_instance) return;
+    const CloudLyricsState ls = playerService.cloudMusicLyricsState();
+    if (ls != CloudLyricsState::NotFound && ls != CloudLyricsState::Error) return; // only act on a failed lookup
+    CloudTrackItem cur{};
+    if (!playerService.cloudMusicNowPlayingTrack(&cur) || !cur.id[0]) return;
+    strlcpy(s_instance->m_cloudLyricsTrackId, cur.id, sizeof(s_instance->m_cloudLyricsTrackId));
+    playerService.cloudMusicLyricsStart(cur.id); // core re-queues (not Loaded yet)
 }
 
 void HifiUi::buildAudioTopBar(const char* title, const char* rightText, bool rightOk, const char* rightIcon) {

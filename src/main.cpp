@@ -4607,6 +4607,133 @@ bool playerCoreCloudNowPlayingCoverDecode(uint8_t scaleFactor, uint16_t** outPix
     return ok;
 }
 
+// ---- Cloud lyrics (网易云网络歌词) -----------------------------------------
+// Fetched once per track from the gateway's /esp/v1/tracks/<id>/lyrics
+// (upstream /lyric -> parsed LRC) and kept in PSRAM -- separate storage and
+// state from the LOCAL player's lyrics (ID3 SYLT + lrclib.net), but the UI
+// interaction is the same: currentLyricLine(positionMs) drives the detail
+// row on the cloud now-playing page.
+static constexpr uint16_t kCloudMaxLyricLines = 80;
+struct CloudLyricLine {
+    uint32_t ms = 0;
+    char text[96]{};
+};
+static CloudLyricLine* s_cloudLyricLines = nullptr; // PSRAM, allocated in setup()
+static uint16_t s_cloudLyricCount = 0;
+static char s_cloudLyricTrackId[24] = "";
+static uint8_t s_cloudLyricsState = 0; // CloudLyricsState
+static uint32_t s_cloudLyricGeneration = 0;
+
+static void cloudLyricsFetchTask(void* param) {
+    const uint32_t generation = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(param));
+    String trackId;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        trackId = s_cloudLyricTrackId;
+        s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Loading);
+        cloudResultUnlock();
+    }
+    if (!trackId.length() || !WiFi.isConnected()) {
+        if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+            if (generation == s_cloudLyricGeneration) s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Error);
+            cloudResultUnlock();
+        }
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    char path[80];
+    snprintf(path, sizeof(path), "/esp/v1/tracks/%s/lyrics", trackId.c_str());
+    String body;
+    bool ok = false;
+    // Small local retry loop -- cloudMusicHttpGetWithRetry is tied to the
+    // browse command generation, which must not abort this fetch.
+    for (uint8_t attempt = 0; attempt < 3 && !ok; ++attempt) {
+        ok = cloudMusicHttpGet(path, body);
+        if (!ok && attempt + 1 < 3) vTaskDelay(pdMS_TO_TICKS(3000));
+    }
+
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        if (generation != s_cloudLyricGeneration) {
+            cloudResultUnlock();
+            vTaskDelete(nullptr);
+            return;
+        }
+        s_cloudLyricCount = 0;
+        if (!ok) {
+            s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Error);
+        } else {
+            String items[kCloudMaxLyricLines];
+            const uint8_t n = jsonArrayItems(body, "synced", items, kCloudMaxLyricLines);
+            if (s_cloudLyricLines && n) {
+                for (uint8_t i = 0; i < n; ++i) {
+                    double ms = 0;
+                    String text;
+                    if (jsonNumber(items[i], "time_ms", &ms) && jsonStringField(items[i], "text", text) && text.length()) {
+                        s_cloudLyricLines[s_cloudLyricCount].ms = static_cast<uint32_t>(ms);
+                        strlcpy(s_cloudLyricLines[s_cloudLyricCount].text, text.c_str(), sizeof(s_cloudLyricLines[0].text));
+                        cloudTextSanitize(s_cloudLyricLines[s_cloudLyricCount].text);
+                        ++s_cloudLyricCount;
+                    }
+                }
+            }
+            s_cloudLyricsState = static_cast<uint8_t>(s_cloudLyricCount ? CloudLyricsState::Loaded : CloudLyricsState::NotFound);
+        }
+        cloudResultUnlock();
+    }
+    vTaskDelete(nullptr);
+}
+
+void playerCoreCloudMusicLyricsStart(const char* trackId) {
+    if (!trackId || !trackId[0]) return;
+    if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+        if (strcmp(s_cloudLyricTrackId, trackId) == 0 && s_cloudLyricsState == static_cast<uint8_t>(CloudLyricsState::Loaded)) {
+            cloudResultUnlock();
+            return; // already have this track's lyrics
+        }
+        strlcpy(s_cloudLyricTrackId, trackId, sizeof(s_cloudLyricTrackId));
+        s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Loading);
+        const uint32_t generation = ++s_cloudLyricGeneration;
+        cloudResultUnlock();
+        if (xTaskCreate(cloudLyricsFetchTask, "cloudLyr", 8192,
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(generation)), 1, nullptr) != pdPASS) {
+            if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Error);
+                cloudResultUnlock();
+            }
+            MWR_LOG_ERROR("Failed to create cloud lyrics fetch task");
+        }
+    }
+}
+
+uint8_t playerCoreCloudMusicLyricsState() { return s_cloudLyricsState; }
+
+bool playerCoreCloudMusicLyricsForTrack(const char* trackId) {
+    if (!trackId || !trackId[0]) return false;
+    bool ok = false;
+    if (cloudResultLock()) {
+        ok = s_cloudLyricsState == static_cast<uint8_t>(CloudLyricsState::Loaded) && strcmp(s_cloudLyricTrackId, trackId) == 0;
+        cloudResultUnlock();
+    }
+    return ok;
+}
+
+const char* playerCoreCloudMusicCurrentLyricLine(uint32_t positionMs) {
+    static char lineBuf[96];
+    lineBuf[0] = '\0';
+    if (cloudResultLock()) {
+        if (s_cloudLyricLines && s_cloudLyricCount && s_cloudLyricsState == static_cast<uint8_t>(CloudLyricsState::Loaded)) {
+            int32_t idx = -1;
+            for (uint16_t i = 0; i < s_cloudLyricCount; ++i) {
+                if (s_cloudLyricLines[i].ms <= positionMs) idx = i;
+                else break;
+            }
+            if (idx >= 0) strlcpy(lineBuf, s_cloudLyricLines[idx].text, sizeof(lineBuf));
+        }
+        cloudResultUnlock();
+    }
+    return lineBuf;
+}
+
 // Consume-once (same idiom as playerCoreLyricsOnlineReady): true exactly
 // once per successfully-started cloud track, after which PlayerService::
 // tick() has applied *outTrack to the snapshot and this returns false again
@@ -5255,7 +5382,8 @@ void setup() {
     s_cloudPlaylistTracks = static_cast<CloudTrackItem*>(ps_malloc(sizeof(CloudTrackItem) * kCloudPlaylistTrackMax));
     s_cloudRankings = static_cast<CloudRankingItem*>(ps_malloc(sizeof(CloudRankingItem) * kCloudRankingMax));
     s_cloudNewSongs = static_cast<CloudTrackItem*>(ps_malloc(sizeof(CloudTrackItem) * kCloudNewSongMax));
-    if (!s_cloudSearchResults || !s_cloudHotPlaylists || !s_cloudPlaylistTracks || !s_cloudRankings || !s_cloudNewSongs) {
+    s_cloudLyricLines = static_cast<CloudLyricLine*>(ps_malloc(sizeof(CloudLyricLine) * kCloudMaxLyricLines));
+    if (!s_cloudSearchResults || !s_cloudHotPlaylists || !s_cloudPlaylistTracks || !s_cloudRankings || !s_cloudNewSongs || !s_cloudLyricLines) {
         MWR_LOG_ERROR("Failed to allocate cloud music result arrays (PSRAM)");
     }
     // This task runs the full TLS resolve HTTP request AND

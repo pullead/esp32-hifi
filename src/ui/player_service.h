@@ -11,6 +11,10 @@ enum class PlayerTransport : uint8_t { Stopped, Buffering, Playing, Paused, Erro
 // PlayerService::lyricsFetchState() to show "查询中"/"点击重试" instead of a
 // blanket "没有歌词信息".
 enum class LyricFetchState : uint8_t { Idle, Pending, Found, NotFound };
+// Lifecycle for the online player's lyrics (网易云网络歌词, fetched from the
+// gateway's /esp/v1/tracks/<id>/lyrics) -- separate from LyricFetchState,
+// which tracks the LOCAL player's lrclib.net lookups.
+enum class CloudLyricsState : uint8_t { Idle, Loading, Loaded, NotFound, Error };
 enum class UsbStorageState : uint8_t { Idle, Mounting, Mounted, Restoring, Scanning, Error, Unsupported };
 
 // Render Music Gateway connection lifecycle (see docs spec section 8.1).
@@ -368,6 +372,16 @@ class PlayerService {
     // Copy of the last resolved cloud track (title/artist/cover etc.),
     // non-consuming -- the UI reads it for the now-playing page.
     bool cloudMusicNowPlayingTrack(CloudTrackItem* item) const;
+
+    // Online lyrics (网易云): async fetch for the given track id (guarded,
+    // no-op if already loaded for that id); currentLyricLine() returns the
+    // line active at positionMs, mirroring the local player's interaction.
+    void cloudMusicLyricsStart(const char* trackId);
+    CloudLyricsState cloudMusicLyricsState() const;
+    const char* cloudMusicCurrentLyricLine(uint32_t positionMs) const;
+    // True when the loaded lyrics belong to this track id (so a stale
+    // result from a previous track is ignored).
+    bool cloudMusicLyricsForTrack(const char* trackId) const;
 
     // Phase 4: resolve + play (see main.cpp's cloudMusicControllerTask).
     // Mutual exclusion with Radio/Sd works the same way playRadioUrl()/
