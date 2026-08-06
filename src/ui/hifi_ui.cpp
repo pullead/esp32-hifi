@@ -3830,6 +3830,11 @@ void HifiUi::buildCloudMusicHome() {
     buildAudioTopBar("在线音乐", nullptr, false, nullptr);
     lv_obj_t* screen = lv_scr_act();
 
+    // Kick off (or no-op if one's already running) the two-stage wake so
+    // browsing right after entering this page doesn't 502 against a
+    // still-cold Render upstream -- same trigger the settings page uses.
+    playerService.cloudMusicWakeStart();
+
     lv_obj_t* searchBtn = lv_btn_create(screen);
     lv_obj_set_pos(searchBtn, 280, 2);
     lv_obj_set_size(searchBtn, 34, 20);

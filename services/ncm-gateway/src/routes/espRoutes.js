@@ -96,6 +96,19 @@ router.get(
   })
 );
 
+// GET /esp/v1/wake -- called by the device right after /health succeeds, so
+// the cold-sleeping upstream api-enhanced is awake (and the hot-playlists
+// cache primed) before the user starts browsing. Blocks until the upstream
+// answers or the 90s wake timeout elapses.
+router.get(
+  '/wake',
+  rateLimit('metadata', config.rateLimitMetadataPerMin),
+  withValidation(async (req, res) => {
+    await ncmProvider.wake();
+    res.json({ ok: true });
+  })
+);
+
 router.get(
   '/playlists/:id',
   rateLimit('metadata', config.rateLimitMetadataPerMin),

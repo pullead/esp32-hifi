@@ -29,7 +29,7 @@ function assertConfigured() {
   }
 }
 
-async function upstreamGet(path, params) {
+async function upstreamGet(path, params, timeoutMs) {
   assertConfigured();
   const url = new URL(config.ncmUpstreamUrl + path);
   for (const [key, value] of Object.entries(params || {})) {
@@ -45,7 +45,7 @@ async function upstreamGet(path, params) {
   if (config.ncmCookie) url.searchParams.set('cookie', config.ncmCookie);
 
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.upstreamTimeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs || config.upstreamTimeoutMs);
   let response;
   try {
     response = await fetch(url, { signal: controller.signal });
@@ -193,6 +193,17 @@ async function newSongs(limit, offset) {
   return { items, offset, has_more: offset + items.length < total };
 }
 
+// Wakes a sleeping Render free-tier upstream (api-enhanced) so the device's
+// first browse after idle succeeds instead of 502ing. /top/playlist is the
+// exact endpoint the device's hot-playlist page browses, so warming it also
+// primes the gateway's hotPlaylistsCache. Uses a long timeout because a
+// cold Render instance takes 30-90s to answer -- the device's wake task
+// blocks on this endpoint until the upstream is genuinely ready.
+async function wake() {
+  await upstreamGet('/top/playlist', { limit: 1 }, 90000);
+  return true;
+}
+
 // stream.url validation -- spec 5.4/11: must be a direct CDN URL, http(s)
 // only, never this gateway's own host, never a playlist/manifest/HTML
 // format. This is checked here (closest to where the URL enters the
@@ -305,6 +316,7 @@ module.exports = {
   playlistDetail,
   rankings,
   newSongs,
+  wake,
   resolveTrack,
   lyrics,
 };

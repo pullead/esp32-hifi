@@ -3509,12 +3509,39 @@ static bool cloudMusicHealthCheckOnce(const CloudMusicConfig& cfg) {
     return ok;
 }
 
-// Cold-start wake sequence (spec 8.2): try immediately, then retry every 7s,
-// for up to ~70s total, before giving up as Offline. Runs on its own
-// one-shot task (mirrors radioIconSyncTask/wifiScanTask's pattern) so the
-// LVGL thread never blocks on network I/O -- the UI polls
-// playerCoreCloudServiceState() the same way it already polls
-// UsbStorageState for USB MSC mount progress.
+// Second wake stage: the gateway being up doesn't mean the upstream
+// api-enhanced is -- Render's free tier sleeps BOTH services, and a browse
+// against a still-cold upstream returns HTTP 502 in <1s (Render's
+// cold-start proxy answer), so the device's retry window can't wait it out.
+// The gateway's /esp/v1/wake blocks until the upstream genuinely answers
+// (up to ~90s), so this call is what actually turns "已连接" into "browse
+// will work". HTTP timeout must exceed the gateway's own wake timeout.
+static bool cloudMusicWakeUpstreamOnce(const CloudMusicConfig& cfg) {
+    if (!WiFi.isConnected() || !cfg.configured) return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    const String url = String(cfg.baseUrl) + "/esp/v1/wake";
+    if (!http.begin(client, url)) return false;
+    http.setTimeout(95000); // longer than the gateway's 90s upstream-wake budget
+    http.addHeader("X-Device-Key", cfg.deviceKey);
+    const int code = http.GET();
+    bool ok = false;
+    if (code == HTTP_CODE_OK) {
+        const String body = http.getString();
+        ok = body.indexOf("\"ok\":true") >= 0 || body.indexOf("\"ok\": true") >= 0;
+    }
+    http.end();
+    return ok;
+}
+
+// Cold-start wake sequence (spec 8.2): stage 1 is the gateway's own health
+// (retry every 7s, ~70s budget); stage 2 warms the cold-sleeping upstream
+// api-enhanced via /esp/v1/wake (up to ~190s total) so the first browse
+// doesn't 502. Runs on its own one-shot task (mirrors
+// radioIconSyncTask/wifiScanTask's pattern) so the LVGL thread never blocks
+// on network I/O -- the UI polls playerCoreCloudServiceState() the same way
+// it already polls UsbStorageState for USB MSC mount progress.
 static void cloudMusicWakeTask(void*) {
     const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
     if (!cfg.configured) {
@@ -3524,15 +3551,31 @@ static void cloudMusicWakeTask(void*) {
         return;
     }
     s_cloudServiceState = CloudServiceState::Waking;
-    const uint32_t deadlineMs = millis() + 70000;
+    // Two-stage wake: up to ~70s for the gateway's own health, then up to
+    // ~180s total for the upstream api-enhanced to come back from Render's
+    // cold sleep (the /esp/v1/wake call itself blocks on the gateway).
+    const uint32_t deadlineMs = millis() + 190000;
     bool ready = false;
+    bool upstreamReady = false;
     for (;;) {
         ready = cloudMusicHealthCheckOnce(cfg);
         printf("[CLOUDMUSIC] health check %s\n", ready ? "ok" : "failed");
         if (ready || millis() >= deadlineMs) break;
         vTaskDelay(pdMS_TO_TICKS(7000));
     }
-    s_cloudServiceState = ready ? CloudServiceState::Ready : CloudServiceState::Offline;
+    if (ready) {
+        // Gateway is up -- now warm the sleeping upstream so the first
+        // browse/resolve doesn't 502. Retry until it answers or the
+        // deadline passes (the gateway itself retries upstream internally
+        // for up to 90s per call, so a few attempts cover Render's worst
+        // cold-start).
+        while (!upstreamReady && millis() < deadlineMs) {
+            upstreamReady = cloudMusicWakeUpstreamOnce(cfg);
+            printf("[CLOUDMUSIC] upstream warm %s\n", upstreamReady ? "ok" : "failed");
+            if (!upstreamReady) vTaskDelay(pdMS_TO_TICKS(5000));
+        }
+    }
+    s_cloudServiceState = (ready && upstreamReady) ? CloudServiceState::Ready : CloudServiceState::Offline;
     s_cloudWakeTaskRunning = false;
     vTaskDelete(nullptr);
 }
