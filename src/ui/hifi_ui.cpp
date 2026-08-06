@@ -126,8 +126,8 @@ static const char* cloudErrToCn(const char* msg) {
 static void addCloudVipBadge(lv_obj_t* row, const CloudTrackItem& item) {
     if (!item.vip && !item.paid) return;
     lv_obj_t* badge = lv_obj_create(row);
-    lv_obj_set_pos(badge, 250, 9);
     lv_obj_set_size(badge, 32, 14);
+    lv_obj_align(badge, LV_ALIGN_RIGHT_MID, -10, 0);
     lv_obj_set_style_radius(badge, 7, 0);
     lv_obj_set_style_bg_color(badge, item.vip ? kMagenta : lv_color_hex(0xF59E0B), 0);
     lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
@@ -3986,8 +3986,8 @@ void HifiUi::refreshCloudHotPlaylists() {
         CloudPlaylistItem item{};
         if (!playerService.cloudMusicHotPlaylist(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 40);
-        lv_obj_set_size(row, 288, 36);
+        lv_obj_set_pos(row, 0, i * 44);
+        lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 10, 0);
         lv_obj_set_style_bg_color(row, kPanel, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -4034,15 +4034,15 @@ void HifiUi::refreshCloudHotPlaylists() {
             lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
         }
 
-        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 40, 2);
-        lv_obj_set_width(nameLabel, 235);
+        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 40, -10);
+        lv_obj_set_width(nameLabel, 205);
         lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(nameLabel, LV_OBJ_FLAG_CLICKABLE);
 
         char sub[64];
         snprintf(sub, sizeof(sub), "%s · %u首", item.creator[0] ? item.creator : "歌单", item.trackCount);
-        lv_obj_t* subLabel = makeText(row, sub, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 40, -3);
-        lv_obj_set_width(subLabel, 235);
+        lv_obj_t* subLabel = makeText(row, sub, &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 40, 10);
+        lv_obj_set_width(subLabel, 205);
         lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(subLabel, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -4127,8 +4127,8 @@ void HifiUi::refreshCloudRankings() {
         CloudRankingItem item{};
         if (!playerService.cloudMusicRanking(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 40);
-        lv_obj_set_size(row, 288, 36);
+        lv_obj_set_pos(row, 0, i * 44);
+        lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 10, 0);
         lv_obj_set_style_bg_color(row, kPanel, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -4174,13 +4174,13 @@ void HifiUi::refreshCloudRankings() {
             lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
         }
 
-        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 40, 2);
-        lv_obj_set_width(nameLabel, 235);
+        lv_obj_t* nameLabel = makeText(row, item.name, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 40, -10);
+        lv_obj_set_width(nameLabel, 205);
         lv_label_set_long_mode(nameLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(nameLabel, LV_OBJ_FLAG_CLICKABLE);
 
-        lv_obj_t* subLabel = makeText(row, item.updateFreq[0] ? item.updateFreq : "官方榜单", &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 40, -3);
-        lv_obj_set_width(subLabel, 235);
+        lv_obj_t* subLabel = makeText(row, item.updateFreq[0] ? item.updateFreq : "官方榜单", &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 40, 10);
+        lv_obj_set_width(subLabel, 205);
         lv_label_set_long_mode(subLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(subLabel, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -4254,8 +4254,8 @@ void HifiUi::refreshCloudNewSongs() {
         CloudTrackItem item{};
         if (!playerService.cloudMusicNewSong(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 36);
-        lv_obj_set_size(row, 288, 32);
+        lv_obj_set_pos(row, 0, i * 44);
+        lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 8, 0);
         lv_obj_set_style_bg_color(row, kPanel, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -4266,14 +4266,14 @@ void HifiUi::refreshCloudNewSongs() {
         addPressFx(row);
         lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
-        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
-        lv_obj_set_width(titleLabel, item.vip || item.paid ? 232 : 268);
+        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_LEFT_MID, 10, -10);
+        lv_obj_set_width(titleLabel, item.vip || item.paid ? 205 : 268);
         lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
         addCloudVipBadge(row, item);
 
-        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
-        lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
+        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 10, 10);
+        lv_obj_set_width(artistLabel, item.vip || item.paid ? 205 : 268);
         lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -4298,8 +4298,8 @@ void HifiUi::buildCloudLanguage() {
     static const char* const kLangSubs[5] = {"华语流行 / 经典中文", "欧美流行 / 英文金曲", "J-Pop / 动漫 / City Pop", "港乐经典 / 粤语流行", "K-Pop / 韩剧 OST"};
     for (uint8_t i = 0; i < 5; ++i) {
         lv_obj_t* row = lv_btn_create(screen);
-        lv_obj_set_pos(row, 8, 28 + i * 36);
-        lv_obj_set_size(row, 304, 32);
+        lv_obj_set_pos(row, 8, 28 + i * 44);
+        lv_obj_set_size(row, 304, 40);
         lv_obj_set_style_radius(row, 10, 0);
         lv_obj_set_style_bg_color(row, kPanel, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -4310,9 +4310,9 @@ void HifiUi::buildCloudLanguage() {
         addPressFx(row);
         lv_obj_add_event_cb(row, onCloudLanguageAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
-        lv_obj_t* name = makeText(row, kLangNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 12, 0);
+        lv_obj_t* name = makeText(row, kLangNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 12, -10);
         lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t* sub = makeText(row, kLangSubs[i], &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 12, -3);
+        lv_obj_t* sub = makeText(row, kLangSubs[i], &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 12, 10);
         lv_obj_clear_flag(sub, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_t* chevron = makeText(row, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_RIGHT_MID, -12, 0);
         lv_obj_clear_flag(chevron, LV_OBJ_FLAG_CLICKABLE);
@@ -4479,8 +4479,8 @@ void HifiUi::refreshCloudMusicSearch() {
         CloudTrackItem item{};
         if (!playerService.cloudMusicSearchResult(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 36);
-        lv_obj_set_size(row, 288, 32);
+        lv_obj_set_pos(row, 0, i * 44);
+        lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 8, 0);
         lv_obj_set_style_bg_color(row, kPanel, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -4491,14 +4491,17 @@ void HifiUi::refreshCloudMusicSearch() {
         addPressFx(row);
         lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
-        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
-        lv_obj_set_width(titleLabel, item.vip || item.paid ? 232 : 268);
+        // Two-line row layout matches the local library's proven 40px rows:
+        // title in the upper half, artist in the lower half (LEFT_MID
+        // offsets), so the 17px-line-height CJK font never overlaps itself.
+        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_LEFT_MID, 10, -10);
+        lv_obj_set_width(titleLabel, item.vip || item.paid ? 205 : 268);
         lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
         addCloudVipBadge(row, item);
 
-        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
-        lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
+        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 10, 10);
+        lv_obj_set_width(artistLabel, item.vip || item.paid ? 205 : 268);
         lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
     }
@@ -4560,8 +4563,8 @@ void HifiUi::refreshCloudMusicPlaylist() {
         CloudTrackItem item{};
         if (!playerService.cloudMusicPlaylistTrack(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 36);
-        lv_obj_set_size(row, 288, 32);
+        lv_obj_set_pos(row, 0, i * 44);
+        lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 8, 0);
         lv_obj_set_style_bg_color(row, kPanel, 0);
         lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -4572,14 +4575,14 @@ void HifiUi::refreshCloudMusicPlaylist() {
         addPressFx(row);
         lv_obj_add_event_cb(row, onCloudMusicTrackRowAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
-        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_TOP_LEFT, 10, 2);
-        lv_obj_set_width(titleLabel, item.vip || item.paid ? 232 : 268);
+        lv_obj_t* titleLabel = makeText(row, item.title, &lv_font_cjk_13, item.playableHint ? kInk : kInkFaint, LV_ALIGN_LEFT_MID, 10, -10);
+        lv_obj_set_width(titleLabel, item.vip || item.paid ? 205 : 268);
         lv_label_set_long_mode(titleLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(titleLabel, LV_OBJ_FLAG_CLICKABLE);
         addCloudVipBadge(row, item);
 
-        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 10, -3);
-        lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
+        lv_obj_t* artistLabel = makeText(row, item.artist, &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 10, 10);
+        lv_obj_set_width(artistLabel, item.vip || item.paid ? 205 : 268);
         lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
     }

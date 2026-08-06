@@ -2671,8 +2671,32 @@ static bool jsonStringField(const String& body, const char* key, String& out) {
             if (e == 'u' && pos + 5 < static_cast<int>(body.length())) {
                 char hex[5] = {body[pos + 2], body[pos + 3], body[pos + 4], body[pos + 5], 0};
                 const uint32_t cp = strtoul(hex, nullptr, 16);
-                if (cp < 0x80) out += static_cast<char>(cp);
-                else if (cp < 0x800) {
+                if (cp >= 0xD800 && cp <= 0xDBFF) {
+                    // High surrogate of a non-BMP pair (emoji etc.): expect
+                    // a following \uDC00-\uDFFF low surrogate and combine
+                    // them into one code point encoded as 4-byte UTF-8.
+                    // Without this, each surrogate half got encoded as a
+                    // 3-byte sequence -> invalid UTF-8 -> garbled text.
+                    if (pos + 11 < static_cast<int>(body.length()) && body[pos + 6] == '\\' && body[pos + 7] == 'u') {
+                        char lowHex[5] = {body[pos + 8], body[pos + 9], body[pos + 10], body[pos + 11], 0};
+                        const uint32_t low = strtoul(lowHex, nullptr, 16);
+                        if (low >= 0xDC00 && low <= 0xDFFF) {
+                            const uint32_t combined = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+                            out += static_cast<char>(0xF0 | (combined >> 18));
+                            out += static_cast<char>(0x80 | ((combined >> 12) & 0x3F));
+                            out += static_cast<char>(0x80 | ((combined >> 6) & 0x3F));
+                            out += static_cast<char>(0x80 | (combined & 0x3F));
+                            pos += 12;
+                            continue;
+                        }
+                    }
+                    // Lone/invalid surrogate: drop it rather than emit bad UTF-8.
+                    pos += 6;
+                    continue;
+                }
+                if (cp < 0x80) {
+                    out += static_cast<char>(cp);
+                } else if (cp < 0x800) {
                     out += static_cast<char>(0xC0 | (cp >> 6));
                     out += static_cast<char>(0x80 | (cp & 0x3F));
                 } else {
@@ -3602,6 +3626,30 @@ void playerCoreCloudMusicWakeStart() {
     }
 }
 
+// Periodic keep-alive: Render's free tier spins BOTH services (the gateway
+// and the upstream api-enhanced) down after ~15 min of inactivity, which is
+// what made browsing 502 after idle. Every 9 min the board health-checks
+// the gateway AND warms the upstream via /esp/v1/wake, so both stay awake
+// while the device is powered on -- the first 在线音乐 visit after a long
+// idle no longer waits through a double cold start. The wake call is fast
+// (<1s) when services are already warm; the retries here only bite during
+// a genuine cold start.
+static void cloudKeepaliveTask(void*) {
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(9 * 60 * 1000));
+        const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
+        if (!cfg.configured || !WiFi.isConnected()) continue;
+        for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+            if (!cloudMusicHealthCheckOnce(cfg)) {
+                vTaskDelay(pdMS_TO_TICKS(20000));
+                continue;
+            }
+            if (cloudMusicWakeUpstreamOnce(cfg)) break;
+            vTaskDelay(pdMS_TO_TICKS(20000));
+        }
+    }
+}
+
 // ---- Cloud Music phase 3: search / hot playlists / playlist detail ------
 // Browse-only, per the project's phased NCM spec -- no playback wiring
 // (that's phase 4). One background controller task processes one command
@@ -3730,6 +3778,32 @@ static uint8_t jsonArrayItems(const String& body, const char* key, String* outIt
     return count;
 }
 
+// Strips characters the embedded CJK subset font (lv_font_cjk_13, ASCII +
+// ~19k CJK/kana/symbols) cannot render -- most importantly non-BMP emoji
+// (4-byte UTF-8) which would otherwise show as tofu boxes mixed into
+// otherwise-fine Chinese text ("文字乱码"), plus stray control chars.
+// Operates in place on a NUL-terminated UTF-8 buffer.
+static void cloudTextSanitize(char* s) {
+    char* w = s;
+    const char* r = s;
+    while (*r) {
+        const uint8_t c = static_cast<uint8_t>(*r);
+        if (c < 0x80) {
+            if (c >= 0x20 && c != 0x7F) *w++ = *r;
+            ++r;
+        } else if (c < 0xE0) {
+            *w++ = *r++;
+        } else if (c < 0xF0) {
+            *w++ = *r++;
+            if (*r) *w++ = *r++;
+            if (*r) *w++ = *r++;
+        } else {
+            r += 4; // non-BMP (emoji / rare chars) -- drop the whole sequence
+        }
+    }
+    *w = '\0';
+}
+
 static void parseCloudTrackItem(const String& itemJson, CloudTrackItem* out) {
     *out = CloudTrackItem{};
     String s;
@@ -3743,6 +3817,9 @@ static void parseCloudTrackItem(const String& itemJson, CloudTrackItem* out) {
     out->playableHint = itemJson.indexOf("\"playable_hint\":false") < 0;
     out->vip = itemJson.indexOf("\"vip\":true") >= 0;
     out->paid = itemJson.indexOf("\"paid\":true") >= 0;
+    cloudTextSanitize(out->title);
+    cloudTextSanitize(out->artist);
+    cloudTextSanitize(out->album);
 }
 
 static void parseCloudPlaylistItem(const String& itemJson, CloudPlaylistItem* out) {
@@ -3754,6 +3831,8 @@ static void parseCloudPlaylistItem(const String& itemJson, CloudPlaylistItem* ou
     if (jsonStringField(itemJson, "cover_url", s)) strlcpy(out->coverUrl, s.c_str(), sizeof(out->coverUrl));
     double num = 0;
     if (jsonNumber(itemJson, "track_count", &num)) out->trackCount = static_cast<uint16_t>(num);
+    cloudTextSanitize(out->name);
+    cloudTextSanitize(out->creator);
 }
 
 static void parseCloudRankingItem(const String& itemJson, CloudRankingItem* out) {
@@ -3763,6 +3842,7 @@ static void parseCloudRankingItem(const String& itemJson, CloudRankingItem* out)
     if (jsonStringField(itemJson, "name", s)) strlcpy(out->name, s.c_str(), sizeof(out->name));
     if (jsonStringField(itemJson, "cover_url", s)) strlcpy(out->coverUrl, s.c_str(), sizeof(out->coverUrl));
     if (jsonStringField(itemJson, "update_freq", s)) strlcpy(out->updateFreq, s.c_str(), sizeof(out->updateFreq));
+    cloudTextSanitize(out->name);
 }
 
 // One GET against the configured gateway, with the device key header and
@@ -5178,6 +5258,12 @@ void setup() {
     // a little headroom while sparing internal heap for mbedTLS.
     if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 12288, nullptr, 1, nullptr) != pdPASS) {
         MWR_LOG_ERROR("Failed to create cloud music controller task");
+    }
+    // Keep both Render free-tier services awake (see cloudKeepaliveTask) --
+    // cheap (one TLS pair every 9 min), prevents the double-cold-start
+    // "加载失败/502" after idle.
+    if (xTaskCreate(cloudKeepaliveTask, "cloudKeep", 8192, nullptr, 1, nullptr) != pdPASS) {
+        MWR_LOG_ERROR("Failed to create cloud keepalive task");
     }
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting
     // like weatherTask) since local playback -- and playerCoreLoadLyrics()'s
