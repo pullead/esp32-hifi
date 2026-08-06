@@ -3548,6 +3548,10 @@ void playerCoreCloudMusicWakeStart() {
         return;
     }
     s_cloudWakeTaskRunning = true;
+    // 8K was the value that worked before (health checks succeeded), and
+    // every kilobyte of task stack is internal heap that mbedTLS needs for
+    // its handshake buffers -- the "唤醒不了" bug was heap exhaustion, so
+    // stack stays at the proven size rather than being bumped speculatively.
     if (xTaskCreate(cloudMusicWakeTask, "cloudWake", 8192, nullptr, 1, nullptr) != pdPASS) {
         s_cloudWakeTaskRunning = false;
         s_cloudServiceState = CloudServiceState::Offline;
@@ -3570,8 +3574,12 @@ void playerCoreCloudMusicWakeStart() {
 static constexpr uint8_t kCloudSearchMaxResults = 10;
 static constexpr uint8_t kCloudHotPlaylistMax = 8;
 static constexpr uint8_t kCloudPlaylistTrackMax = 20;
-static constexpr uint8_t kCloudRankingMax = 12;
-static constexpr uint8_t kCloudNewSongMax = 20;
+// Sized to fit the 320x170 screen's scrollable list comfortably while
+// keeping the static arrays' internal-RAM footprint as small as possible --
+// TLS handshakes need ~40KB of contiguous heap, and every kilobyte of
+// static array counts on this device.
+static constexpr uint8_t kCloudRankingMax = 8;
+static constexpr uint8_t kCloudNewSongMax = 12;
 
 enum class CloudCommandType : uint8_t { Search, LoadHotPlaylists, LoadPlaylist, LoadRankings, LoadNewSongs, ResolveAndPlay };
 struct CloudCommand {
@@ -3586,28 +3594,32 @@ static volatile uint32_t s_cloudRequestGeneration = 0;
 static char s_cloudLastError[96] = "";
 
 static CloudMusicRequestState s_cloudSearchState = CloudMusicRequestState::Idle;
-static CloudTrackItem s_cloudSearchResults[kCloudSearchMaxResults];
+// PSRAM-backed result arrays (allocated in setup()): internal RAM is the
+// constraint for TLS handshakes (~40KB contiguous heap), so the bulk
+// cloud-music lists live in PSRAM -- same reasoning as the audio library's
+// big input buffer. All access goes through the result mutex, unchanged.
+static CloudTrackItem* s_cloudSearchResults = nullptr;
 static uint8_t s_cloudSearchResultCount = 0;
 static bool s_cloudSearchHasMore = false;
 
 static CloudMusicRequestState s_cloudHotState = CloudMusicRequestState::Idle;
-static CloudPlaylistItem s_cloudHotPlaylists[kCloudHotPlaylistMax];
+static CloudPlaylistItem* s_cloudHotPlaylists = nullptr;
 static uint8_t s_cloudHotPlaylistCount = 0;
 
 static CloudMusicRequestState s_cloudPlaylistState = CloudMusicRequestState::Idle;
 static CloudPlaylistItem s_cloudPlaylistInfo;
-static CloudTrackItem s_cloudPlaylistTracks[kCloudPlaylistTrackMax];
+static CloudTrackItem* s_cloudPlaylistTracks = nullptr;
 static uint8_t s_cloudPlaylistTrackCount = 0;
 
 // Phase 5: ranking charts + new-song arrivals (see buildCloudRankings()/
 // buildCloudNewSongs() in the UI). Separate arrays/states, same
 // single-request-at-a-time discipline as the phase-3 lookups.
 static CloudMusicRequestState s_cloudRankingState = CloudMusicRequestState::Idle;
-static CloudRankingItem s_cloudRankings[kCloudRankingMax];
+static CloudRankingItem* s_cloudRankings = nullptr;
 static uint8_t s_cloudRankingCount = 0;
 
 static CloudMusicRequestState s_cloudNewSongState = CloudMusicRequestState::Idle;
-static CloudTrackItem s_cloudNewSongs[kCloudNewSongMax];
+static CloudTrackItem* s_cloudNewSongs = nullptr;
 static uint8_t s_cloudNewSongCount = 0;
 
 // Phase 4: resolve + play. s_cloudResolveState is polled by the UI (a
@@ -3776,6 +3788,111 @@ static bool cloudMusicHttpGetWithRetry(const String& path, String& outBody, cons
     return false;
 }
 
+// ---- Cloud music connectivity diagnostic ---------------------------------
+// Served as /cloud_diag_start + /cloud_diag_json on the device web server:
+// replicates the exact wake/browse failure path (DNS resolve -> plain TCP
+// to :443 -> full TLS health check) on a generously-stacked background
+// task and reports which stage fails, so a "唤醒不了/连接不上" report can be
+// attributed to DNS vs firewall vs TLS/heap instead of guessing. The
+// result is stored in a static buffer that /cloud_diag_json returns once
+// s_cloudDiagReady flips.
+static char s_cloudDiagResult[512] = "";
+static volatile bool s_cloudDiagReady = false;
+static volatile bool s_cloudDiagRunning = false;
+
+// Writes a partial result immediately so /cloud_diag_json shows progress
+// even if a stage hangs. Heap is reported first -- TLS memory pressure was
+// the actual root cause of "唤醒不了" (free internal heap had dropped to
+// ~13KB; mbedTLS needs ~40KB on top of the task stack).
+static void cloudDiagReport(const char* stage, const char* extraJson) {
+    String out = "{\"ready\":false,\"stage\":\"";
+    out += stage;
+    out += "\",\"heap\":";
+    out += String(ESP.getFreeHeap());
+    if (extraJson && extraJson[0]) out += extraJson;
+    out += "}";
+    strlcpy(s_cloudDiagResult, out.c_str(), sizeof(s_cloudDiagResult));
+}
+
+static void cloudDiagTask(void*) {
+    String out = "{";
+    const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
+    const bool wifiOk = WiFi.status() == WL_CONNECTED;
+    cloudDiagReport("start", wifiOk ? ",\"wifi\":true" : ",\"wifi\":false");
+    out += "\"wifi\":";
+    out += wifiOk ? "true" : "false";
+    out += ",\"ssid\":\"";
+    out += wifiOk ? WiFi.SSID().c_str() : "";
+    out += "\",\"rssi\":";
+    out += String(wifiOk ? static_cast<int>(WiFi.RSSI()) : 0);
+    out += ",\"heap\":";
+    out += String(ESP.getFreeHeap());
+    out += ",\"psram\":";
+    out += String(ESP.getFreePsram());
+
+    String host = cfg.baseUrl;
+    if (host.startsWith("https://")) host = host.substring(8);
+    else if (host.startsWith("http://")) host = host.substring(7);
+    const int slash = host.indexOf('/');
+    if (slash >= 0) host = host.substring(0, slash);
+    cloudDiagReport("dns", "");
+
+    IPAddress resolved;
+    const bool dnsOk = WiFi.hostByName(host.c_str(), resolved);
+    out += ",\"dns_ok\":";
+    out += dnsOk ? "true" : "false";
+    if (dnsOk) {
+        out += ",\"resolved\":\"";
+        out += resolved.toString();
+        out += "\"";
+    }
+    cloudDiagReport("tcp", "");
+
+    WiFiClient tcp;
+    const bool tcpOk = dnsOk && tcp.connect(resolved, 443);
+    out += ",\"tcp443\":";
+    out += tcpOk ? "true" : "false";
+    if (tcp) tcp.stop();
+    cloudDiagReport("health", "");
+
+    String body;
+    const bool healthOk = cloudMusicHttpGet("/esp/v1/health", body);
+    out += ",\"health_ok\":";
+    out += healthOk ? "true" : "false";
+    out += ",\"error\":\"";
+    // Gateway error messages are plain Chinese/ASCII text -- no quotes or
+    // backslashes in practice; escape defensively anyway.
+    const char* err = s_cloudLastError;
+    for (const char* p = err; *p; ++p) {
+        if (*p == '"' || *p == '\\') out += '\\';
+        out += *p;
+    }
+    out += "\"}";
+
+    strlcpy(s_cloudDiagResult, out.c_str(), sizeof(s_cloudDiagResult));
+    s_cloudDiagReady = true;
+    s_cloudDiagRunning = false;
+    vTaskDelete(nullptr);
+}
+
+void playerCoreCloudDiagStart() {
+    if (s_cloudDiagRunning) return;
+    s_cloudDiagRunning = true;
+    s_cloudDiagReady = false;
+    s_cloudDiagResult[0] = '\0';
+    // 16K covers DNS+TCP+TLS here (TLS heap buffers are separate from this
+    // task's stack); the earlier 24K version was one more big heap consumer
+    // on an already tight device.
+    if (xTaskCreate(cloudDiagTask, "cloudDiag", 16384, nullptr, 1, nullptr) != pdPASS) {
+        s_cloudDiagRunning = false;
+        MWR_LOG_ERROR("Failed to create cloud diag task");
+    }
+}
+
+bool playerCoreCloudDiagReady() { return s_cloudDiagReady; }
+
+const char* playerCoreCloudDiagResult() { return s_cloudDiagResult; }
+
 static void cloudMusicControllerTask(void*) {
     CloudCommand cmd;
     for (;;) {
@@ -3785,6 +3902,13 @@ static void cloudMusicControllerTask(void*) {
             if (cloudResultLock()) {
                 s_cloudSearchState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
+            }
+            if (!s_cloudSearchResults) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudSearchState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
             }
             String query;
             urlEncodeAppend(query, cmd.param);
@@ -3811,6 +3935,13 @@ static void cloudMusicControllerTask(void*) {
             if (cloudResultLock()) {
                 s_cloudHotState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
+            }
+            if (!s_cloudHotPlaylists) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudHotState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
             }
             // Optional language-category tag ("华语"/"欧美"/"日语"...) --
             // passed through the command param (see the 语言分类 feature),
@@ -3844,6 +3975,13 @@ static void cloudMusicControllerTask(void*) {
                 s_cloudPlaylistState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
             }
+            if (!s_cloudPlaylistTracks) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudPlaylistState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
+            }
             char path[160];
             snprintf(path, sizeof(path), "/esp/v1/playlists/%s?limit=%u", cmd.param, kCloudPlaylistTrackMax);
             String body;
@@ -3870,6 +4008,13 @@ static void cloudMusicControllerTask(void*) {
                 s_cloudRankingState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
             }
+            if (!s_cloudRankings) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudRankingState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
+            }
             char path[64];
             snprintf(path, sizeof(path), "/esp/v1/rankings?limit=%u", kCloudRankingMax);
             String body;
@@ -3892,6 +4037,13 @@ static void cloudMusicControllerTask(void*) {
             if (cloudResultLock()) {
                 s_cloudNewSongState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
+            }
+            if (!s_cloudNewSongs) {
+                if (cloudResultLock(pdMS_TO_TICKS(1000))) {
+                    s_cloudNewSongState = CloudMusicRequestState::Error;
+                    cloudResultUnlock();
+                }
+                continue;
             }
             char path[64];
             snprintf(path, sizeof(path), "/esp/v1/new-songs?limit=%u", kCloudNewSongMax);
@@ -3999,7 +4151,7 @@ uint8_t playerCoreCloudMusicSearchState() { return static_cast<uint8_t>(s_cloudS
 uint8_t playerCoreCloudMusicSearchResultCount() { return s_cloudSearchResultCount; }
 
 bool playerCoreCloudMusicSearchResult(uint8_t index, CloudTrackItem* item) {
-    if (!item || index >= s_cloudSearchResultCount) return false;
+    if (!item || !s_cloudSearchResults || index >= s_cloudSearchResultCount) return false;
     bool ok = false;
     if (cloudResultLock()) {
         *item = s_cloudSearchResults[index];
@@ -4026,7 +4178,7 @@ uint8_t playerCoreCloudMusicHotPlaylistsState() { return static_cast<uint8_t>(s_
 uint8_t playerCoreCloudMusicHotPlaylistCount() { return s_cloudHotPlaylistCount; }
 
 bool playerCoreCloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item) {
-    if (!item || index >= s_cloudHotPlaylistCount) return false;
+    if (!item || !s_cloudHotPlaylists || index >= s_cloudHotPlaylistCount) return false;
     bool ok = false;
     if (cloudResultLock()) {
         *item = s_cloudHotPlaylists[index];
@@ -4060,7 +4212,7 @@ CloudPlaylistItem playerCoreCloudMusicPlaylistDetailInfo() {
 uint8_t playerCoreCloudMusicPlaylistTrackCount() { return s_cloudPlaylistTrackCount; }
 
 bool playerCoreCloudMusicPlaylistTrack(uint8_t index, CloudTrackItem* item) {
-    if (!item || index >= s_cloudPlaylistTrackCount) return false;
+    if (!item || !s_cloudPlaylistTracks || index >= s_cloudPlaylistTrackCount) return false;
     bool ok = false;
     if (cloudResultLock()) {
         *item = s_cloudPlaylistTracks[index];
@@ -4083,7 +4235,7 @@ uint8_t playerCoreCloudMusicRankingsState() { return static_cast<uint8_t>(s_clou
 uint8_t playerCoreCloudMusicRankingCount() { return s_cloudRankingCount; }
 
 bool playerCoreCloudMusicRanking(uint8_t index, CloudRankingItem* item) {
-    if (!item || index >= s_cloudRankingCount) return false;
+    if (!item || !s_cloudRankings || index >= s_cloudRankingCount) return false;
     bool ok = false;
     if (cloudResultLock()) {
         *item = s_cloudRankings[index];
@@ -4106,7 +4258,7 @@ uint8_t playerCoreCloudMusicNewSongsState() { return static_cast<uint8_t>(s_clou
 uint8_t playerCoreCloudMusicNewSongCount() { return s_cloudNewSongCount; }
 
 bool playerCoreCloudMusicNewSong(uint8_t index, CloudTrackItem* item) {
-    if (!item || index >= s_cloudNewSongCount) return false;
+    if (!item || !s_cloudNewSongs || index >= s_cloudNewSongCount) return false;
     bool ok = false;
     if (cloudResultLock()) {
         *item = s_cloudNewSongs[index];
@@ -4963,12 +5115,25 @@ void setup() {
     s_cloudResultMutex = xSemaphoreCreateMutex();
     s_cloudCommandQueue = xQueueCreate(1, sizeof(CloudCommand));
     if (!s_cloudResultMutex) MWR_LOG_ERROR("Failed to create cloud music result mutex");
-    // Stack is sized generously: this task runs the full TLS resolve HTTP
-    // request AND audio.connecttohost() (DNS/TLS/network stack all use a
-    // lot of stack) synchronously, unlike tasks that only queue work. 10K
-    // was enough to boot but is a suspected overflow source when a real
-    // connect starts, crashing the device back to a fresh boot (Home).
-    if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 20480, nullptr, 1, nullptr) != pdPASS) {
+    // Cloud result arrays live in PSRAM -- internal RAM is the constraint
+    // for TLS handshakes (~40KB contiguous heap); keeping ~24KB of list
+    // data out of it is what lets WiFiClientSecure actually connect (the
+    // "网关一直唤醒不了" bug: free internal heap had collapsed and TLS
+    // allocation failed every attempt, while plain-HTTP radio kept working).
+    s_cloudSearchResults = static_cast<CloudTrackItem*>(ps_malloc(sizeof(CloudTrackItem) * kCloudSearchMaxResults));
+    s_cloudHotPlaylists = static_cast<CloudPlaylistItem*>(ps_malloc(sizeof(CloudPlaylistItem) * kCloudHotPlaylistMax));
+    s_cloudPlaylistTracks = static_cast<CloudTrackItem*>(ps_malloc(sizeof(CloudTrackItem) * kCloudPlaylistTrackMax));
+    s_cloudRankings = static_cast<CloudRankingItem*>(ps_malloc(sizeof(CloudRankingItem) * kCloudRankingMax));
+    s_cloudNewSongs = static_cast<CloudTrackItem*>(ps_malloc(sizeof(CloudTrackItem) * kCloudNewSongMax));
+    if (!s_cloudSearchResults || !s_cloudHotPlaylists || !s_cloudPlaylistTracks || !s_cloudRankings || !s_cloudNewSongs) {
+        MWR_LOG_ERROR("Failed to allocate cloud music result arrays (PSRAM)");
+    }
+    // This task runs the full TLS resolve HTTP request AND
+    // audio.connecttohost() synchronously; 10K was the original value and
+    // (with the real playback-crash fix being the deferred-navigation
+    // change, not this stack) remains sufficient. Keeping it at 12K leaves
+    // a little headroom while sparing internal heap for mbedTLS.
+    if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 12288, nullptr, 1, nullptr) != pdPASS) {
         MWR_LOG_ERROR("Failed to create cloud music controller task");
     }
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting
@@ -7676,6 +7841,14 @@ void WEBSRV_onCommand(ps_ptr<char> cmd, ps_ptr<char> param, ps_ptr<char> arg){  
                                         json.assignf("{{\"ok\":{},\"message\":\"{}\"}}", ok ? "true" : "false",
                                                      ok ? "saved" : "invalid config (need http(s) URL + key)");
                                         webSrv.show(json.c_get(), webSrv.JSON);
+                                        return;}
+    CMD_EQUALS("cloud_diag_start"){     // Diagnostics: replicate the wake path (DNS->TCP443->TLS health) on a
+                                        // dedicated 24K-stack task and stash the JSON result.
+                                        playerCoreCloudDiagStart();
+                                        webSrv.show("{\"started\":true}", webSrv.JSON);
+                                        return;}
+    CMD_EQUALS("cloud_diag_json"){      if (playerCoreCloudDiagReady()) webSrv.show(playerCoreCloudDiagResult(), webSrv.JSON);
+                                        else webSrv.show("{\"ready\":false}", webSrv.JSON);
                                         return;}
 
     CMD_EQUALS("wifi_status_json"){     serveWifiStatusJson(); return;}
