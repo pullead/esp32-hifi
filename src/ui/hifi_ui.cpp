@@ -1016,6 +1016,11 @@ void HifiUi::show(Page page) {
     else if (page == Page::CloudMusicHome) buildCloudMusicHome();
     else if (page == Page::CloudMusicSearch) buildCloudMusicSearch();
     else if (page == Page::CloudMusicPlaylist) buildCloudMusicPlaylist();
+    else if (page == Page::CloudHotPlaylists) buildCloudHotPlaylists();
+    else if (page == Page::CloudRankings) buildCloudRankings();
+    else if (page == Page::CloudNewSongs) buildCloudNewSongs();
+    else if (page == Page::CloudLanguage) buildCloudLanguage();
+    else if (page == Page::CloudNowPlaying) buildCloudNowPlaying();
     else buildPlaceholder("SETTINGS / EQ", "Audio, EQ, network and sleep");
 }
 
