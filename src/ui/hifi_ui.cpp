@@ -4612,6 +4612,53 @@ void HifiUi::refreshCloudMusicPlaylist() {
 // -- so this both kicks off the fetch when a new track starts AND retries
 // the decode (throttled) until the cover lands, at which point the caller
 // rebuilds the page to swap the placeholder for the real image.
+// 缓存查找：命中就把该槽位标记为最新使用（LRU），把解码结果拷贝一份给
+// 调用方（调用方拿到的是独立内存，不是缓存槽位本身的指针）。
+bool HifiUi::cloudCoverCacheLookup(const char* trackId, uint16_t** outPixels, uint16_t* outW, uint16_t* outH) {
+    for (auto& entry : m_cloudCoverCache) {
+        if (!entry.pixels || entry.trackId[0] == '\0' || strcmp(entry.trackId, trackId) != 0) continue;
+        const size_t bytes = static_cast<size_t>(entry.w) * entry.h * 2;
+        uint16_t* copy = static_cast<uint16_t*>(ps_malloc(bytes));
+        if (!copy) return false;
+        memcpy(copy, entry.pixels, bytes);
+        *outPixels = copy;
+        *outW = entry.w;
+        *outH = entry.h;
+        entry.lastUsedSeq = ++m_cloudCoverCacheSeq;
+        return true;
+    }
+    return false;
+}
+
+// 插入一条新缓存：满了就淘汰 lastUsedSeq 最小（最久没用）的那个槽位。
+// 存进缓存的是又一份独立拷贝，跟当前正在显示、之后会被 clearCoverArt()
+// free 掉的 m_coverArtPixels 完全没有关联。
+void HifiUi::cloudCoverCacheInsert(const char* trackId, const uint16_t* pixels, uint16_t w, uint16_t h) {
+    for (auto& entry : m_cloudCoverCache) {
+        if (entry.trackId[0] != '\0' && strcmp(entry.trackId, trackId) == 0) return; // already cached
+    }
+    CloudCoverCacheEntry* slot = nullptr;
+    for (auto& entry : m_cloudCoverCache) {
+        if (!entry.pixels) { slot = &entry; break; }
+    }
+    if (!slot) {
+        slot = &m_cloudCoverCache[0];
+        for (auto& entry : m_cloudCoverCache) {
+            if (entry.lastUsedSeq < slot->lastUsedSeq) slot = &entry;
+        }
+    }
+    const size_t bytes = static_cast<size_t>(w) * h * 2;
+    uint16_t* copy = static_cast<uint16_t*>(ps_malloc(bytes));
+    if (!copy) return; // 装不下就算了，只是错过这次缓存机会，不影响正常显示
+    memcpy(copy, pixels, bytes);
+    if (slot->pixels) free(slot->pixels);
+    strlcpy(slot->trackId, trackId, sizeof(slot->trackId));
+    slot->pixels = copy;
+    slot->w = w;
+    slot->h = h;
+    slot->lastUsedSeq = ++m_cloudCoverCacheSeq;
+}
+
 void HifiUi::loadCloudCover() {
     CloudTrackItem track{};
     if (!playerService.cloudMusicNowPlayingTrack(&track) || !track.id[0]) return;
@@ -4620,12 +4667,35 @@ void HifiUi::loadCloudCover() {
         clearCoverArt();
         strlcpy(m_cloudCoverTrackId, track.id, sizeof(m_cloudCoverTrackId));
         m_cloudCoverReady = false;
-        playerService.cloudNowPlayingCoverStart(m_cloudCurrentPlaylistCover);
+        // 先查缓存：这首歌之前显示过的话，解码结果可能还在缓存里，命中就
+        // 不用再解一次 JPEG，直接显示。
+        uint16_t* cachedPixels = nullptr;
+        uint16_t cachedW = 0, cachedH = 0;
+        if (cloudCoverCacheLookup(track.id, &cachedPixels, &cachedW, &cachedH)) {
+            m_coverArtPixels = cachedPixels;
+            m_coverArtDsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+            m_coverArtDsc.header.always_zero = 0;
+            m_coverArtDsc.header.w = cachedW;
+            m_coverArtDsc.header.h = cachedH;
+            m_coverArtDsc.data_size = static_cast<uint32_t>(cachedW) * cachedH * 2;
+            m_coverArtDsc.data = reinterpret_cast<const uint8_t*>(cachedPixels);
+            m_cloudCoverReady = true;
+            return;
+        }
     }
     if (!m_cloudCoverReady) {
         const uint32_t now = lv_tick_get();
-        if (now - m_lastCloudCoverRetry < 500) return; // cover still downloading -- don't hammer the SD card
+        if (now - m_lastCloudCoverRetry < 500) return; // 封面还在下载中，别频繁读 SD 卡
         m_lastCloudCoverRetry = now;
+        // 每次节流轮询都重新尝试发起下载，而不是只在"刚切歌"那一刻发起一次：
+        // playerCoreCloudNowPlayingCoverStart() 内部有全局的
+        // s_cloudNowPlayingCoverRequested 标志，如果上一首歌的封面还在下载
+        // （没有区分是哪首歌的下载），这首新歌的这次调用会被直接吞掉、什么
+        // 也不做。之前只在切歌那一瞬间调用一次，被吞掉之后就再也不会重试，
+        // 封面永远拿不到——这正好对应"节奏快的歌切换时封面一直不出来"。
+        // 这里改成每次节流窗口都重试，是安全的：函数内部已经会检查 SD 卡上
+        // 是否已经缓存过，重复调用没有副作用，直到真的成功为止。
+        playerService.cloudNowPlayingCoverStart(m_cloudCurrentPlaylistCover);
     }
     uint16_t* pixels = nullptr;
     uint16_t w = 0, h = 0;
@@ -4642,6 +4712,7 @@ void HifiUi::loadCloudCover() {
         m_coverArtDsc.data_size = static_cast<uint32_t>(w) * h * 2;
         m_coverArtDsc.data = reinterpret_cast<const uint8_t*>(pixels);
         m_cloudCoverReady = true;
+        cloudCoverCacheInsert(track.id, pixels, w, h);
     }
 }
 
@@ -4766,8 +4837,13 @@ void HifiUi::buildCloudNowPlaying() {
     lv_obj_set_style_shadow_opa(m_progress, LV_OPA_50, LV_PART_INDICATOR);
     lv_obj_set_style_bg_color(m_progress, kInk, LV_PART_KNOB);
     lv_obj_set_style_pad_all(m_progress, 6, LV_PART_KNOB);
-    // No seek handler attached: dragging the knob does nothing permanent
-    // (refresh() pushes the real playback position back on the next tick).
+    // 这里没有接 seek 回调（CDN 分段续播不稳定），而且跟本地播放页的滑块不
+    // 一样，这个还必须做成完全不可拖动：lv_slider 这个控件本身默认就是可
+    // 交互的，跟有没有接回调无关，所以不加这行的话，手指拖着滑块走，下一
+    // 个约 100ms 的刷新又会把它拽回真实播放位置——这就是"拖动进度条一卡一
+    // 卡拖不动"的真正原因。清掉 CLICKABLE 之后 LVGL 根本不会把按压/拖动事
+    // 件派发给它，变成真正的只读进度条。
+    lv_obj_clear_flag(m_progress, LV_OBJ_FLAG_CLICKABLE);
 
     // Control bar: prev / play / next / 在线音乐 (list) / close-to-home.
     // Five evenly-spaced slots; the LIST slot opens the online-music
@@ -6664,6 +6740,7 @@ void HifiUi::onHomeNowPlayingAction(lv_event_t* event) {
     // skeleton, same as before this tap existed.
     if (state.source == PlayerSource::Radio) s_instance->show(Page::Radio);
     else if (state.source == PlayerSource::Sd) s_instance->show(Page::LocalNowPlaying);
+    else if (state.source == PlayerSource::CloudMusic) s_instance->show(Page::CloudNowPlaying);
     else s_instance->show(Page::NowPlaying);
 }
 

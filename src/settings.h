@@ -47,7 +47,10 @@
     #undef SDMMC_FREQUENCY
     #define TFT_CONTROLLER       6
     #define TFT_ROTATION         2
-    #define TFT_FREQUENCY        20000000
+    // 2026-08-06: 20MHz -> 80MHz，用户要求。这条走的是普通显示 SPI 总线
+    // （GPSPI），不经过 flash/PSRAM 共用的那套 MSPI 时序校准机制，ESP32-S3
+    // 上屏幕跑 80MHz 是常见配置，风险比 flash/PSRAM 超频低得多。
+    #define TFT_FREQUENCY        80000000
     #define TP_CONTROLLER        15
     #define TP_ROTATION          2
     #define TP_H_MIRROR          0

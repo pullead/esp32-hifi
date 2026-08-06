@@ -18,8 +18,20 @@ constexpr int kHeight = 170;
 // rather than being shrunk to free up internal RAM for WiFi's own
 // esp_wifi_init(). WiFi is deliberately the one deferred/best-effort here,
 // not this.
-constexpr int kRowsPerBuffer = 20;
-constexpr uint32_t kTftSpiHz = 40000000;
+// 2026-08-06/07: 20 -> 40 -> 80 行，两个 buffer 共约 100KB，都在 PSRAM 里
+// （见下面 heap_caps_malloc 的 MALLOC_CAP_SPIRAM），PSRAM 剩余空间很宽裕。
+// 这个改动不会让单次刷新传输的总字节数变少（传输是同步阻塞的，总量不
+// 变），只是把覆盖同一块屏幕区域所需的 flush() 调用次数减少，省掉相应的
+// 函数调用/LVGL 调度开销——80 行已经接近屏幕高度(170)的一半，再往上加边
+// 际收益会更小。
+constexpr int kRowsPerBuffer = 80;
+// 这个常量之前一直是这条 LVGL/Arduino_GFX 路径真正生效的 LCD SPI 频率——
+// settings.h 里的 TFT_FREQUENCY 只给旧的非 LVGL 驱动路径用，那条路径在
+// MWR_LVGL_UI 打开时被 setup() 里的提前 return 挡住，根本不会执行到，所以
+// 改 TFT_FREQUENCY 对这条实际在跑的路径没有任何效果。40 -> 80MHz 已经实测
+// 稳定；现在测试 100MHz，其余配置（Flash QIO 40MHz / PSRAM 120MHz / 80行
+// buffer）保持不动，单独隔离这一个变量。
+constexpr uint32_t kTftSpiHz = 100000000;
 constexpr uint8_t kTouchAddress = 0x15;
 constexpr uint8_t kImuAddress = 0x6B;
 constexpr bool kLcdSelfTest = false;
@@ -83,6 +95,19 @@ Arduino_DataBus* s_bus = nullptr;
 Arduino_GFX* s_gfx = nullptr;
 uint32_t s_flushCount = 0;
 uint32_t s_lastFallbackDraw = 0;
+
+// 2026-08-07: 临时的串口性能基线统计，配合 LV_USE_PERF_MONITOR 一起看——
+// 那个只能在屏幕上看，这里额外从串口打印一份方便留存/对比，不依赖人盯着
+// 屏幕读数。每秒打印一次：这一秒里 flush() 被调用了几次（近似"这一秒画了
+// 多少块脏区域"，不是标准意义的整帧 FPS，但能反映刷新频率）、
+// lv_timer_handler() 总共被调用了几次、这些调用累计占用了多少 CPU 时间
+// （用来看渲染+同步阻塞发送到底占了这一秒里多大比例）、以及单次调用里最
+// 慢的一次耗时（用来揪卡顿尖峰）。测完记得删掉/关掉，不是长期要留的代码。
+uint32_t s_perfWindowStartMs = 0;
+uint32_t s_perfFlushAtWindowStart = 0;
+uint32_t s_perfTimerHandlerCalls = 0;
+uint32_t s_perfTimerHandlerBusyUs = 0;
+uint32_t s_perfTimerHandlerMaxUs = 0;
 
 void drawFallbackHome() {
     if (!s_gfx) return;
@@ -221,7 +246,13 @@ bool WaveshareLvglPort::begin() {
     lv_indev_drv_init(&m_touchDriver);
     m_touchDriver.type = LV_INDEV_TYPE_POINTER;
     m_touchDriver.read_cb = readTouch;
-    m_touchDriver.scroll_limit = 16;
+    // 2026-08-07: 16 -> 8（LVGL 默认是10）。这个值是"手指移动超过多少像素
+    // 才判定为滑动，而不是点击"的阈值——16 比默认值还大，导致轻/快速的一
+    // 划，手指还没挪够16px就抬起了，会被误判成点击，正好对应"明明只是滑
+    // 动却触发了点击"的反馈。调小之后滑动更容易被正确识别，代价是极短距
+    // 离的滑动手势会更容易被当成滑动而不是点击（可以接受，列表这类场景
+    // 本来就应该优先滑动）。
+    m_touchDriver.scroll_limit = 8;
     // Lower = slower slow-down = more momentum glide after release (LVGL's
     // own doc comment on this field: "Greater value means faster
     // slow-down"). Was 18; dropped toward LVGL's own ~10 default so a flick
@@ -256,7 +287,27 @@ void WaveshareLvglPort::tick() {
     // is fixed now. m_displayFlipped stays false, so the touch mapping never
     // takes the flipped branch either. initImu()/pollImuOrientation() remain
     // in the file but are no longer driven.
+    const uint32_t callStartUs = micros();
     lv_timer_handler();
+    const uint32_t callUs = micros() - callStartUs;
+    ++s_perfTimerHandlerCalls;
+    s_perfTimerHandlerBusyUs += callUs;
+    if (callUs > s_perfTimerHandlerMaxUs) s_perfTimerHandlerMaxUs = callUs;
+    if (s_perfWindowStartMs == 0) s_perfWindowStartMs = now;
+    if (now - s_perfWindowStartMs >= 1000) {
+        const uint32_t flushesThisWindow = s_flushCount - s_perfFlushAtWindowStart;
+        printf("[PERF] flush/s=%lu timer_handler_calls/s=%lu busy_us=%lu (%.1f%%) max_call_us=%lu\n",
+               static_cast<unsigned long>(flushesThisWindow),
+               static_cast<unsigned long>(s_perfTimerHandlerCalls),
+               static_cast<unsigned long>(s_perfTimerHandlerBusyUs),
+               static_cast<double>(s_perfTimerHandlerBusyUs) / 10000.0,
+               static_cast<unsigned long>(s_perfTimerHandlerMaxUs));
+        s_perfWindowStartMs = now;
+        s_perfFlushAtWindowStart = s_flushCount;
+        s_perfTimerHandlerCalls = 0;
+        s_perfTimerHandlerBusyUs = 0;
+        s_perfTimerHandlerMaxUs = 0;
+    }
     if (s_flushCount == 0 && now - s_lastFallbackDraw > 2000) {
         s_lastFallbackDraw = now;
         drawFallbackHome();

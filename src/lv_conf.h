@@ -96,7 +96,12 @@
 #define LV_DISP_DEF_REFR_PERIOD 30      /*[ms]*/
 
 /*Input device read period in milliseconds*/
-#define LV_INDEV_DEF_READ_PERIOD 30     /*[ms]*/
+// 2026-08-07: 30 -> 15ms，触摸采样频率翻倍，减少"跟手度不够"的感觉——I2C
+// 触摸读取本身很便宜（一次读7字节，400kHz总线下远不到1ms），加倍轮询的
+// 额外开销可以接受。真正的滑动卡顿大头还是在渲染/SPI发送阻塞那部分（串
+// 口[PERF]日志偶尔看到单次20-80ms的卡顿），这个只是让两次卡顿之间采样更
+// 密，不能根治，但能改善普通操作下的跟手感。
+#define LV_INDEV_DEF_READ_PERIOD 15     /*[ms]*/
 
 /*Use a custom tick source that tells the elapsed time in milliseconds.
  *It removes the need to manually update the tick with `lv_tick_inc()`)*/
@@ -294,6 +299,9 @@
  *-----------*/
 
 /*1: Show CPU usage and FPS count*/
+// 2026-08-07: 测过了，这个内建角标在这个项目的接入方式下不准（FPS 报的是
+// LV_DISP_DEF_REFR_PERIOD 的理论倒数，CPU 一直卡 0% 是空闲回调没接上），
+// 关掉，改看串口 [PERF] 日志。
 #define LV_USE_PERF_MONITOR 0
 #if LV_USE_PERF_MONITOR
     #define LV_USE_PERF_MONITOR_POS LV_ALIGN_BOTTOM_RIGHT

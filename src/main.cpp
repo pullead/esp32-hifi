@@ -1313,9 +1313,24 @@ void playerCoreStop() {
     stopSong();
 }
 
+// 找到"暂停再播放后频谱卡住约一分钟"这个 bug 的真正原因了：
+// Audio::pauseResume() 的返回值语义是"true=现在是暂停状态，false=现在是
+// 播放状态"（库里那条注释自己写的），但下面这行原来是 `if (accepted)
+// s_f_pauseResume = !audio.isRunning();`——只有在"刚暂停"（accepted为
+// true）时才会更新 s_f_pauseResume，"刚恢复播放"（accepted为false）时这
+// 个判断整个跳过，s_f_pauseResume 就一直卡在 true（暂停）不会被改回
+// false，即使 audio.isRunning() 已经立刻正确变回了 true。playerCore
+// ReadSnapshot() 判断 transport 时 `else if (s_f_pauseResume)
+// PlayerTransport::Paused` 排在 `audio.isRunning()` 判断前面，于是即使音
+// 频已经在正常解码、频谱数据也在正常更新，UI 这边读到的 transport 一直
+// 还是 Paused，频谱动画因为"没有在播放"就不画——这才是"卡住"的真相，不
+// 是频谱计算本身卡住，是这个状态标志位没跟着同步。之所以"大概一分钟后自
+// 己恢复"，是因为别处某个跟这个 bug 无关的路径最终把 s_f_pauseResume 重
+// 置了。改成每次切换后都用 audio.isRunning() 无条件同步，不再依赖这个歧
+// 义返回值。
 static bool audioPauseResumeAndUpdateState() {
     const bool accepted = audio.pauseResume();
-    if (accepted) s_f_pauseResume = !audio.isRunning();
+    s_f_pauseResume = !audio.isRunning();
     return accepted;
 }
 
@@ -2120,7 +2135,7 @@ static void localMusicScanTask(void*) {
 static bool startLocalMusicScan() {
     if (s_localLibraryScanning || usbStorageBlocksSdAppAccess()) return false;
     s_localLibraryScanning = true;
-    const BaseType_t created = xTaskCreate(localMusicScanTask, "musicScan", 8192, nullptr, 1, nullptr);
+    const BaseType_t created = xTaskCreatePinnedToCore(localMusicScanTask, "musicScan", 8192, nullptr, 1, nullptr, 0);
     if (created != pdPASS) {
         s_localLibraryScanning = false;
         MWR_LOG_ERROR("Failed to create local music scan task");
@@ -2343,7 +2358,7 @@ bool playerCoreUsbStorageMount() {
     stopSong(); // stop playback before handing the SD card to the host
     s_usbStorageBusy = true;
     usbMscSetModeFlag(true);
-    const BaseType_t created = xTaskCreate(usbStorageRebootToMscTask, "usbMscOn", 4096, nullptr, 2, nullptr);
+    const BaseType_t created = xTaskCreatePinnedToCore(usbStorageRebootToMscTask, "usbMscOn", 4096, nullptr, 2, nullptr, 0);
     if (created != pdPASS) {
         s_usbStorageBusy = false;
         usbMscSetModeFlag(false);
@@ -2362,7 +2377,7 @@ bool playerCoreUsbStorageUnmount() {
 #if MWR_USB_MSC_SUPPORTED
     if (s_usbStorageState != UsbStorageState::Mounted || s_usbStorageBusy) return false;
     s_usbStorageBusy = true;
-    const BaseType_t created = xTaskCreate(usbStorageRebootToNormalTask, "usbMscOff", 4096, nullptr, 2, nullptr);
+    const BaseType_t created = xTaskCreatePinnedToCore(usbStorageRebootToNormalTask, "usbMscOff", 4096, nullptr, 2, nullptr, 0);
     if (created != pdPASS) {
         s_usbStorageBusy = false;
         MWR_LOG_ERROR("Failed to create USB MSC reboot task");
@@ -2999,7 +3014,7 @@ static void radioIconSyncTask(void*) {
 void playerCoreRadioIconSyncStart() {
     if (s_radioIconSyncInProgress) return;
     s_radioIconSyncInProgress = true;
-    if (xTaskCreate(radioIconSyncTask, "radioIcon", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(radioIconSyncTask, "radioIcon", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
         s_radioIconSyncInProgress = false;
         MWR_LOG_ERROR("Failed to create radio icon sync task");
     }
@@ -3328,6 +3343,7 @@ static volatile CloudServiceState s_cloudServiceState = CloudServiceState::Unkno
 static SemaphoreHandle_t s_cloudMusicMutex = nullptr; // guards s_cloudConfig across the LVGL thread and cloudMusicWakeTask
 static CloudMusicConfig s_cloudConfig;
 static volatile bool s_cloudWakeTaskRunning = false;
+static volatile uint32_t s_cloudLastReadyMs = 0; // millis() when s_cloudServiceState last became Ready
 // Gateway config history (up to 5, newest first). Every saved/used config
 // is upserted here; only playerCoreCloudMusicHistoryDelete() removes one.
 // Stored in NVS as cm_h<i>u/k/t so it survives app-only reflashes.
@@ -3600,6 +3616,7 @@ static void cloudMusicWakeTask(void*) {
         }
     }
     s_cloudServiceState = (ready && upstreamReady) ? CloudServiceState::Ready : CloudServiceState::Offline;
+    if (ready && upstreamReady) s_cloudLastReadyMs = millis();
     s_cloudWakeTaskRunning = false;
     vTaskDelete(nullptr);
 }
@@ -3607,8 +3624,19 @@ static void cloudMusicWakeTask(void*) {
 // Entry point: called when the user opens 在线音乐 settings/home (spec 8.2:
 // "进入'在线音乐' -> 请求 /health"). No-op while a wake is already in
 // flight; safe to call repeatedly (e.g. re-entering the page).
+//
+// 如果服务最近已经确认过 Ready，这里也直接跳过：buildCloudMusicHome() 每次
+// 进页面都会无条件调这个函数（不只是第一次进），没有这个判断的话，每次进
+// 页面都会重新做一次 WiFiClientSecure/mbedTLS 的健康检查握手——这个任务没
+// 绑核，会跟 LVGL 渲染任务抢 CPU，正好对应"进在线音乐时UI有点卡"这个真实
+// 反馈。5 分钟这个窗口比 Render 免费版约 15 分钟的休眠阈值短很多，所以不会
+// 重新引入两段式唤醒机制本来要解决的"双重冷启动 502"问题——真正冷启动的
+//情况还是会走完整的唤醒流程。
+static constexpr uint32_t kCloudReadySkipWindowMs = 5UL * 60UL * 1000UL;
+
 void playerCoreCloudMusicWakeStart() {
     if (s_cloudWakeTaskRunning) return;
+    if (s_cloudServiceState == CloudServiceState::Ready && (millis() - s_cloudLastReadyMs) < kCloudReadySkipWindowMs) return;
     const CloudMusicConfig cfg = playerCoreCloudMusicConfig();
     if (!cfg.configured) {
         s_cloudServiceState = CloudServiceState::Offline;
@@ -3619,7 +3647,7 @@ void playerCoreCloudMusicWakeStart() {
     // every kilobyte of task stack is internal heap that mbedTLS needs for
     // its handshake buffers -- the "唤醒不了" bug was heap exhaustion, so
     // stack stays at the proven size rather than being bumped speculatively.
-    if (xTaskCreate(cloudMusicWakeTask, "cloudWake", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(cloudMusicWakeTask, "cloudWake", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
         s_cloudWakeTaskRunning = false;
         s_cloudServiceState = CloudServiceState::Offline;
         MWR_LOG_ERROR("Failed to create cloud music wake task");
@@ -4006,7 +4034,7 @@ void playerCoreCloudDiagStart() {
     // 16K covers DNS+TCP+TLS here (TLS heap buffers are separate from this
     // task's stack); the earlier 24K version was one more big heap consumer
     // on an already tight device.
-    if (xTaskCreate(cloudDiagTask, "cloudDiag", 16384, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(cloudDiagTask, "cloudDiag", 16384, nullptr, 1, nullptr, 0) != pdPASS) {
         s_cloudDiagRunning = false;
         MWR_LOG_ERROR("Failed to create cloud diag task");
     }
@@ -4491,7 +4519,7 @@ static void cloudThumbSyncTask(void*) {
 void playerCoreCloudThumbSyncStart() {
     if (s_cloudThumbSyncInProgress) return;
     s_cloudThumbSyncInProgress = true;
-    if (xTaskCreate(cloudThumbSyncTask, "cloudThumb", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(cloudThumbSyncTask, "cloudThumb", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
         s_cloudThumbSyncInProgress = false;
         MWR_LOG_ERROR("Failed to create cloud thumb sync task");
     }
@@ -4569,7 +4597,7 @@ void playerCoreCloudNowPlayingCoverStart(const char* fallbackUrl) {
         return; // already cached (or nothing to fetch) -- no task needed
     }
     s_cloudNowPlayingCoverRequested = true;
-    if (xTaskCreate(cloudNowPlayingCoverTask, "npCover", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(cloudNowPlayingCoverTask, "npCover", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
         s_cloudNowPlayingCoverRequested = false;
         MWR_LOG_ERROR("Failed to create now-playing cover task");
     }
@@ -4694,8 +4722,8 @@ void playerCoreCloudMusicLyricsStart(const char* trackId) {
         s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Loading);
         const uint32_t generation = ++s_cloudLyricGeneration;
         cloudResultUnlock();
-        if (xTaskCreate(cloudLyricsFetchTask, "cloudLyr", 8192,
-                        reinterpret_cast<void*>(static_cast<uintptr_t>(generation)), 1, nullptr) != pdPASS) {
+        if (xTaskCreatePinnedToCore(cloudLyricsFetchTask, "cloudLyr", 8192,
+                        reinterpret_cast<void*>(static_cast<uintptr_t>(generation)), 1, nullptr, 0) != pdPASS) {
             if (cloudResultLock(pdMS_TO_TICKS(1000))) {
                 s_cloudLyricsState = static_cast<uint8_t>(CloudLyricsState::Error);
                 cloudResultUnlock();
@@ -4934,7 +4962,7 @@ static void onWifiNetworkReady() {
     s_f_dlnaSeekServer = true;
     s_lvglNetworkReady = true;
     if (!s_weatherMutex) s_weatherMutex = xSemaphoreCreateMutex();
-    if (xTaskCreate(weatherTask, "weather", 10240, nullptr, 1, nullptr) != pdPASS) MWR_LOG_ERROR("Failed to create weather task");
+    if (xTaskCreatePinnedToCore(weatherTask, "weather", 10240, nullptr, 1, nullptr, 0) != pdPASS) MWR_LOG_ERROR("Failed to create weather task");
 }
 
 // startWifiApFallback() (WiFi.mode(WIFI_AP_STA) + softAP + DNSServer) is
@@ -5015,7 +5043,7 @@ static void wifiReconnectTask(void*) {
 static bool startWifiReconnectTask() {
     if (s_wifiReconnectInProgress) return false;
     s_wifiReconnectInProgress = true;
-    const BaseType_t created = xTaskCreate(wifiReconnectTask, "wifiReconn", 4096, nullptr, 1, nullptr);
+    const BaseType_t created = xTaskCreatePinnedToCore(wifiReconnectTask, "wifiReconn", 4096, nullptr, 1, nullptr, 0);
     if (created != pdPASS) {
         s_wifiReconnectInProgress = false;
         MWR_LOG_ERROR("Failed to create WiFi reconnect task");
@@ -5067,7 +5095,7 @@ void playerCoreWifiAddNetwork(const char* ssid, const char* password) {
     strlcpy(request->ssid, ssid, sizeof(request->ssid));
     if (password) strlcpy(request->password, password, sizeof(request->password));
     s_wifiAddInProgress = true;
-    const BaseType_t created = xTaskCreate(wifiAddTask, "wifiAdd", 6144, request, 1, nullptr);
+    const BaseType_t created = xTaskCreatePinnedToCore(wifiAddTask, "wifiAdd", 6144, request, 1, nullptr, 0);
     if (created != pdPASS) {
         s_wifiAddInProgress = false;
         free(request);
@@ -5128,7 +5156,7 @@ static void wifiScanTask(void*) {
 void playerCoreWifiScanStart() {
     if (s_wifiScanInProgress) return;
     s_wifiScanInProgress = true;
-    const BaseType_t created = xTaskCreate(wifiScanTask, "wifiScan", 4096, nullptr, 1, nullptr);
+    const BaseType_t created = xTaskCreatePinnedToCore(wifiScanTask, "wifiScan", 4096, nullptr, 1, nullptr, 0);
     if (created != pdPASS) {
         s_wifiScanInProgress = false;
         s_wifiScanResultCount = 0;
@@ -5391,13 +5419,13 @@ void setup() {
     // (with the real playback-crash fix being the deferred-navigation
     // change, not this stack) remains sufficient. Keeping it at 12K leaves
     // a little headroom while sparing internal heap for mbedTLS.
-    if (xTaskCreate(cloudMusicControllerTask, "cloudCtrl", 12288, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(cloudMusicControllerTask, "cloudCtrl", 12288, nullptr, 1, nullptr, 0) != pdPASS) {
         MWR_LOG_ERROR("Failed to create cloud music controller task");
     }
     // Keep both Render free-tier services awake (see cloudKeepaliveTask) --
     // cheap (one TLS pair every 9 min), prevents the double-cold-start
     // "加载失败/502" after idle.
-    if (xTaskCreate(cloudKeepaliveTask, "cloudKeep", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreatePinnedToCore(cloudKeepaliveTask, "cloudKeep", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
         MWR_LOG_ERROR("Failed to create cloud keepalive task");
     }
     // Lyrics fetch task starts unconditionally (not gated on WiFi connecting
@@ -5406,7 +5434,7 @@ void setup() {
     // itself checks WiFi.isConnected() and returns immediately if it's down.
     s_lyricsMutex = xSemaphoreCreateMutex();
     s_lyricsFetchQueue = xQueueCreate(1, sizeof(uint16_t));
-    if (xTaskCreate(lyricsFetchTask, "lyricsFetch", 8192, nullptr, 1, nullptr) != pdPASS) MWR_LOG_ERROR("Failed to create lyrics fetch task");
+    if (xTaskCreatePinnedToCore(lyricsFetchTask, "lyricsFetch", 8192, nullptr, 1, nullptr, 0) != pdPASS) MWR_LOG_ERROR("Failed to create lyrics fetch task");
     Audio::audio_info_callback = my_audio_info; // audio callback
     dlna.dlna_client_callbak(on_dlna_client);   // dlna callback
     bt_emitter.kcx_bt_emitter_callback(on_kcx_bt_emitter);

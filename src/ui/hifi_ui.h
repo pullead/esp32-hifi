@@ -512,6 +512,24 @@ class HifiUi {
     char m_cloudCoverTrackId[24]{};
     bool m_cloudCoverReady = false;
     uint32_t m_lastCloudCoverRetry = 0;
+    // 云音乐封面解码结果的小容量 LRU 缓存：跟 m_coverArtPixels 这个"当前
+    // 显示中"的槽位完全独立、各自拥有自己的内存，避免两边共享指针导致
+    // clearCoverArt() 把缓存里还在用的内存也 free 掉。命中缓存时是整块
+    // memcpy 一份到 m_coverArtPixels，不是共享指针——多一次内存拷贝，换
+    // 来零风险（不会有任何一边意外持有悬空指针）。4 个槽位、每个约几十KB，
+    // PSRAM 完全够用。目的是切歌来回切时不用重复解码同一张 JPEG。
+    static constexpr uint8_t kCloudCoverCacheSlots = 4;
+    struct CloudCoverCacheEntry {
+        char trackId[24]{};
+        uint16_t* pixels = nullptr;
+        uint16_t w = 0;
+        uint16_t h = 0;
+        uint32_t lastUsedSeq = 0;
+    };
+    CloudCoverCacheEntry m_cloudCoverCache[kCloudCoverCacheSlots];
+    uint32_t m_cloudCoverCacheSeq = 0;
+    bool cloudCoverCacheLookup(const char* trackId, uint16_t** outPixels, uint16_t* outW, uint16_t* outH);
+    void cloudCoverCacheInsert(const char* trackId, const uint16_t* pixels, uint16_t w, uint16_t h);
     // Which cloud track's lyrics were last requested (mirrors
     // m_cloudCoverTrackId -- used to trigger the async fetch once per
     // track change).
