@@ -3812,8 +3812,17 @@ static void cloudMusicControllerTask(void*) {
                 s_cloudHotState = CloudMusicRequestState::Loading;
                 cloudResultUnlock();
             }
-            char path[64];
-            snprintf(path, sizeof(path), "/esp/v1/playlists/hot?limit=%u", kCloudHotPlaylistMax);
+            // Optional language-category tag ("华语"/"欧美"/"日语"...) --
+            // passed through the command param (see the 语言分类 feature),
+            // URL-encoded since the tags are non-ASCII.
+            char path[192];
+            if (cmd.param[0]) {
+                String catEnc;
+                urlEncodeAppend(catEnc, cmd.param);
+                snprintf(path, sizeof(path), "/esp/v1/playlists/hot?limit=%u&cat=%s", kCloudHotPlaylistMax, catEnc.c_str());
+            } else {
+                snprintf(path, sizeof(path), "/esp/v1/playlists/hot?limit=%u", kCloudHotPlaylistMax);
+            }
             String body;
             const bool ok = cloudMusicHttpGetWithRetry(path, body, cmd.generation);
             if (cmd.generation != s_cloudRequestGeneration) continue;
@@ -4004,12 +4013,12 @@ bool playerCoreCloudMusicSearchHasMore() { return s_cloudSearchHasMore; }
 
 const char* playerCoreCloudMusicLastError() { return s_cloudLastError; }
 
-void playerCoreCloudMusicHotPlaylistsStart() {
+void playerCoreCloudMusicHotPlaylistsStart(const char* cat) {
     if (cloudResultLock(pdMS_TO_TICKS(1000))) {
         s_cloudHotState = CloudMusicRequestState::Loading;
         cloudResultUnlock();
     }
-    cloudMusicEnqueue(CloudCommandType::LoadHotPlaylists, nullptr);
+    cloudMusicEnqueue(CloudCommandType::LoadHotPlaylists, (cat && cat[0]) ? cat : nullptr);
 }
 
 uint8_t playerCoreCloudMusicHotPlaylistsState() { return static_cast<uint8_t>(s_cloudHotState); }

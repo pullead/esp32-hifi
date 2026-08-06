@@ -3846,15 +3846,15 @@ void HifiUi::buildCloudMusicHome() {
         return;
     }
 
-    // Three category tiles. 42px rows with a leading icon chip, a big name
-    // and a one-line hint -- roomy enough to tap on a 320x170 panel.
-    static const char* const kCatNames[3] = {"热门歌单", "歌曲排行榜", "新歌速递"};
-    static const char* const kCatSubs[3] = {"精选网友歌单，一键开听", "飙升 / 热歌 / 新歌榜", "最新上架歌曲抢先听"};
-    static const char* const kCatIcons[3] = {LV_SYMBOL_LIST, LV_SYMBOL_PLAY, LV_SYMBOL_REFRESH};
-    for (uint8_t i = 0; i < 3; ++i) {
+    // Four category tiles: compact 32px rows (36px pitch) so all four fit
+    // the 320x170 panel under the 24px top bar (last row ends at y=168).
+    static const char* const kCatNames[4] = {"热门歌单", "歌曲排行榜", "新歌速递", "语言分类"};
+    static const char* const kCatSubs[4] = {"精选网友歌单，一键开听", "飙升 / 热歌 / 新歌榜", "最新上架歌曲抢先听", "中文 / 英语 / 日语 / 粤语"};
+    static const char* const kCatIcons[4] = {LV_SYMBOL_LIST, LV_SYMBOL_PLAY, LV_SYMBOL_REFRESH, LV_SYMBOL_AUDIO};
+    for (uint8_t i = 0; i < 4; ++i) {
         lv_obj_t* tile = lv_btn_create(screen);
-        lv_obj_set_pos(tile, 8, 30 + i * 44);
-        lv_obj_set_size(tile, 304, 40);
+        lv_obj_set_pos(tile, 8, 28 + i * 36);
+        lv_obj_set_size(tile, 304, 32);
         lv_obj_set_style_radius(tile, 10, 0);
         lv_obj_set_style_bg_color(tile, kPanel, 0);
         lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
@@ -3866,20 +3866,20 @@ void HifiUi::buildCloudMusicHome() {
         lv_obj_add_event_cb(tile, onCloudCategoryAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
 
         lv_obj_t* iconChip = lv_obj_create(tile);
-        lv_obj_set_pos(iconChip, 8, 8);
-        lv_obj_set_size(iconChip, 24, 24);
+        lv_obj_set_pos(iconChip, 8, 5);
+        lv_obj_set_size(iconChip, 22, 22);
         lv_obj_set_style_radius(iconChip, 6, 0);
         lv_obj_set_style_bg_color(iconChip, kPanelDeep, 0);
         lv_obj_set_style_border_width(iconChip, 0, 0);
         lv_obj_set_style_pad_all(iconChip, 0, 0);
         lv_obj_clear_flag(iconChip, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_clear_flag(iconChip, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t* icon = makeText(iconChip, kCatIcons[i], &lv_font_montserrat_14, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_t* icon = makeText(iconChip, kCatIcons[i], &lv_font_montserrat_12, kAccentBright, LV_ALIGN_CENTER, 0, 0);
         lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
 
-        lv_obj_t* name = makeText(tile, kCatNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 40, 3);
+        lv_obj_t* name = makeText(tile, kCatNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 38, 0);
         lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_t* sub = makeText(tile, kCatSubs[i], &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 40, -4);
+        lv_obj_t* sub = makeText(tile, kCatSubs[i], &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 38, -3);
         lv_obj_clear_flag(sub, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_t* chevron = makeText(tile, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_RIGHT_MID, -10, 0);
         lv_obj_clear_flag(chevron, LV_OBJ_FLAG_CLICKABLE);
@@ -3895,7 +3895,13 @@ void HifiUi::refreshCloudMusicHome() {
 // its own page with a 28px cover thumbnail per row (downloaded/cached by
 // the background cloudThumbSyncTask; a placeholder tile until it lands).
 void HifiUi::buildCloudHotPlaylists() {
-    buildAudioTopBar("热门歌单", nullptr, false, nullptr);
+    // Language-classified lists (中文/英语/日语...) land on this same page
+    // with their own title and the language's category tag; the plain
+    // 热门歌单 entry has neither.
+    char title[40];
+    if (m_cloudLanguageName[0]) snprintf(title, sizeof(title), "%s歌单", m_cloudLanguageName);
+    else strlcpy(title, "热门歌单", sizeof(title));
+    buildAudioTopBar(title, nullptr, false, nullptr);
     lv_obj_t* screen = lv_scr_act();
 
     m_cloudListHint = makeText(screen, "", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 34);
@@ -3919,7 +3925,7 @@ void HifiUi::buildCloudHotPlaylists() {
         lv_label_set_text(m_cloudListHint, "尚未配置在线音乐网关");
         return;
     }
-    playerService.cloudMusicHotPlaylistsStart();
+    playerService.cloudMusicHotPlaylistsStart(m_cloudLanguageCat[0] ? m_cloudLanguageCat : nullptr);
     playerService.cloudThumbSyncStart(); // kick off the playlist-cover downloads
     m_lastCloudHotState = CloudMusicRequestState::Idle; // force a render on the first tick
     refreshCloudHotPlaylists();
@@ -4260,6 +4266,46 @@ void HifiUi::refreshCloudNewSongs() {
         lv_obj_set_width(artistLabel, item.vip || item.paid ? 232 : 268);
         lv_label_set_long_mode(artistLabel, LV_LABEL_LONG_DOT);
         lv_obj_clear_flag(artistLabel, LV_OBJ_FLAG_CLICKABLE);
+    }
+}
+
+// 语言分类: a static language picker. Each row maps to a NetEase playlist
+// category tag (华语/欧美/日语/粤语/韩语); tapping one opens the
+// hot-playlists page loaded with that tag (the page title becomes
+// "<语言>歌单"), reusing the same playlist-detail -> play path.
+void HifiUi::buildCloudLanguage() {
+    buildAudioTopBar("语言分类", nullptr, false, nullptr);
+    lv_obj_t* screen = lv_scr_act();
+
+    const CloudMusicConfig cfg = playerService.cloudMusicConfig();
+    if (!cfg.configured) {
+        makeText(screen, "尚未配置在线音乐网关\n请前往 设置 > 在线音乐 完成配置", &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_LEFT, 8, 40);
+        return;
+    }
+
+    static const char* const kLangNames[5] = {"中文", "英语", "日语", "粤语", "韩语"};
+    static const char* const kLangCats[5] = {"华语", "欧美", "日语", "粤语", "韩语"};
+    static const char* const kLangSubs[5] = {"华语流行 / 经典中文", "欧美流行 / 英文金曲", "J-Pop / 动漫 / City Pop", "港乐经典 / 粤语流行", "K-Pop / 韩剧 OST"};
+    for (uint8_t i = 0; i < 5; ++i) {
+        lv_obj_t* row = lv_btn_create(screen);
+        lv_obj_set_pos(row, 8, 28 + i * 36);
+        lv_obj_set_size(row, 304, 32);
+        lv_obj_set_style_radius(row, 10, 0);
+        lv_obj_set_style_bg_color(row, kPanel, 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(row, 0, 0);
+        lv_obj_set_style_shadow_width(row, 0, 0);
+        lv_obj_set_style_pad_all(row, 0, 0);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(row);
+        lv_obj_add_event_cb(row, onCloudLanguageAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i)));
+
+        lv_obj_t* name = makeText(row, kLangNames[i], &lv_font_cjk_13, kInk, LV_ALIGN_TOP_LEFT, 12, 0);
+        lv_obj_clear_flag(name, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* sub = makeText(row, kLangSubs[i], &lv_font_cjk_13, kInkFaint, LV_ALIGN_BOTTOM_LEFT, 12, -3);
+        lv_obj_clear_flag(sub, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_t* chevron = makeText(row, LV_SYMBOL_RIGHT, &lv_font_montserrat_14, kInkDim, LV_ALIGN_RIGHT_MID, -12, 0);
+        lv_obj_clear_flag(chevron, LV_OBJ_FLAG_CLICKABLE);
     }
 }
 
@@ -4876,9 +4922,26 @@ void HifiUi::onCloudMusicTrackRowAction(lv_event_t* event) {
 void HifiUi::onCloudCategoryAction(lv_event_t* event) {
     if (!s_instance) return;
     const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
-    if (index == 0) s_instance->show(Page::CloudHotPlaylists);
-    else if (index == 1) s_instance->show(Page::CloudRankings);
+    if (index == 0) {
+        // Plain hot playlists -- make sure no stale language tag leaks in
+        // from a previous 语言分类 visit.
+        s_instance->m_cloudLanguageCat[0] = '\0';
+        s_instance->m_cloudLanguageName[0] = '\0';
+        s_instance->show(Page::CloudHotPlaylists);
+    } else if (index == 1) s_instance->show(Page::CloudRankings);
     else if (index == 2) s_instance->show(Page::CloudNewSongs);
+    else if (index == 3) s_instance->show(Page::CloudLanguage);
+}
+
+void HifiUi::onCloudLanguageAction(lv_event_t* event) {
+    if (!s_instance) return;
+    const uint8_t index = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    static const char* const kLangNames[5] = {"中文", "英语", "日语", "粤语", "韩语"};
+    static const char* const kLangCats[5] = {"华语", "欧美", "日语", "粤语", "韩语"};
+    if (index >= 5) return;
+    strlcpy(s_instance->m_cloudLanguageName, kLangNames[index], sizeof(s_instance->m_cloudLanguageName));
+    strlcpy(s_instance->m_cloudLanguageCat, kLangCats[index], sizeof(s_instance->m_cloudLanguageCat));
+    s_instance->show(Page::CloudHotPlaylists); // loads hot playlists with ?cat=<tag>
 }
 
 void HifiUi::onCloudRankingRowAction(lv_event_t* event) {

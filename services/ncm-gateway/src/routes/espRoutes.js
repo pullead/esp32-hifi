@@ -82,11 +82,14 @@ router.get(
   withValidation(async (req, res) => {
     const limit = validators.parseLimit(req.query.limit, { max: 20, defaultValue: 8 });
     const offset = validators.parseOffset(req.query.offset);
+    // Optional NetEase playlist category (e.g. 华语/欧美/日语/粤语/韩语) --
+    // bounded length, everything else is passed through to the upstream.
+    const cat = typeof req.query.cat === 'string' && req.query.cat.length <= 24 ? req.query.cat : '';
 
-    const key = cacheKey('hot', limit, offset);
+    const key = cacheKey('hot', limit, offset, cat || 'all');
     let result = cache.hotPlaylistsCache.get(key);
     if (!result) {
-      result = await ncmProvider.hotPlaylists(limit, offset);
+      result = await ncmProvider.hotPlaylists(limit, offset, cat);
       cache.hotPlaylistsCache.set(key, result);
     }
     res.json({ ok: true, ...result });

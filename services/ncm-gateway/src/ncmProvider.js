@@ -128,14 +128,20 @@ function buildPlaylistSummary(pl) {
   };
 }
 
-async function hotPlaylists(limit, offset) {
-  const data = await upstreamGet('/top/playlist', { limit, offset, order: 'hot' });
+// cat is an optional NetEase playlist category tag ("华语"/"欧美"/"日语"/
+// "粤语"/"韩语" ...) -- used by the device's language-classification
+// category (语言分类). Empty means the default hot playlists feed.
+async function hotPlaylists(limit, offset, cat) {
+  const params = { limit, offset, order: 'hot' };
+  if (cat) params.cat = cat;
+  const data = await upstreamGet('/top/playlist', params);
   const playlists = (data && data.playlists) || [];
   const total = (data && data.total) || 0;
   return {
     items: playlists.map(buildPlaylistSummary),
     offset,
     has_more: offset + playlists.length < total,
+    cat: cat || '',
   };
 }
 

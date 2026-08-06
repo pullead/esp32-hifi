@@ -324,7 +324,9 @@ class PlayerService {
     bool cloudMusicSearchHasMore() const;
     const char* cloudMusicLastError() const; // shared across search/hot/playlist -- only one of them is ever Error at a time in this phase's single-request-at-a-time UI
 
-    void cloudMusicHotPlaylistsStart();
+    // cat: optional NetEase playlist category ("华语"/"欧美"/"日语"...) for
+    // the 语言分类 feature; empty/null loads the default hot feed.
+    void cloudMusicHotPlaylistsStart(const char* cat = nullptr);
     CloudMusicRequestState cloudMusicHotPlaylistsState() const;
     uint8_t cloudMusicHotPlaylistCount() const;
     bool cloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item) const;

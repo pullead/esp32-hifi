@@ -62,7 +62,7 @@ extern uint8_t playerCoreCloudMusicSearchResultCount();
 extern bool playerCoreCloudMusicSearchResult(uint8_t index, CloudTrackItem* item);
 extern bool playerCoreCloudMusicSearchHasMore();
 extern const char* playerCoreCloudMusicLastError();
-extern void playerCoreCloudMusicHotPlaylistsStart();
+extern void playerCoreCloudMusicHotPlaylistsStart(const char* cat);
 extern uint8_t playerCoreCloudMusicHotPlaylistsState();
 extern uint8_t playerCoreCloudMusicHotPlaylistCount();
 extern bool playerCoreCloudMusicHotPlaylist(uint8_t index, CloudPlaylistItem* item);
@@ -344,7 +344,7 @@ bool PlayerService::cloudMusicSearchHasMore() const { return playerCoreCloudMusi
 
 const char* PlayerService::cloudMusicLastError() const { return playerCoreCloudMusicLastError(); }
 
-void PlayerService::cloudMusicHotPlaylistsStart() { playerCoreCloudMusicHotPlaylistsStart(); }
+void PlayerService::cloudMusicHotPlaylistsStart(const char* cat) { playerCoreCloudMusicHotPlaylistsStart(cat); }
 
 CloudMusicRequestState PlayerService::cloudMusicHotPlaylistsState() const {
     return static_cast<CloudMusicRequestState>(playerCoreCloudMusicHotPlaylistsState());

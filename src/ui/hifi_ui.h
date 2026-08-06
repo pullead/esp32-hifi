@@ -50,7 +50,8 @@ class HifiUi {
         CloudNowPlaying,
         CloudHotPlaylists,
         CloudRankings,
-        CloudNewSongs
+        CloudNewSongs,
+        CloudLanguage
     };
     // Cycled by tapping the play-mode button: 顺序播放 (stop at the end of
     // the filtered list) -> 列表循环 (wrap back to the start) -> 单曲循环
@@ -102,6 +103,7 @@ class HifiUi {
     static void onCloudMusicTrackRowAction(lv_event_t* event);
     static void onCloudCategoryAction(lv_event_t* event);
     static void onCloudRankingRowAction(lv_event_t* event);
+    static void onCloudLanguageAction(lv_event_t* event);
     static void onCloudTransportAction(lv_event_t* event);
     static void onCloudHomeAction(lv_event_t* event);
     static void onQuickVolumeAction(lv_event_t* event);
@@ -152,6 +154,7 @@ class HifiUi {
     void refreshCloudRankings();
     void buildCloudNewSongs();
     void refreshCloudNewSongs();
+    void buildCloudLanguage();
     void buildCloudNowPlaying();
     void refreshCloudNowPlaying(const struct PlayerSnapshot& state);
     void loadCloudCover();
@@ -462,6 +465,11 @@ class HifiUi {
     CloudMusicRequestState m_lastCloudSearchState = CloudMusicRequestState::Idle;
     char m_cloudSelectedPlaylistId[24]{};
     char m_cloudSelectedPlaylistName[96]{};
+    // Language-classification context (语言分类): the selected NetEase
+    // playlist category tag and its display name. Cleared when the plain
+    // 热门歌单 entry is opened directly.
+    char m_cloudLanguageCat[16]{};
+    char m_cloudLanguageName[24]{};
     CloudMusicRequestState m_lastCloudPlaylistState = CloudMusicRequestState::Idle;
     // Tracked separately from m_lastCloudSearchState/m_lastCloudPlaylistState
     // -- a resolve (triggered by tapping a track row) overlays its own
