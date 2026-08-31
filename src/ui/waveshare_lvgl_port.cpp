@@ -4,7 +4,12 @@
 #include <Wire.h>
 #include <algorithm>
 #include <cmath>
+#include <driver/spi_master.h>
 #include <esp_heap_caps.h>
+#include <esp_memory_utils.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_vendor.h>
 
 // Owned by MiniWebRadio. Reuse it instead of starting Arduino's default Wire
 // object on the same I2C controller.
@@ -31,7 +36,17 @@ constexpr int kRowsPerBuffer = 80;
 // 改 TFT_FREQUENCY 对这条实际在跑的路径没有任何效果。40 -> 80MHz 已经实测
 // 稳定；现在测试 100MHz，其余配置（Flash QIO 40MHz / PSRAM 120MHz / 80行
 // buffer）保持不动，单独隔离这一个变量。
-constexpr uint32_t kTftSpiHz = 100000000;
+// 2026-09-03: 100MHz -> 80MHz。ESP32-S3 的 GPSPI 硬件上限就是 80MHz，
+// esp_lcd_new_panel_io_spi() 会校验 pclk_hz 并对超限值直接返回
+// ESP_ERR_INVALID_ARG（实测：填 100MHz 时 begin() 卡在这一步，整个显示
+// 驱动没建起来，屏幕不刷新）。
+//
+// 顺带纠正一条既有结论：此前 Arduino_GFX 路径填 100MHz "实测稳定"是假象。
+// Arduino 的 SPIClass 只按分频系数取最接近的可用档位，不做上限校验，所以
+// 那时候实际跑的本来就是 80MHz，从来没真到过 100MHz——换成会校验的
+// esp_lcd 之后这个问题才暴露出来。也就是说这里从 100 改回 80 并不会损失
+// 任何实际速度，只是把配置写成了硬件真正能做到的值。
+constexpr uint32_t kTftSpiHz = 80000000;
 constexpr uint8_t kTouchAddress = 0x15;
 constexpr uint8_t kImuAddress = 0x6B;
 constexpr bool kLcdSelfTest = false;
@@ -91,10 +106,68 @@ bool readRegisters(uint8_t address, uint8_t reg, uint8_t* data, size_t len) {
     return true;
 }
 
-Arduino_DataBus* s_bus = nullptr;
+// Both stay null since the 2026-09-03 esp_lcd migration -- the panel is now
+// driven by s_panel/s_panelIo below. Every remaining s_gfx user is null-
+// guarded and therefore a no-op; kept (rather than deleted along with the
+// Arduino_GFX dependency) only until the migration has proven stable on
+// hardware, so a revert stays a one-file change. What that costs today:
+//   - drawFallbackHome(): the pre-LVGL placeholder screen no longer draws.
+//     Harmless -- LVGL takes over within a second of boot either way.
+//   - runSelfTest(): already dead (kLcdSelfTest == false).
+//   - applyDisplayRotation() / pollImuOrientation(): already inert (IMU
+//     auto-rotate was removed by request 2026-07-24); orientation is now
+//     fixed at init via esp_lcd_panel_swap_xy/mirror.
+// s_bus is gone entirely -- nothing referenced it once Arduino_HWSPI was
+// dropped. s_gfx stays only because the null-guarded no-op users listed
+// above still name it.
 Arduino_GFX* s_gfx = nullptr;
 uint32_t s_flushCount = 0;
 uint32_t s_lastFallbackDraw = 0;
+
+// 2026-09-03: 显示链路迁移到官方 esp_lcd（方案见 docs/PLAN_esp_lcd_migration.md）。
+// 目的是把 flush 从"同步阻塞直到传完"改成"提交给 DMA 后立刻返回、传输完成中断
+// 里才通知 LVGL"，这样 LVGL 的双缓冲才真正吃到"渲染下一块 / 传输上一块"的并行。
+//
+// 这一步（第一阶段）只替换驱动，flush 仍然保持同步语义——先单独验证方向/偏移/
+// 颜色都对，再改异步。两个问题分开验证，避免出问题时分不清是驱动没配好还是异步
+// 逻辑有错。
+//
+// SPI host：ESP32-S3 上 Arduino 的 FSPI=0 对应 SPI2 总线，全局 SPI 对象就是
+// SPIClass SPI(FSPI)，而 Arduino_HWSPI 默认用它——所以此前能正常出画面的这条
+// 路径实际跑在 SPI2 上。注意 common.h:100 那条"必须用 SPI3、FSPI 收不到数据"的
+// 注释是旧 tftLib 路径的经验，不适用于这里。IDF 的枚举编号和 Arduino 不同：
+// SPI2_HOST 在 IDF 里是 1，别按 Arduino 的 FSPI=0 去填。
+constexpr spi_host_device_t kLcdSpiHost = SPI2_HOST;
+esp_lcd_panel_io_handle_t s_panelIo = nullptr;
+esp_lcd_panel_handle_t s_panel = nullptr;
+
+// Migration diagnostics. These have to be reported from the periodic [PERF]
+// line rather than printed once at init: this board re-enumerates USB when
+// the app starts, so a reset-and-capture drops the connection before any
+// app-level output arrives, and a capture without reset joins the stream too
+// late to see init messages. Periodic printing is the only thing a serial
+// capture can reliably observe here.
+esp_err_t s_lastDrawErr = ESP_OK;
+uint32_t s_drawErrCount = 0;
+uint32_t s_transDoneCount = 0;
+// How far begin() got, for the same "can't see init printf" reason. Each
+// step bumps it, so the periodic line shows exactly where it stopped:
+//   1 spi_bus_initialize  2 new_panel_io_spi  3 new_panel_st7789
+//   4 panel init/config   5 lv_init           6 draw buffers alloc'd
+//   7 lv_disp_drv_register  8 callbacks registered  9 fully ready
+volatile int s_beginStage = 0;
+esp_err_t s_lastInitErr = ESP_OK;
+
+// Runs in ISR context from the SPI DMA completion interrupt. Must stay tiny
+// and must not call anything that blocks -- lv_disp_flush_ready() only flips
+// a flag, which is safe here (this is the pattern esp_lcd's own LVGL examples
+// use). Returning false means "no higher-priority task was woken".
+bool IRAM_ATTR onColorTransDone(esp_lcd_panel_io_handle_t, esp_lcd_panel_io_event_data_t*, void* userCtx) {
+    ++s_transDoneCount;
+    auto* driver = static_cast<lv_disp_drv_t*>(userCtx);
+    if (driver) lv_disp_flush_ready(driver);
+    return false;
+}
 
 // 2026-08-07: 临时的串口性能基线统计，配合 LV_USE_PERF_MONITOR 一起看——
 // 那个只能在屏幕上看，这里额外从串口打印一份方便留存/对比，不依赖人盯着
@@ -162,30 +235,74 @@ bool WaveshareLvglPort::initPanel() {
         digitalWrite(LCD_BL, LOW);
     }
 
-    s_bus = new Arduino_HWSPI(LCD_DC, LCD_CS, LCD_CLK, LCD_DIN);
-    // ips=true: photos of the light-mode retheme showed a clean inversion
-    // signature (white bg -> near-black, purple #8A6CFF -> olive/yellow-
-    // green, teal #1CA9A0 -> pink/red -- textbook 255-minus-channel
-    // inversion). ST7789 panels disagree on default polarity; this board's
-    // panel wants INVON. Was invisible on the old dark theme by coincidence
-    // (inverted-dark still reads as "dark"), obvious once the bg is white.
-    s_gfx = new Arduino_ST7789(s_bus, LCD_RST, 0, true, 170, 320, 35, 0, 35, 0);
-    if (!s_gfx || !s_gfx->begin(kTftSpiHz)) {
-        printf("[LCD] Arduino_GFX begin failed\n");
+    // ---- SPI bus -------------------------------------------------------
+    // max_transfer_sz must cover the largest single draw_bitmap we ever
+    // issue: one full draw buffer (320 * kRowsPerBuffer * 2 bytes).
+    spi_bus_config_t busCfg = {};
+    busCfg.sclk_io_num = LCD_CLK;
+    busCfg.mosi_io_num = LCD_DIN;
+    busCfg.miso_io_num = -1;
+    busCfg.quadwp_io_num = -1;
+    busCfg.quadhd_io_num = -1;
+    busCfg.max_transfer_sz = kWidth * kRowsPerBuffer * static_cast<int>(sizeof(lv_color_t));
+    s_lastInitErr = spi_bus_initialize(kLcdSpiHost, &busCfg, SPI_DMA_CH_AUTO);
+    if (s_lastInitErr != ESP_OK) {
+        printf("[LCD] spi_bus_initialize failed\n");
         return false;
     }
-    applyDisplayRotation(false);
-    if (kBootColorFlash) {
-        s_gfx->fillScreen(kRed);
-        delay(120);
-        s_gfx->fillScreen(kGreen);
-        delay(120);
-        s_gfx->fillScreen(kBlue);
-        delay(120);
+    s_beginStage = 1;
+
+    // ---- panel IO ------------------------------------------------------
+    esp_lcd_panel_io_spi_config_t ioCfg = {};
+    ioCfg.cs_gpio_num = LCD_CS;
+    ioCfg.dc_gpio_num = LCD_DC;
+    ioCfg.spi_mode = 0;
+    ioCfg.pclk_hz = kTftSpiHz;
+    ioCfg.trans_queue_depth = 10;
+    ioCfg.lcd_cmd_bits = 8;
+    ioCfg.lcd_param_bits = 8;
+    // on_color_trans_done is registered later, in begin(), because its
+    // user_ctx has to be &m_displayDriver and that isn't initialized until
+    // after lv_disp_drv_init().
+    // esp_lcd_spi_bus_handle_t is just an int holding the host number.
+    s_lastInitErr = esp_lcd_new_panel_io_spi(static_cast<esp_lcd_spi_bus_handle_t>(kLcdSpiHost), &ioCfg, &s_panelIo);
+    if (s_lastInitErr != ESP_OK) {
+        printf("[LCD] esp_lcd_new_panel_io_spi failed\n");
+        return false;
     }
-    s_gfx->fillScreen(kBlack);
-    printf("[LCD] Arduino_GFX panel ready\n");
-    m_panel = s_gfx;
+    s_beginStage = 2;
+
+    // ---- ST7789 panel --------------------------------------------------
+    esp_lcd_panel_dev_config_t panelCfg = {};
+    panelCfg.reset_gpio_num = LCD_RST;
+    panelCfg.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
+    panelCfg.bits_per_pixel = 16;
+    s_lastInitErr = esp_lcd_new_panel_st7789(s_panelIo, &panelCfg, &s_panel);
+    if (s_lastInitErr != ESP_OK) {
+        printf("[LCD] esp_lcd_new_panel_st7789 failed\n");
+        return false;
+    }
+    s_beginStage = 3;
+    esp_lcd_panel_reset(s_panel);
+    esp_lcd_panel_init(s_panel);
+    // This board's panel wants INVON -- previously expressed as Arduino_GFX's
+    // ips=true. Photos of the light-mode retheme showed a clean inversion
+    // signature (white bg -> near-black, purple -> olive, teal -> pink), which
+    // stayed invisible on the old dark theme by coincidence.
+    esp_lcd_panel_invert_color(s_panel, true);
+    // Panel is physically 170x320 portrait; the UI is 320x170 landscape.
+    // swap_xy turns the axes, mirror fixes the resulting handedness, and the
+    // 35px RAM offset (portrait x) follows the swap onto the y axis.
+    // All three are empirical -- verify on hardware, see the plan's §6.
+    esp_lcd_panel_swap_xy(s_panel, true);
+    esp_lcd_panel_mirror(s_panel, true, false);
+    esp_lcd_panel_set_gap(s_panel, 0, 35);
+    esp_lcd_panel_disp_on_off(s_panel, true);
+    s_beginStage = 4;
+
+    printf("[LCD] esp_lcd ST7789 panel ready (SPI%d, %lu Hz)\n", static_cast<int>(kLcdSpiHost) + 1,
+           static_cast<unsigned long>(kTftSpiHz));
+    m_panel = s_panel;
     return true;
 }
 
@@ -209,6 +326,7 @@ bool WaveshareLvglPort::begin() {
     m_imuReady = initImu();
 
     lv_init();
+    s_beginStage = 5;
     const size_t bufferBytes = kWidth * kRowsPerBuffer * sizeof(lv_color_t);
     // PSRAM, not MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL: Arduino_HWSPI (the
     // driver actually in use here, see initPanel()) doesn't DMA straight out
@@ -224,11 +342,20 @@ bool WaveshareLvglPort::begin() {
     m_bufferB = static_cast<lv_color_t*>(heap_caps_malloc(bufferBytes, MALLOC_CAP_SPIRAM));
     printf("[LVGL] draw buffers: A=%p B=%p (internal free=%u, psram free=%u)\n", m_bufferA, m_bufferB,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    // esp_lcd hands these straight to the SPI DMA now, so whether they're
+    // reachable by DMA stopped being a don't-care (it was fine under
+    // Arduino_HWSPI, which copied through its own bounce buffer with plain
+    // CPU reads). See the plan's §6 -- this is the top risk of the migration.
+    if (m_bufferA) {
+        printf("[LVGL] buffer A: psram=%d dma_capable=%d\n", static_cast<int>(esp_ptr_external_ram(m_bufferA)),
+               static_cast<int>(esp_ptr_dma_capable(m_bufferA)));
+    }
     if (!m_bufferA || !m_bufferB) {
         printf("[LVGL] draw buffer alloc failed\n");
         return false;
     }
 
+    s_beginStage = 6;
     lv_disp_draw_buf_init(&m_drawBuffer, m_bufferA, m_bufferB, kWidth * kRowsPerBuffer);
     lv_disp_drv_init(&m_displayDriver);
     m_displayDriver.hor_res = kWidth;
@@ -242,6 +369,18 @@ bool WaveshareLvglPort::begin() {
         return false;
     }
     lv_disp_set_default(m_display);
+    s_beginStage = 7;
+
+    // Async completion: flush() queues the DMA transfer and returns; this
+    // callback is what actually tells LVGL the buffer is free again. Has to
+    // be registered after lv_disp_drv_register() so user_ctx points at a
+    // fully initialized driver.
+    esp_lcd_panel_io_callbacks_t ioCbs = {};
+    ioCbs.on_color_trans_done = onColorTransDone;
+    if (esp_lcd_panel_io_register_event_callbacks(s_panelIo, &ioCbs, &m_displayDriver) != ESP_OK) {
+        printf("[LVGL] esp_lcd callback register failed\n");
+        return false;
+    }
 
     lv_indev_drv_init(&m_touchDriver);
     m_touchDriver.type = LV_INDEV_TYPE_POINTER;
@@ -262,6 +401,7 @@ bool WaveshareLvglPort::begin() {
     m_touchDriver.gesture_limit = 56;
     m_touchDriver.long_press_time = 450;
     m_touchIndev = lv_indev_drv_register(&m_touchDriver);
+    s_beginStage = 8;
     s_instance = this;
     m_lastTick = millis();
     printf("[LVGL] port ready\n");
@@ -302,6 +442,18 @@ void WaveshareLvglPort::tick() {
                static_cast<unsigned long>(s_perfTimerHandlerBusyUs),
                static_cast<double>(s_perfTimerHandlerBusyUs) / 10000.0,
                static_cast<unsigned long>(s_perfTimerHandlerMaxUs));
+        // esp_lcd migration diagnostics -- remove once it's working.
+        // flushes = how many times flush() ran at all; trans_done = how many
+        // DMA completion callbacks came back. flushes>0 with trans_done==0 is
+        // the "transfer never completes" case; draw_err>0 means the transfer
+        // was rejected outright (then err tells us why, e.g. a buffer the SPI
+        // DMA can't reach).
+        printf("[LCDDBG] stage=%d init_err=%s flushes=%lu trans_done=%lu draw_err=%lu last_err=%s bufA_psram=%d bufA_dma=%d\n",
+               s_beginStage, esp_err_to_name(s_lastInitErr),
+               static_cast<unsigned long>(s_flushCount), static_cast<unsigned long>(s_transDoneCount),
+               static_cast<unsigned long>(s_drawErrCount), esp_err_to_name(s_lastDrawErr),
+               s_instance && s_instance->m_bufferA ? static_cast<int>(esp_ptr_external_ram(s_instance->m_bufferA)) : -1,
+               s_instance && s_instance->m_bufferA ? static_cast<int>(esp_ptr_dma_capable(s_instance->m_bufferA)) : -1);
         s_perfWindowStartMs = now;
         s_perfFlushAtWindowStart = s_flushCount;
         s_perfTimerHandlerCalls = 0;
@@ -433,8 +585,8 @@ void WaveshareLvglPort::pollImuOrientation() {
 }
 
 void WaveshareLvglPort::flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_color_t* colorMap) {
-    auto* gfx = static_cast<Arduino_GFX*>(driver->user_data);
-    if (!gfx || !colorMap) {
+    auto* panel = static_cast<esp_lcd_panel_handle_t>(driver->user_data);
+    if (!panel || !colorMap) {
         lv_disp_flush_ready(driver);
         return;
     }
@@ -450,8 +602,23 @@ void WaveshareLvglPort::flush(lv_disp_drv_t* driver, const lv_area_t* area, lv_c
                       static_cast<long>(height));
     }
     ++s_flushCount;
-    gfx->draw16bitRGBBitmap(area->x1, area->y1, reinterpret_cast<uint16_t*>(colorMap), width, height);
-    lv_disp_flush_ready(driver);
+    // esp_lcd's end coordinates are exclusive, LVGL's area is inclusive.
+    // Queues the transfer and returns immediately -- lv_disp_flush_ready() is
+    // deliberately NOT called here. It happens in onColorTransDone() once the
+    // DMA actually finishes, which is the whole point of this migration:
+    // LVGL gets to render into the other buffer while this one is still on
+    // the wire. Calling flush_ready here would let LVGL overwrite a buffer
+    // the DMA is still reading.
+    const esp_err_t err = esp_lcd_panel_draw_bitmap(panel, area->x1, area->y1, area->x2 + 1, area->y2 + 1, colorMap);
+    if (err != ESP_OK) {
+        // If the transfer is rejected outright there will be no completion
+        // callback, so LVGL would wait on flush_ready forever and the whole
+        // UI silently freezes with flush/s stuck at 0. Report it and release
+        // the buffer ourselves so at least the failure is visible/recoverable.
+        s_lastDrawErr = err;
+        ++s_drawErrCount;
+        lv_disp_flush_ready(driver);
+    }
 }
 
 bool WaveshareLvglPort::readTouchPoint(uint16_t* x, uint16_t* y) {
