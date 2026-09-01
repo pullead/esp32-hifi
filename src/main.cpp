@@ -1602,7 +1602,24 @@ static uint32_t s_usbStoragePartitionStartLba = 0;
 static UsbStorageFormatInfo s_usbStorageFormatInfo{};
 
 #if MWR_USB_MSC_SUPPORTED
-static USBMSC s_usbMsc;
+// ⚠️ USBMSC 的**构造函数**里就调了 tinyusb_enable_interface(USB_INTERFACE_MSC, …)
+// （arduino-esp32 cores/esp32/USBMSC.cpp:204），也就是说只要这个对象存在，
+// MSC 描述符就无条件被塞进配置描述符 —— 跟有没有调 begin() 毫无关系。
+//
+// 它原本是文件级全局对象，后果是**声卡模式下 MSC 接口也跟着枚举**：设备在主机
+// 眼里成了 MSC + Audio 的复合设备（2026-09-05 用 macOS 的 ioreg 实测确认，
+// 接口 0 是 TinyUSB MSC、接口 1 才是音频）。这既违背了"一个 USB 口同时只能是
+// 一种用途"的设计，MSC 的 bulk 端点还要占 USB-OTG 的 DFIFO —— 而等时端点每帧
+// 就要 196 字节，那块空间本来就吃紧，分不到时是**静默失败**：ep_out 保持 0、
+// 端点从不 arm，可 tud_audio_set_itf_cb 照样被调用，于是屏幕上看到的就是
+// "str=1 但 PACKETS 永远 0"，一个错误都不报。
+//
+// 改成函数内 static（C++11 magic static，线程安全的延迟构造）：第一次调用才
+// 真正构造，声卡模式下这个函数永远不会被走到，MSC 接口自然也就不会注册。
+static USBMSC& usbMsc() {
+    static USBMSC instance;
+    return instance;
+}
 static bool s_usbMscConfigured = false;
 static bool s_usbStarted = false;
 static uint16_t s_usbMscSectorSize = 0;
@@ -1773,23 +1790,23 @@ static bool usbStorageProbeGeometry() {
 static bool usbStoragePrepareMsc(bool mediaPresent) {
     if (!usbStorageProbeGeometry()) return false;
     if (!s_usbMscConfigured) {
-        s_usbMsc.vendorID("ESP32S3");
-        s_usbMsc.productID("HiFi SD");
-        s_usbMsc.productRevision("1.0");
-        s_usbMsc.onRead(usbMscRead);
-        s_usbMsc.onWrite(usbMscWrite);
-        s_usbMsc.onStartStop(usbMscStartStop);
-        s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
-        s_usbMsc.mediaPresent(mediaPresent);
-        if (!s_usbMsc.begin(static_cast<uint32_t>(s_usbMscBlockCount), s_usbMscSectorSize)) {
+        usbMsc().vendorID("ESP32S3");
+        usbMsc().productID("HiFi SD");
+        usbMsc().productRevision("1.0");
+        usbMsc().onRead(usbMscRead);
+        usbMsc().onWrite(usbMscWrite);
+        usbMsc().onStartStop(usbMscStartStop);
+        usbMsc().isWritable(!kUsbMscReadOnlyProbe);
+        usbMsc().mediaPresent(mediaPresent);
+        if (!usbMsc().begin(static_cast<uint32_t>(s_usbMscBlockCount), s_usbMscSectorSize)) {
             MWR_LOG_ERROR("USB MSC begin failed");
-            s_usbMsc.mediaPresent(false);
+            usbMsc().mediaPresent(false);
             return false;
         }
         s_usbMscConfigured = true;
     } else {
-        s_usbMsc.isWritable(!kUsbMscReadOnlyProbe);
-        s_usbMsc.mediaPresent(mediaPresent);
+        usbMsc().isWritable(!kUsbMscReadOnlyProbe);
+        usbMsc().mediaPresent(mediaPresent);
     }
 
     if (!s_usbStarted) {
@@ -1802,7 +1819,7 @@ static bool usbStoragePrepareMsc(bool mediaPresent) {
         fflush(stdout);
         if (!s_usbStarted) {
             MWR_LOG_ERROR("USB begin failed");
-            s_usbMsc.mediaPresent(false);
+            usbMsc().mediaPresent(false);
             return false;
         }
     }

@@ -42,6 +42,7 @@ struct UsbDacStatus {
     uint32_t bufferUnderruns;  // 见上面关于时钟漂移的说明
     uint32_t bufferOverruns;
     uint32_t framesReceived;   // 收到的 USB 音频包数，用来确认数据真的在流动
+
 };
 
 // 开机时调用，仅在 NVS 标志为真的分支里。返回 false 表示初始化失败，
@@ -52,3 +53,14 @@ bool usbDacBegin();
 void usbDacLoop();
 
 void usbDacGetStatus(UsbDacStatus* out);
+
+// 6 段实时频谱（低音..高音），0..255，供 UI 画点阵频谱。
+//
+// 本地播放页的频谱来自 Audio::getSpectrumBands()——那是**解码器**算的，而声卡
+// 模式下音频根本不经过 Audio 对象（PCM 由 USB 直接送到 I2S），所以那条路在这里
+// 拿不到任何东西，只能自己从收到的 PCM 算。
+//
+// ⚠️ 内部会做一次 512 点 FFT，**必须在 UI 线程（core 1）调用**。不要放到音频
+// 路径上——core 0 是 I2S 任务的地盘，欠载比掉帧严重得多（见 usbDacBegin() 里
+// 关于任务钉核的注释）。rx 回调那边只抽样存快照，一次计算都不做。
+void usbDacGetSpectrum(uint8_t out[6]);

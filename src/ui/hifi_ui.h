@@ -92,7 +92,6 @@ class HifiUi {
     static void onUsbStorageAction(lv_event_t* event);
     static void onUsbDacEnterAction(lv_event_t* event);
     static void onUsbDacExitAction(lv_event_t* event);
-    static void onUsbDacDiagToggle(lv_event_t* event);
     static void onCloudMusicEditBaseUrlAction(lv_event_t* event);
     static void onCloudMusicEditDeviceKeyAction(lv_event_t* event);
     static void onCloudMusicConfigBackAction(lv_event_t* event);
@@ -430,15 +429,28 @@ class HifiUi {
     // USB 声卡模式。这一页在声卡模式下是**唯一**能看到诊断的地方——
     // TinyUSB 接管 USB 口之后 USB-Serial/JTAG 控制台就没了，printf 抓不到。
     lv_obj_t* m_usbDacEnterButton = nullptr;
-    lv_obj_t* m_usbDacState = nullptr;
-    lv_obj_t* m_usbDacFormat = nullptr;
-    lv_obj_t* m_usbDacVuL = nullptr;
-    lv_obj_t* m_usbDacVuR = nullptr;
-    // 诊断行默认收起：under/over/pkts 是声卡模式下调时钟同步的唯一手段
-    // （串口控制台被 TinyUSB 占用了），不能删，但不该常驻主画面。
-    bool m_usbDacDiagOpen = false;
+    lv_obj_t* m_usbDacState = nullptr;   // 卡片右上：正在播放 / 等待主机连接 / 已静音
+    lv_obj_t* m_usbDacFormat = nullptr;  // 卡片右上副行：主机音量 / 预填状态
+    // 电平表直接复用 Radio Now Playing 那套：封面下方的 9 段 VFD 梯
+    // （m_vfdSegments）+ 其下的 L/R 峰值保持读数（m_peakLLabel/m_peakRLabel），
+    // 位置与几何完全不变。页面互斥，这些成员在 resetWidgets() 里已经会被清空。
+    // 顶栏右侧的连接指示（一个圆点 + 文字），和卡片里的播放状态不是一回事：
+    // 这里说的是"USB 连没连上"，卡片里说的是"有没有在传音频"。
+    lv_obj_t* m_usbDacLinkDot = nullptr;
+    lv_obj_t* m_usbDacLinkText = nullptr;
+    // 原专辑封面那 72x72 的位置改成采样率信息块（声卡模式没有封面可显示，
+    // UAC2 协议里压根没有元数据字段）。
+    lv_obj_t* m_usbDacRateBig = nullptr;  // 大号采样率数字，如 "48.0"
+    lv_obj_t* m_usbDacDepth = nullptr;    // "16bit · 2ch"
+    lv_obj_t* m_usbDacMuteBadge = nullptr;
+    // 底栏信息栏：缓冲水位条 + under/over/pkts。
+    // under/over/pkts 是声卡模式下调时钟同步的**唯一**手段（串口控制台被
+    // TinyUSB 占用了），所以常驻显示，不再藏在点击切换后面。
     lv_obj_t* m_usbDacBuffer = nullptr;
-    lv_obj_t* m_usbDacCounters = nullptr;
+    lv_obj_t* m_usbDacBufBar = nullptr;
+    lv_obj_t* m_usbDacCounters = nullptr;  // "under / over"，合成一格
+    lv_obj_t* m_usbDacPkts = nullptr;
+    lv_obj_t* m_usbDacLatency = nullptr;
     UsbStorageState m_lastUsbStorageState = UsbStorageState::Unsupported;
     // Mount confirmation: the first tap on 挂载 arms the button, a second
     // tap within 5s actually mounts (mount now stops playback and reboots

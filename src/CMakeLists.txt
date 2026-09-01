@@ -8,7 +8,11 @@
 
 FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.*)
 
-idf_component_register(SRCS ${app_sources} INCLUDE_DIRS "." PRIV_REQUIRES espressif__tinyusb)
+# espressif__esp-dsp: usb_dac.cpp 的 usbDacGetSpectrum() 用它做 512 点 FFT
+# （声卡模式拿不到 Audio::getSpectrumBands()，见那边的注释）。组件本来就在
+# managed_components 里，但 ESP-IDF 只沿 REQUIRES 边共享 include 路径，
+# 不声明这条边的话 #include "esp_dsp.h" 找不到。
+idf_component_register(SRCS ${app_sources} INCLUDE_DIRS "." PRIV_REQUIRES espressif__tinyusb espressif__esp-dsp)
 
 # espressif/tinyusb (pulled in via platformio.ini's custom_component_add)
 # requires the *consumer* to point it at a project-supplied tusb_config.h --

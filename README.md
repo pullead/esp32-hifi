@@ -117,6 +117,10 @@ target:
   manual add-network flow, two LVGL crash root-causes. **Has an open,
   unresolved issue at the bottom** — read it before touching WiFi
   credential code.
+- `docs/DEV_LOG_2026-09-06_usb_dac_no_sound.md` — USB 声卡模式从「完全没有
+  声音」到可用的四个根因（TinyUSB 回调改名导致的静默失效、全速 UAC2 反馈格式、
+  预填水位自造断流、MSC 接口未关），声卡页三段式界面重做，以及排查方法论。
+  **注意**：本轮修复只在 macOS 上验过，Windows/iOS/Android 尚未复测。
 
 ***
 

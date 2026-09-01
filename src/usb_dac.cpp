@@ -15,6 +15,12 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <string.h>
+#include <math.h>
+
+// 点阵频谱用。esp-dsp 已经在 managed_components 里（sdkconfig 的
+// CONFIG_DSP_OPTIMIZED=y / MAX_FFT_SIZE=4096），只需在 src/CMakeLists.txt 的
+// PRIV_REQUIRES 里加上 espressif__esp-dsp 这条边。
+#include "esp_dsp.h"
 
 #include "esp32-hal-tinyusb.h"
 #include "tusb.h"
@@ -46,6 +52,17 @@ constexpr size_t kRingBytes       = 24 * 1024;
 // 音乐没问题，看视频也还不至于明显唇音不同步；取 1/2 就会到 90ms 以上。
 constexpr size_t kRingTargetBytes = kRingBytes / 4;
 
+// --- 频谱快照 ---
+// UI 要画点阵频谱，但声卡模式下拿不到 Audio::getSpectrumBands()（那是解码器
+// 算的，而这里 PCM 不经过解码器），只能自己算。
+//
+// 分工：rx 回调里只把样本抄进这个环形快照（纯 memcpy 量级，不做任何计算），
+// 真正的 FFT 由 UI 线程在 usbDacGetSpectrum() 里做。音频路径一点都不碰——
+// 512 点 FFT 大约 100~200us，放到 core 0 的音频任务上是没必要的风险。
+//
+// 长度取 2 的幂，写指针用位与回绕（FFT 也要求 2 的幂）。
+constexpr size_t kSpecFftSize = 512;
+
 // ---------------------------------------------------------------------------
 // 描述符长度
 //
@@ -73,7 +90,14 @@ uint8_t  s_itfAudioControl = 0;
 
 volatile bool     s_mounted   = false;
 volatile bool     s_streaming = false;
+int16_t         s_specRing[kSpecFftSize];
+volatile size_t s_specHead = 0;
+
 volatile uint32_t s_sampleRate = 48000;
+// 主机请求的采样率与 I2S 当前实际配置的采样率。只有 i2sTask 会把后者改成前者，
+// 见 tud_audio_set_req_entity_cb() 里关于 use-after-free 的注释。
+volatile uint32_t s_pendingRate = 0;
+uint32_t          s_activeRate  = 0;
 volatile bool     s_muted = false;
 volatile int16_t  s_volumeDb256 = 0;
 volatile uint32_t s_underruns = 0;
@@ -194,7 +218,22 @@ void i2sTask(void*) {
     constexpr size_t kChunk = 768;
     uint8_t chunk[kChunk];
     uint32_t tick = 0;
+    // 连续读空的轮数。见下面 ringRead 返回 0 时的说明：单次读空是正常的，
+    // 只有连续空到超过 I2S DMA 撑得住的 30ms 才算真断流。
+    constexpr uint32_t kEmptyStreakLimit = 40; // 每轮 1ms
+    uint32_t emptyStreak = 0;
     while (s_i2sRunning) {
+        // 主机换了采样率就在这里重配 —— 只有本任务碰 s_i2sTx，所以安全。
+        // 重配等于换了时钟，缓冲里剩下的旧数据按新速率放会变调，直接丢掉重新预填。
+        const uint32_t wanted = s_pendingRate;
+        if (wanted && wanted != s_activeRate) {
+            if (i2sStart(wanted)) {
+                s_activeRate = wanted;
+                s_ringTail = s_ringHead; // 丢弃旧速率的残留
+                s_primed   = false;      // 退回预填，重新攒到目标水位
+            }
+        }
+
         // 每搬几次更新一次反馈值。不需要每帧都算——反馈端点本身是 1ms 一次，
         // 而缓冲水位的变化远比这慢。
         if ((++tick & 0x07) == 0 && s_streaming) updateFeedback();
@@ -210,19 +249,32 @@ void i2sTask(void*) {
 
         const size_t got = ringRead(chunk, kChunk);
         if (!got) {
-            // 只有"已预填 + 正在传 + 却依然干涸"才是真欠载。
+            // 环形缓冲被抽空是稳态下的**正常现象**，不是断流：i2s_channel_write()
+            // 会一直搬到 I2S DMA 塞满才阻塞，本任务是贪婪消费者，必然把 ring 抽干。
+            // 真正在护着音频的是 I2S DMA 那 30ms，只要它没跑干就一个采样都不会丢。
             //
-            // 之前这里对任何空缓冲都计数，结果十分钟记了 11 万次而声音完全正常
-            // ——因为 i2s_channel_write() 会一直搬到 DMA 塞满才阻塞，这个任务是
-            // 贪婪消费者，抽空缓冲是稳态下的**正常现象**，不是断流。真正的断流
-            // 是 I2S DMA 自己跑干，而那 30ms DMA 缓冲一直没空过。
-            if (s_streaming && s_primed) {
-                s_underruns = s_underruns + 1;
-                s_primed = false; // 退回预填，重新攒够再继续
+            // ⚠️ 所以这里**绝不能**一读空就退回预填。之前那版就是这么写的，
+            // 后果是自己制造断流：
+            //   I2S DMA 容量 6x240 帧 = 5760 字节 = 30ms
+            //   预填目标   kRingTargetBytes = 6144 字节 = 32ms
+            // 预填攒够的 6144 字节一上来就被 DMA 吸走 5760，ring 立刻见底 →
+            // 判定空 → 停止消费回去攒 32ms → 而 DMA 只撑得住 30ms → 断音。
+            // 攒够再放、再被吸干、再断，表现就是声音断续 + 状态在
+            // "缓冲中/正在播放"之间反复闪。
+            //
+            // 正确的判据是**连续空到超过 DMA 撑得住的时间**才算真断流。
+            // 这里每轮等 1ms，阈值取 40 轮 = 40ms > DMA 的 30ms。
+            if (++emptyStreak >= kEmptyStreakLimit) {
+                emptyStreak = 0;
+                if (s_streaming && s_primed) {
+                    s_underruns = s_underruns + 1;
+                    s_primed = false; // 真断流了，退回预填重新攒
+                }
             }
-            vTaskDelay(pdMS_TO_TICKS(2));
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
+        emptyStreak = 0;
         size_t written = 0;
         i2s_channel_write(s_i2sTx, chunk, got, &written, portMAX_DELAY);
     }
@@ -289,8 +341,13 @@ uint16_t loadDescriptor(uint8_t* dst, uint8_t* itf) {
         TUD_AUDIO20_DESC_CS_AS_ISO_EP(AUDIO_CS_AS_ISO_DATA_EP_ATT_NON_MAX_PACKETS_OK, AUDIO_CTRL_NONE,
                                       AUDIO_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, 0x0001),
 
-        // 反馈端点（IN 方向，主机读我们的实际速率）
-        TUD_AUDIO20_DESC_STD_AS_ISO_FB_EP((uint8_t)(0x80 | s_epFb), 4, 0x01),
+        // 反馈端点（IN 方向，主机读我们的实际速率）。
+        // wMaxPacketSize 必须是 **3** 而不是 4：USB 2.0 规范 5.12.4.2 规定全速
+        // 反馈是 10.14 格式的 3 字节，16.16 的 4 字节那是高速才用的，而 ESP32-S3
+        // 的 USB 只有全速。配套还要打 TinyUSB 的补丁——它原本按 UAC 版本而不是
+        // 按总线速度选格式，全速 UAC2 会错发 4 字节 16.16，主机解析出来是真值的
+        // 4 倍（192 采样/帧），于是不停重新协商流。详见 audiod_fb_send() 里的注释。
+        TUD_AUDIO20_DESC_STD_AS_ISO_FB_EP((uint8_t)(0x80 | s_epFb), 3, 0x01),
     };
 
     *itf += 2; // 本功能占用 AC + AS 两个接口
@@ -320,6 +377,21 @@ bool tud_audio_set_itf_cb(uint8_t, tusb_control_request_t const* request) {
         s_ringHead = 0;
         s_ringTail = 0;
         s_primed = false;
+
+        // ⚠️ 必须**在这里**就给出一个有效的反馈值，不能等 i2sTask 慢慢更新。
+        //
+        // 异步等时传输里，主机切到 alt=1 之后会先读反馈端点，再据此决定每个 USB
+        // 帧发多少个采样。反馈值是 0 就等于告诉它"这设备每帧要 0 个采样"——于是
+        // 它一个数据包都不发，环形缓冲永远攒不满预填水位，屏幕就一直停在
+        // "缓冲中"，频谱也一直不动。
+        //
+        // Windows 上没暴露出来：usbaudio2.sys 在反馈值无效时会自己回退到标称
+        // 速率。macOS / iOS / Android 都严格照反馈值办事。这就是 943c479
+        // "真机验证通过"（只在 Windows 上验的）却在另外三种主机上全都没声音的
+        // 原因——设备被正确认成声卡，engine 也建起来了，就是一个采样都不来。
+        //
+        // 开流后的微调仍旧由 i2sTask 里的 updateFeedback() 接管。
+        tud_audio_n_fb_set(0, (s_sampleRate << 16) / 1000);
     }
     return true;
 }
@@ -350,7 +422,19 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const* r
         for (uint32_t supported : kSampleRates) {
             if (rate == supported) {
                 s_sampleRate = rate;
-                i2sStart(rate); // 重配 I2S 时钟跟上主机
+                // ⚠️ 这里**不能**直接调 i2sStart()。这个回调跑在 TinyUSB 任务上，
+                // 而 i2sStart() 开头就 i2s_channel_disable + i2s_del_channel，
+                // 此刻 i2sTask（core 0）很可能正阻塞在 i2s_channel_write() 里
+                // 用着同一个句柄 —— 那就是 use-after-free。
+                //
+                // 之所以在 Windows 上从没炸过：它默认就是 48000，和 s_sampleRate
+                // 的初值相同，而且 SET SAM_FREQ 发生在切 alt=1 之前，那时 i2sTask
+                // 还停在预填的 vTaskDelay 上，侥幸躲过。iPhone/Apple Music 是
+                // 44.1k，必然走到这条路径上来。
+                //
+                // 改成只记下目标速率，真正的重配由 i2sTask 自己在循环里做 ——
+                // 句柄从头到尾只被一个任务碰，竞态从根上就不存在了。
+                s_pendingRate = rate;
                 return true;
             }
         }
@@ -415,8 +499,24 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const* r
     return false;
 }
 
-// 一包音频到了。这里跑在 TinyUSB 任务里，只做搬运，不做任何阻塞操作。
-bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received, uint8_t, uint8_t, uint8_t) {
+// 一包音频到了。只做搬运，不做任何阻塞操作。
+//
+// ⚠️ 函数名必须是 tud_audio_rx_done_isr。这个回调在新版 TinyUSB 里从
+// `tud_audio_rx_done_post_read_cb` 改成了现在这个名字（audio_device.h:251
+// 声明、audio_device.c:499 调用），而 audio_compat.h **没有**给旧名提供兼容
+// 别名。用旧名的话，它就只是一个没人引用的全局函数：编译零警告、链接正常、
+// 运行时驱动一路调用它自己那个什么都不做的弱默认实现，一个包都送不上来。
+//
+// 2026-09-05 就是栽在这上面：设备在 macOS / iOS / Android 上全都被正确认成
+// 声卡（ioreg 里 engine 建好、alt=1、主机确实在推流），可屏幕上 PACKETS 恒为 0。
+// 之所以 943c479 那次在 Windows 上真的出过声，是因为当时组件管理器装的还是
+// 改名前的 tinyusb —— platformio.ini 里那条依赖写的是 `*`，没锁版本。
+//
+// ⚠️ 后缀 _isr 是字面意思：它现在在**中断上下文**里被调用（audiod_xfer_isr）。
+// 所以这里不能阻塞、不能 printf、也不要用浮点（ESP32 的 FreeRTOS 默认不允许
+// 在 ISR 里做浮点运算）。下面全是整数运算和 memcpy，是安全的；FFT 那些浮点
+// 活儿都留在 UI 线程的 usbDacGetSpectrum() 里做。
+bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t, uint8_t, uint8_t) {
     (void)rhport;
     if (!n_bytes_received) return true;
     s_framesReceived = s_framesReceived + 1;
@@ -437,13 +537,20 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received, u
         const int16_t* pcm = reinterpret_cast<const int16_t*>(scratch);
         const size_t frames = got / (kChannels * kBytesPerSample);
         uint16_t peakL = 0, peakR = 0;
+        // 顺带把单声道样本抄进频谱快照——和 VU 共用这一次遍历，不再单独扫一遍。
+        size_t sh = s_specHead;
         for (size_t i = 0; i < frames; ++i) {
             // 注意用 int32_t 取绝对值：-INT16_MIN 在 int16_t 里会溢出。
             const uint16_t al = static_cast<uint16_t>(pcm[2 * i]     < 0 ? -static_cast<int32_t>(pcm[2 * i])     : pcm[2 * i]);
             const uint16_t ar = static_cast<uint16_t>(pcm[2 * i + 1] < 0 ? -static_cast<int32_t>(pcm[2 * i + 1]) : pcm[2 * i + 1]);
             if (al > peakL) peakL = al;
             if (ar > peakR) peakR = ar;
+            // 左右取平均降成单声道。用 int32_t 中转，两个 int16 相加会溢出。
+            s_specRing[sh] = static_cast<int16_t>(
+                (static_cast<int32_t>(pcm[2 * i]) + static_cast<int32_t>(pcm[2 * i + 1])) / 2);
+            sh = (sh + 1) & (kSpecFftSize - 1);
         }
+        s_specHead = sh;
         // 快起慢落：新峰值立即顶上去，否则每包（1ms）衰减 3，约 85ms 落到底。
         const uint8_t l8 = static_cast<uint8_t>(peakL >> 7);
         const uint8_t r8 = static_cast<uint8_t>(peakR >> 7);
@@ -484,6 +591,7 @@ bool usbDacBegin() {
         printf("[USBDAC] I2S init failed\n");
         return false;
     }
+    s_activeRate = s_sampleRate;
 
     s_i2sRunning = true;
     // 钉在 core 0：和音频解码任务同一个核（core 1 留给 Arduino loop + LVGL）。
@@ -540,6 +648,91 @@ void usbDacGetStatus(UsbDacStatus* out) {
     out->bufferUnderruns  = s_underruns;
     out->bufferOverruns   = s_overruns;
     out->framesReceived   = s_framesReceived;
+}
+
+void usbDacGetSpectrum(uint8_t out[6]) {
+    // FFT 工作区。放函数内 static 而不是文件级，是为了让"只有真正画频谱时才
+    // 占这 6KB"这件事留在一处——声卡模式之外这个函数永远不会被调到。
+    // dsps_fft2r_fc32 的优化版要求 16 字节对齐。
+    static bool  ready = false;
+    static float window[kSpecFftSize];
+    static float work[kSpecFftSize * 2] __attribute__((aligned(16)));
+    static float smooth[6] = {0, 0, 0, 0, 0, 0};
+
+    if (!s_streaming || s_muted) {
+        // 没在传或静音时让它平滑落下去，而不是"啪"一下全灭。
+        for (uint8_t b = 0; b < 6; ++b) {
+            smooth[b] *= 0.7f;
+            out[b] = static_cast<uint8_t>(smooth[b]);
+        }
+        return;
+    }
+
+    if (!ready) {
+        if (dsps_fft2r_init_fc32(nullptr, kSpecFftSize) != ESP_OK) {
+            memset(out, 0, 6);
+            return;
+        }
+        dsps_wind_hann_f32(window, kSpecFftSize);
+        ready = true;
+    }
+
+    // 从写指针往回取最近 kSpecFftSize 个样本。这里和 rx 回调是无锁并发，
+    // 允许读到撕裂的一两个样本——这是拿来画图的，不是拿来出声的，
+    // 为它上锁反而会拖慢音频回调。
+    const size_t head = s_specHead;
+    for (size_t i = 0; i < kSpecFftSize; ++i) {
+        const int16_t sample = s_specRing[(head + i) & (kSpecFftSize - 1)];
+        work[i * 2]     = (static_cast<float>(sample) / 32768.0f) * window[i];
+        work[i * 2 + 1] = 0.0f; // 实信号，虚部补零
+    }
+
+    dsps_fft2r_fc32(work, kSpecFftSize);
+    dsps_bit_rev_fc32(work, kSpecFftSize);
+
+    // 对数分段，不是等宽——等宽的话低音全挤在第一格，人耳对频率本来就是对数感知。
+    static const uint16_t kEdgeHz[7] = {30, 150, 400, 1000, 2500, 6000, 16000};
+    const uint32_t rate = s_sampleRate ? s_sampleRate : 48000;
+    const size_t   maxBin = kSpecFftSize / 2 - 1;
+
+    for (uint8_t b = 0; b < 6; ++b) {
+        size_t lo = static_cast<size_t>(static_cast<uint64_t>(kEdgeHz[b])     * kSpecFftSize / rate);
+        size_t hi = static_cast<size_t>(static_cast<uint64_t>(kEdgeHz[b + 1]) * kSpecFftSize / rate);
+        if (lo < 1) lo = 1;          // bin 0 是直流分量，永远跳过
+        if (hi > maxBin) hi = maxBin;
+        if (hi <= lo) hi = lo + 1;
+
+        // 取带内峰值而不是平均：频谱分析仪的传统做法，视觉上更活跃，
+        // 平均会把一个尖峰摊平到整段里看不见。
+        // ⚠️ 必须归一化再算 dB。N 点 FFT 对幅度 A 的正弦波，bin 峰值是 A*N/2，
+        // 加了 Hann 窗（相干增益 0.5）之后是 A*N/4 —— 直接拿这个原始值去算 dB，
+        // 幅度 0.5 的信号能算出 +36dB，映射完远超 255，于是**所有频段恒满格**，
+        // 28 列全部点满 11 行；逐列脏检查又发现"和上次一样"而整列跳过重绘，
+        // 屏幕上看起来就是频谱死住不动。
+        // 系数 4/N = (2/N 的 FFT 归一化) x (2 倍的 Hann 窗增益补偿)，
+        // 还原之后 peak 就是原始信号幅度（0..1）。
+        constexpr float kMagScale = 4.0f / static_cast<float>(kSpecFftSize);
+        float peak = 0.0f;
+        for (size_t i = lo; i <= hi && i <= maxBin; ++i) {
+            const float re = work[i * 2];
+            const float im = work[i * 2 + 1];
+            const float mag = sqrtf(re * re + im * im) * kMagScale;
+            if (mag > peak) peak = mag;
+        }
+
+        // 转 dB 再映射到 0..255。线性幅度直接画的话，音乐里绝大多数时间
+        // 都贴在最底下几格——动态范围有 60dB 以上，线性刻度根本展不开。
+        const float db = 20.0f * log10f(peak + 1e-9f);
+        // -60dB..+6dB -> 0..255。上限特意留 6dB 余量而不是顶到 0dB：满刻度信号
+        // 落在约九成高度上，峰值还有地方可去，不会一直撞天花板。
+        float v = (db + 60.0f) * (255.0f / 66.0f);
+        if (v < 0.0f)   v = 0.0f;
+        if (v > 255.0f) v = 255.0f;
+
+        // 快起慢落，和 VU 同一条弹道原则（见 rx 回调里的峰值检测）。
+        smooth[b] = v > smooth[b] ? v : (smooth[b] * 0.72f + v * 0.28f);
+        out[b] = static_cast<uint8_t>(smooth[b]);
+    }
 }
 
 #endif // MWR_USB_DAC
