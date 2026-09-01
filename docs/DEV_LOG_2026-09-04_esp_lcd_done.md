@@ -473,3 +473,45 @@ esp_lcd 迁移之后驱动层已经没什么可榨的（SPI 到硬件上限 80MH
 脏区域治理的固有风险是"该更新的地方没更新"。串口无异常，但**画面正确性
 需要肉眼验证**，重点看：时间/日期/天气、音量条与百分比、播放暂停图标、
 进度条、播放时的频谱与转盘动画、各页面切换、云音乐列表加载。
+
+---
+
+## 12. 2026-09-05 追加：CPU 频率策略 —— 固定 240MHz，**这是有意为之，不要"优化"**
+
+查证结论（编译期 `sdkconfig.h` 实测）：
+
+```
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ        240
+CONFIG_PM_ENABLE                       未定义  → 动态调频(DFS)整个功能关闭
+CONFIG_FREERTOS_USE_TICKLESS_IDLE      未定义  → 空闲不进 tickless
+CONFIG_PM_DFS_INIT_AUTO                未定义
+```
+
+`src/` 与 `lib/tftLib/` 中**没有任何** `setCpuFrequencyMhz()` / `esp_pm_configure()` /
+`esp_pm_lock_*` / `esp_light_sleep_start()` 调用。即 CPU 全程满频 240MHz 运行。
+
+> ⚠️ **一个容易看错的地方**：`sdkconfig.h` 里能 grep 到
+> `CONFIG_PM_SLP_IRAM_OPT=1` 和 `CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=1`，
+> 但它们是 `CONFIG_PM_ENABLE` 的**子选项**，主开关没开时完全不起作用。
+> 别据此误判成"省电已经开了"。
+
+### 决定：维持固定 240MHz（2026-09-05 用户确认）
+
+设备是常插电的桌面播放器，**不是电池供电**，所以 DFS 的唯一收益（功耗/发热）
+对本项目没有价值，而风险直接落在最不能出问题的地方：
+
+- DFS 会在 80/160/240MHz 之间切换，**APB 时钟跟着变**，扰动 I2S 与 SPI 时序
+- 外设必须正确持有 PM lock 才安全，而 Arduino 的 audio 库那条路径是否规范持锁
+  **从未验证过**
+- 收益是功耗，不是性能——满频不会让程序变慢，只是空闲时白烧电
+  （当前 `busy` 仅 4.6%，CPU 约 95% 时间在空转）
+
+**若将来要做便携电池版**，DFS + tickless idle 是必须补的功课，但那是一个
+需要单独验证一轮的课题（每个外设的 PM lock 都要过一遍），不能顺手改。
+
+### 顺带查到：WiFi 射频省电是开着的，且与 CPU 策略不一致
+
+arduino-esp32 的 `WiFiGenericClass::_sleepEnabled` 在非 ESP32-S2 目标上默认是
+`WIFI_PS_MIN_MODEM`，而本工程**从未调用 `WiFi.setSleep()` 覆盖它**。
+所以射频侧在省电模式、CPU 侧满频。目前没观察到由此引发的问题，
+但排查网络相关的延迟/丢包时值得记住这一条。
