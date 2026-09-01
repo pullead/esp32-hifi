@@ -15,6 +15,101 @@
 // docs/UI_DESIGN_SPEC.md's v2 addendum. Layout grid (status bar/control bar/
 // cover geometry) is unchanged; only tokens and a few radii/borders differ.
 namespace {
+
+// ---------------------------------------------------------------------------
+// 脏区域治理（2026-09-05）
+//
+// LVGL 8 的 setter **一律无条件把控件标脏**，值一模一样也不例外：
+//   - lv_label_set_text() 的第一行就是 lv_obj_invalidate(obj)，之后才看文字
+//   - lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN) 同样先 invalidate，不管本来
+//     是不是已经隐藏
+//   - lv_obj_set_style_*() 走 lv_obj_refresh_style() 也是一样
+//
+// 而 refresh() 每 60ms 会把所有控件全量重写一遍。结果：一个静止的界面每秒被
+// 整屏重绘约 19 次。实测证据是 flush/s 稳定在 192/204 之间跳 = 16×12 和
+// 17×12，即每次 refresh 恰好 12 次 flush，而满屏 = ceil(170/16) = 11 次。
+//
+// 下面这组包装先把当前值读回来比一比，相同就直接跳过，不碰 LVGL。
+//
+// 读样式为什么用 lv_obj_get_local_style_prop() 而不是 lv_obj_get_style_*()：
+// 后者返回的是**计算后**的值（叠加了 state、transition、父对象继承）。控件
+// 处于按下/聚焦态时，计算值和我们要写的本地值可能不同，会误判成"需要写"或
+// 更糟的"不用写"。local 版读的就是我们自己 set 进去的那一层，语义正好对上。
+//
+// 注意：这些只适合"每帧都被调用、但值极少变"的刷新路径。build* 那种一次性
+// 构造代码没必要用，对象刚建出来本来就没有旧值可比。
+// ---------------------------------------------------------------------------
+
+bool uiStyleColorSame(lv_obj_t* obj, lv_style_prop_t prop, lv_color_t color, lv_style_selector_t selector) {
+    lv_style_value_t value;
+    if (lv_obj_get_local_style_prop(obj, prop, &value, selector) != LV_STYLE_RES_FOUND) return false;
+    return value.color.full == color.full;
+}
+
+bool uiStyleNumSame(lv_obj_t* obj, lv_style_prop_t prop, int32_t num, lv_style_selector_t selector) {
+    lv_style_value_t value;
+    if (lv_obj_get_local_style_prop(obj, prop, &value, selector) != LV_STYLE_RES_FOUND) return false;
+    return value.num == num;
+}
+
+void uiSetText(lv_obj_t* label, const char* text) {
+    if (!label) return;
+    if (!text) text = "";
+    const char* current = lv_label_get_text(label);
+    if (current && strcmp(current, text) == 0) return;
+    lv_label_set_text(label, text);
+}
+
+void uiSetTextColor(lv_obj_t* obj, lv_color_t color, lv_style_selector_t selector = 0) {
+    if (!obj || uiStyleColorSame(obj, LV_STYLE_TEXT_COLOR, color, selector)) return;
+    lv_obj_set_style_text_color(obj, color, selector);
+}
+
+void uiSetBgColor(lv_obj_t* obj, lv_color_t color, lv_style_selector_t selector = 0) {
+    if (!obj || uiStyleColorSame(obj, LV_STYLE_BG_COLOR, color, selector)) return;
+    lv_obj_set_style_bg_color(obj, color, selector);
+}
+
+void uiSetBorderColor(lv_obj_t* obj, lv_color_t color, lv_style_selector_t selector = 0) {
+    if (!obj || uiStyleColorSame(obj, LV_STYLE_BORDER_COLOR, color, selector)) return;
+    lv_obj_set_style_border_color(obj, color, selector);
+}
+
+void uiSetShadowColor(lv_obj_t* obj, lv_color_t color, lv_style_selector_t selector = 0) {
+    if (!obj || uiStyleColorSame(obj, LV_STYLE_SHADOW_COLOR, color, selector)) return;
+    lv_obj_set_style_shadow_color(obj, color, selector);
+}
+
+void uiSetBgOpa(lv_obj_t* obj, lv_opa_t opa, lv_style_selector_t selector = 0) {
+    if (!obj || uiStyleNumSame(obj, LV_STYLE_BG_OPA, opa, selector)) return;
+    lv_obj_set_style_bg_opa(obj, opa, selector);
+}
+
+void uiSetHidden(lv_obj_t* obj, bool hidden) {
+    if (!obj) return;
+    if (lv_obj_has_flag(obj, LV_OBJ_FLAG_HIDDEN) == hidden) return;
+    if (hidden) lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_clear_flag(obj, LV_OBJ_FLAG_HIDDEN);
+}
+
+void uiSetBarValue(lv_obj_t* bar, int32_t value, lv_anim_enable_t anim = LV_ANIM_OFF) {
+    if (!bar || lv_bar_get_value(bar) == value) return;
+    lv_bar_set_value(bar, value, anim);
+}
+
+// 高度/位置：频谱条在播放时确实每帧都变，但空闲时是恒定值，照样每 60ms 被
+// 重写一遍。lv_obj_set_height/set_pos 底层也是写样式属性 -> invalidate。
+void uiSetHeight(lv_obj_t* obj, lv_coord_t h) {
+    if (!obj || uiStyleNumSame(obj, LV_STYLE_HEIGHT, h, 0)) return;
+    lv_obj_set_height(obj, h);
+}
+
+void uiSetPos(lv_obj_t* obj, lv_coord_t x, lv_coord_t y) {
+    if (!obj) return;
+    if (uiStyleNumSame(obj, LV_STYLE_X, x, 0) && uiStyleNumSame(obj, LV_STYLE_Y, y, 0)) return;
+    lv_obj_set_pos(obj, x, y);
+}
+
 // Local Now Playing spectrum canvas height (see buildLocalNowPlaying() and
 // refreshLocalNowPlaying()) -- shared so the two can't drift out of sync.
 constexpr lv_coord_t kSpecCanvasH = 43;
@@ -2220,8 +2315,8 @@ void HifiUi::refreshLocalNowPlaying(const PlayerSnapshot& rawState) {
     if (m_localCassetteView) {
         // Cassette label layout: title and artist are their own lines,
         // matching the physical cassette label's two printed rows.
-        if (m_title) lv_label_set_text(m_title, state.title[0] ? state.title : "本地播放");
-        if (m_detail) lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+        if (m_title) uiSetText(m_title, state.title[0] ? state.title : "本地播放");
+        if (m_detail) uiSetText(m_detail, state.detail[0] ? state.detail : "");
     } else {
         // Flat card: title+artist combined into one looping marquee line,
         // and the row below shows the current synced-lyrics line instead
@@ -2229,19 +2324,19 @@ void HifiUi::refreshLocalNowPlaying(const PlayerSnapshot& rawState) {
         char combinedTitle[160];
         if (state.title[0] && state.detail[0]) snprintf(combinedTitle, sizeof(combinedTitle), "%s - %s", state.title, state.detail);
         else snprintf(combinedTitle, sizeof(combinedTitle), "%s", state.title[0] ? state.title : "本地播放");
-        if (m_title) lv_label_set_text(m_title, combinedTitle);
+        if (m_title) uiSetText(m_title, combinedTitle);
         if (m_detail) {
             if (m_hasLyrics) {
                 const char* lyric = playerService.currentLyricLine(state.positionSeconds * 1000UL);
-                lv_label_set_text(m_detail, (lyric && lyric[0]) ? lyric : "");
+                uiSetText(m_detail, (lyric && lyric[0]) ? lyric : "");
             } else {
                 // Distinguishes "still looking" / "looked, found nothing" from
                 // a blanket "没有歌词信息" -- see onLyricRetryAction() for the
                 // tap-to-retry half of this.
                 switch (playerService.lyricsFetchState(m_currentLocalTrackIndex)) {
-                    case LyricFetchState::Pending: lv_label_set_text(m_detail, "正在联网查询歌词..."); break;
-                    case LyricFetchState::NotFound: lv_label_set_text(m_detail, "未找到歌词，点击重试"); break;
-                    default: lv_label_set_text(m_detail, "没有歌词信息"); break;
+                    case LyricFetchState::Pending: uiSetText(m_detail, "正在联网查询歌词..."); break;
+                    case LyricFetchState::NotFound: uiSetText(m_detail, "未找到歌词，点击重试"); break;
+                    default: uiSetText(m_detail, "没有歌词信息"); break;
                 }
             }
         }
@@ -2249,12 +2344,12 @@ void HifiUi::refreshLocalNowPlaying(const PlayerSnapshot& rawState) {
     if (m_elapsed) {
         char elapsed[16];
         formatTime(elapsed, sizeof(elapsed), state.positionSeconds);
-        lv_label_set_text(m_elapsed, elapsed);
+        uiSetText(m_elapsed, elapsed);
     }
     if (m_total) {
         char total[16];
         formatTime(total, sizeof(total), state.durationSeconds);
-        lv_label_set_text(m_total, total);
+        uiSetText(m_total, total);
     }
 
     const bool playing = state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Buffering;
@@ -2327,7 +2422,7 @@ void HifiUi::refreshLocalNowPlaying(const PlayerSnapshot& rawState) {
         if (anyColumnChanged) lv_obj_invalidate(m_specCanvas);
     }
 
-    if (m_playIcon) lv_label_set_text(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    if (m_playIcon) uiSetText(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 
     // Tape-position needle: real 6-band average level deflects it right
     // from a left rest position, like a classic VU meter -- same data
@@ -2685,11 +2780,11 @@ void HifiUi::refreshRadioNowPlaying(const PlayerSnapshot& rawState) {
         return;
     }
 
-    if (m_title) lv_label_set_text(m_title, state.title[0] ? state.title : "网络电台");
-    if (m_detail) lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+    if (m_title) uiSetText(m_title, state.title[0] ? state.title : "网络电台");
+    if (m_detail) uiSetText(m_detail, state.detail[0] ? state.detail : "");
 
     const bool playing = state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Buffering;
-    if (m_playIcon) lv_label_set_text(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    if (m_playIcon) uiSetText(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 
     // Cassette-view needle/reels -- same widgets and driving logic as
     // refreshLocalNowPlaying's (m_cassetteNeedle/m_cassetteReelL/R are only
@@ -2733,7 +2828,7 @@ void HifiUi::refreshRadioNowPlaying(const PlayerSnapshot& rawState) {
         const uint8_t lit = static_cast<uint8_t>((static_cast<uint16_t>(vu) * 9) / 255);
         for (uint8_t i = 0; i < 9; ++i) {
             if (!m_vfdSegments[i]) continue;
-            lv_obj_set_style_bg_opa(m_vfdSegments[i], i < lit ? LV_OPA_COVER : LV_OPA_20, 0);
+            uiSetBgOpa(m_vfdSegments[i], i < lit ? LV_OPA_COVER : LV_OPA_20, 0);
         }
     }
 
@@ -2768,12 +2863,12 @@ void HifiUi::refreshRadioNowPlaying(const PlayerSnapshot& rawState) {
         if (m_peakLLabel) {
             char text[16];
             formatPeak(text, sizeof(text), "L", m_peakHoldRawL);
-            lv_label_set_text(m_peakLLabel, text);
+            uiSetText(m_peakLLabel, text);
         }
         if (m_peakRLabel) {
             char text[16];
             formatPeak(text, sizeof(text), "R", m_peakHoldRawR);
-            lv_label_set_text(m_peakRLabel, text);
+            uiSetText(m_peakRLabel, text);
         }
     }
 
@@ -3246,19 +3341,19 @@ void HifiUi::refreshUsbStorage() {
                          static_cast<unsigned long>(stats.writeCount), static_cast<unsigned long>(stats.writeFailCount),
                          static_cast<unsigned long>(stats.lastSize), static_cast<long>(stats.lastResult),
                          static_cast<unsigned long>(stats.maxSize));
-                lv_label_set_text(m_usbStorageDebug, debug);
+                uiSetText(m_usbStorageDebug, debug);
             }
         }
 
-        lv_label_set_text(m_usbStorageStatus, title);
-        lv_label_set_text(m_usbStorageDetail, detail);
-        lv_label_set_text(m_usbStorageHint, hint);
-        lv_label_set_text(m_usbStorageFormat, formatText);
-        lv_obj_set_style_text_color(m_usbStorageFormat, formatColor, 0);
-        lv_label_set_text(m_usbStorageCapacity, capacityText);
-        lv_label_set_text(m_usbStorageButtonLabel, button);
-        lv_obj_set_style_bg_color(m_usbStorageButton, buttonColor, 0);
-        lv_obj_set_style_bg_opa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
+        uiSetText(m_usbStorageStatus, title);
+        uiSetText(m_usbStorageDetail, detail);
+        uiSetText(m_usbStorageHint, hint);
+        uiSetText(m_usbStorageFormat, formatText);
+        uiSetTextColor(m_usbStorageFormat, formatColor, 0);
+        uiSetText(m_usbStorageCapacity, capacityText);
+        uiSetText(m_usbStorageButtonLabel, button);
+        uiSetBgColor(m_usbStorageButton, buttonColor, 0);
+        uiSetBgOpa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
         if (enabled) lv_obj_clear_state(m_usbStorageButton, LV_STATE_DISABLED);
         else lv_obj_add_state(m_usbStorageButton, LV_STATE_DISABLED);
         return;
@@ -3325,8 +3420,8 @@ void HifiUi::refreshUsbStorage() {
             break;
     }
 
-    lv_label_set_text(m_usbStorageStatus, title);
-    lv_label_set_text(m_usbStorageDetail, detail);
+    uiSetText(m_usbStorageStatus, title);
+    uiSetText(m_usbStorageDetail, detail);
     if (m_usbStorageDebug) {
         UsbStorageStats stats;
         if (playerService.usbStorageStats(&stats)) {
@@ -3338,14 +3433,14 @@ void HifiUi::refreshUsbStorage() {
                      static_cast<unsigned long>(stats.lastLba), static_cast<unsigned long>(stats.minLba),
                      static_cast<unsigned long>(stats.maxLba), static_cast<unsigned long>(stats.lastOffset),
                      static_cast<unsigned long>(stats.maxSize));
-            lv_label_set_text(m_usbStorageDebug, debug);
+            uiSetText(m_usbStorageDebug, debug);
         } else {
-            lv_label_set_text(m_usbStorageDebug, "MSC stats unavailable");
+            uiSetText(m_usbStorageDebug, "MSC stats unavailable");
         }
     }
-    lv_label_set_text(m_usbStorageButtonLabel, button);
-    lv_obj_set_style_bg_color(m_usbStorageButton, buttonColor, 0);
-    lv_obj_set_style_bg_opa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
+    uiSetText(m_usbStorageButtonLabel, button);
+    uiSetBgColor(m_usbStorageButton, buttonColor, 0);
+    uiSetBgOpa(m_usbStorageButton, enabled ? LV_OPA_COVER : LV_OPA_70, 0);
     if (enabled) lv_obj_clear_state(m_usbStorageButton, LV_STATE_DISABLED);
     else lv_obj_add_state(m_usbStorageButton, LV_STATE_DISABLED);
 }
@@ -3706,17 +3801,17 @@ void HifiUi::refreshCloudMusicSettings() {
             snprintf(qrContent, sizeof(qrContent), "http://%s/cloud_config", snap.wifiIp);
         }
         if (m_cloudHintLabel) {
-            lv_label_set_text(m_cloudHintLabel,
+            uiSetText(m_cloudHintLabel,
                               qrContent[0] ? "同一WiFi下用手机扫码,输入网关地址和设备密钥" : "请先连接WiFi后再扫码配置");
         }
         if (qrContent[0]) {
-            lv_obj_clear_flag(m_cloudQr, LV_OBJ_FLAG_HIDDEN);
+            uiSetHidden(m_cloudQr, false);
             if (strcmp(qrContent, m_cloudQrLastContent) != 0) {
                 lv_qrcode_update(m_cloudQr, qrContent, strlen(qrContent));
                 strlcpy(m_cloudQrLastContent, qrContent, sizeof(m_cloudQrLastContent));
             }
         } else {
-            lv_obj_add_flag(m_cloudQr, LV_OBJ_FLAG_HIDDEN);
+            uiSetHidden(m_cloudQr, true);
             m_cloudQrLastContent[0] = '\0';
         }
         return;
@@ -3738,8 +3833,8 @@ void HifiUi::refreshCloudMusicSettings() {
             case CloudServiceState::Offline: text = "音乐服务暂时不可用"; color = kMute; break;
         }
     }
-    lv_label_set_text(m_cloudStatusLabel, text);
-    lv_obj_set_style_text_color(m_cloudStatusLabel, color, 0);
+    uiSetText(m_cloudStatusLabel, text);
+    uiSetTextColor(m_cloudStatusLabel, color, 0);
 }
 
 void HifiUi::onCloudMusicEditBaseUrlAction(lv_event_t* event) {
@@ -3980,19 +4075,19 @@ void HifiUi::refreshCloudHotPlaylists() {
 
     lv_obj_clean(m_cloudListArea);
     if (state == CloudMusicRequestState::Loading) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(m_cloudListHint, "正在加载热门歌单…");
+        uiSetHidden(m_cloudListArea, true);
+        uiSetText(m_cloudListHint, "正在加载热门歌单…");
         return;
     }
     if (state == CloudMusicRequestState::Error) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        uiSetHidden(m_cloudListArea, true);
         char msg[128];
         snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
-        lv_label_set_text(m_cloudListHint, msg);
+        uiSetText(m_cloudListHint, msg);
         return;
     }
-    lv_label_set_text(m_cloudListHint, "");
-    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+    uiSetText(m_cloudListHint, "");
+    uiSetHidden(m_cloudListArea, false);
 
     const uint8_t count = playerService.cloudMusicHotPlaylistCount();
     if (!count) {
@@ -4004,11 +4099,11 @@ void HifiUi::refreshCloudHotPlaylists() {
         CloudPlaylistItem item{};
         if (!playerService.cloudMusicHotPlaylist(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 44);
+        uiSetPos(row, 0, i * 44);
         lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 10, 0);
-        lv_obj_set_style_bg_color(row, kPanel, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        uiSetBgColor(row, kPanel, 0);
+        uiSetBgOpa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -4036,14 +4131,14 @@ void HifiUi::refreshCloudHotPlaylists() {
             lv_img_set_pivot(img, 0, 0); // zoom scales from the top-left, so set_pos stays exact
             const uint16_t longest = tw > th ? tw : th;
             if (longest > 28) lv_img_set_zoom(img, static_cast<uint16_t>(256u * 28 / longest));
-            lv_obj_set_pos(img, 6, 4);
+            uiSetPos(img, 6, 4);
             lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
         } else {
             lv_obj_t* tile = lv_obj_create(row);
-            lv_obj_set_pos(tile, 6, 4);
+            uiSetPos(tile, 6, 4);
             lv_obj_set_size(tile, 28, 28);
             lv_obj_set_style_radius(tile, 4, 0);
-            lv_obj_set_style_bg_color(tile, kPanelDeep, 0);
+            uiSetBgColor(tile, kPanelDeep, 0);
             lv_obj_set_style_border_width(tile, 0, 0);
             lv_obj_set_style_pad_all(tile, 0, 0);
             lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
@@ -4121,19 +4216,19 @@ void HifiUi::refreshCloudRankings() {
 
     lv_obj_clean(m_cloudListArea);
     if (state == CloudMusicRequestState::Loading) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(m_cloudListHint, "正在加载排行榜…");
+        uiSetHidden(m_cloudListArea, true);
+        uiSetText(m_cloudListHint, "正在加载排行榜…");
         return;
     }
     if (state == CloudMusicRequestState::Error) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        uiSetHidden(m_cloudListArea, true);
         char msg[128];
         snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
-        lv_label_set_text(m_cloudListHint, msg);
+        uiSetText(m_cloudListHint, msg);
         return;
     }
-    lv_label_set_text(m_cloudListHint, "");
-    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+    uiSetText(m_cloudListHint, "");
+    uiSetHidden(m_cloudListArea, false);
 
     const uint8_t count = playerService.cloudMusicRankingCount();
     if (!count) {
@@ -4145,11 +4240,11 @@ void HifiUi::refreshCloudRankings() {
         CloudRankingItem item{};
         if (!playerService.cloudMusicRanking(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 44);
+        uiSetPos(row, 0, i * 44);
         lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 10, 0);
-        lv_obj_set_style_bg_color(row, kPanel, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        uiSetBgColor(row, kPanel, 0);
+        uiSetBgOpa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -4176,14 +4271,14 @@ void HifiUi::refreshCloudRankings() {
             lv_img_set_pivot(img, 0, 0);
             const uint16_t longest = tw > th ? tw : th;
             if (longest > 28) lv_img_set_zoom(img, static_cast<uint16_t>(256u * 28 / longest));
-            lv_obj_set_pos(img, 6, 4);
+            uiSetPos(img, 6, 4);
             lv_obj_clear_flag(img, LV_OBJ_FLAG_CLICKABLE);
         } else {
             lv_obj_t* tile = lv_obj_create(row);
-            lv_obj_set_pos(tile, 6, 4);
+            uiSetPos(tile, 6, 4);
             lv_obj_set_size(tile, 28, 28);
             lv_obj_set_style_radius(tile, 4, 0);
-            lv_obj_set_style_bg_color(tile, kPanelDeep, 0);
+            uiSetBgColor(tile, kPanelDeep, 0);
             lv_obj_set_style_border_width(tile, 0, 0);
             lv_obj_set_style_pad_all(tile, 0, 0);
             lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
@@ -4249,19 +4344,19 @@ void HifiUi::refreshCloudNewSongs() {
 
     lv_obj_clean(m_cloudListArea);
     if (state == CloudMusicRequestState::Loading) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(m_cloudListHint, "正在加载新歌…");
+        uiSetHidden(m_cloudListArea, true);
+        uiSetText(m_cloudListHint, "正在加载新歌…");
         return;
     }
     if (state == CloudMusicRequestState::Error) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        uiSetHidden(m_cloudListArea, true);
         char msg[128];
         snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
-        lv_label_set_text(m_cloudListHint, msg);
+        uiSetText(m_cloudListHint, msg);
         return;
     }
-    lv_label_set_text(m_cloudListHint, "");
-    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+    uiSetText(m_cloudListHint, "");
+    uiSetHidden(m_cloudListArea, false);
 
     const uint8_t count = playerService.cloudMusicNewSongCount();
     if (!count) {
@@ -4272,11 +4367,11 @@ void HifiUi::refreshCloudNewSongs() {
         CloudTrackItem item{};
         if (!playerService.cloudMusicNewSong(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 44);
+        uiSetPos(row, 0, i * 44);
         lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 8, 0);
-        lv_obj_set_style_bg_color(row, kPanel, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        uiSetBgColor(row, kPanel, 0);
+        uiSetBgOpa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -4455,12 +4550,12 @@ bool HifiUi::refreshCloudResolveOverlay() {
     if (state == CloudMusicRequestState::Error) {
         char msg[128];
         snprintf(msg, sizeof(msg), "播放失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
-        lv_label_set_text(m_cloudListHint, msg);
+        uiSetText(m_cloudListHint, msg);
     } else if (state == CloudMusicRequestState::Idle) {
         // Loaded transitions straight back to Idle once PlayerService::
         // tick() consumes the result (see playerCoreCloudMusicConsumeNowPlaying)
         // -- clear the "正在解析…" hint set by onCloudMusicTrackRowAction.
-        lv_label_set_text(m_cloudListHint, "");
+        uiSetText(m_cloudListHint, "");
     }
     return true;
 }
@@ -4474,19 +4569,19 @@ void HifiUi::refreshCloudMusicSearch() {
 
     lv_obj_clean(m_cloudListArea);
     if (state == CloudMusicRequestState::Loading) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(m_cloudListHint, "正在搜索…");
+        uiSetHidden(m_cloudListArea, true);
+        uiSetText(m_cloudListHint, "正在搜索…");
         return;
     }
     if (state == CloudMusicRequestState::Error) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        uiSetHidden(m_cloudListArea, true);
         char msg[128];
         snprintf(msg, sizeof(msg), "搜索失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
-        lv_label_set_text(m_cloudListHint, msg);
+        uiSetText(m_cloudListHint, msg);
         return;
     }
-    lv_label_set_text(m_cloudListHint, "");
-    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+    uiSetText(m_cloudListHint, "");
+    uiSetHidden(m_cloudListArea, false);
 
     const uint8_t count = playerService.cloudMusicSearchResultCount();
     if (!count) {
@@ -4497,11 +4592,11 @@ void HifiUi::refreshCloudMusicSearch() {
         CloudTrackItem item{};
         if (!playerService.cloudMusicSearchResult(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 44);
+        uiSetPos(row, 0, i * 44);
         lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 8, 0);
-        lv_obj_set_style_bg_color(row, kPanel, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        uiSetBgColor(row, kPanel, 0);
+        uiSetBgOpa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -4558,19 +4653,19 @@ void HifiUi::refreshCloudMusicPlaylist() {
 
     lv_obj_clean(m_cloudListArea);
     if (state == CloudMusicRequestState::Loading) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(m_cloudListHint, "正在加载歌单…");
+        uiSetHidden(m_cloudListArea, true);
+        uiSetText(m_cloudListHint, "正在加载歌单…");
         return;
     }
     if (state == CloudMusicRequestState::Error) {
-        lv_obj_add_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+        uiSetHidden(m_cloudListArea, true);
         char msg[128];
         snprintf(msg, sizeof(msg), "加载失败：%s", cloudErrToCn(playerService.cloudMusicLastError()));
-        lv_label_set_text(m_cloudListHint, msg);
+        uiSetText(m_cloudListHint, msg);
         return;
     }
-    lv_label_set_text(m_cloudListHint, "");
-    lv_obj_clear_flag(m_cloudListArea, LV_OBJ_FLAG_HIDDEN);
+    uiSetText(m_cloudListHint, "");
+    uiSetHidden(m_cloudListArea, false);
 
     const uint8_t count = playerService.cloudMusicPlaylistTrackCount();
     if (!count) {
@@ -4581,11 +4676,11 @@ void HifiUi::refreshCloudMusicPlaylist() {
         CloudTrackItem item{};
         if (!playerService.cloudMusicPlaylistTrack(i, &item)) continue;
         lv_obj_t* row = lv_btn_create(m_cloudListArea);
-        lv_obj_set_pos(row, 0, i * 44);
+        uiSetPos(row, 0, i * 44);
         lv_obj_set_size(row, 288, 40);
         lv_obj_set_style_radius(row, 8, 0);
-        lv_obj_set_style_bg_color(row, kPanel, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        uiSetBgColor(row, kPanel, 0);
+        uiSetBgOpa(row, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(row, 0, 0);
         lv_obj_set_style_shadow_width(row, 0, 0);
         lv_obj_set_style_pad_all(row, 0, 0);
@@ -4937,15 +5032,15 @@ void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
 
     if (m_title) {
         if (state.source == PlayerSource::CloudMusic) {
-            lv_label_set_text(m_title, state.title[0] ? state.title : "未在播放");
+            uiSetText(m_title, state.title[0] ? state.title : "未在播放");
         } else {
             // Not playing yet (user just tapped a track): mirror the
             // resolve lifecycle so the page gives instant feedback --
             // 正在连接… while resolve runs, 连接失败 + reason on error.
             const CloudMusicRequestState rs = playerService.cloudMusicResolveState();
-            if (rs == CloudMusicRequestState::Loading) lv_label_set_text(m_title, "正在连接…");
-            else if (rs == CloudMusicRequestState::Error) lv_label_set_text(m_title, "连接失败");
-            else lv_label_set_text(m_title, "未在播放");
+            if (rs == CloudMusicRequestState::Loading) uiSetText(m_title, "正在连接…");
+            else if (rs == CloudMusicRequestState::Error) uiSetText(m_title, "连接失败");
+            else uiSetText(m_title, "未在播放");
         }
     }
     if (m_detail) {
@@ -4955,29 +5050,29 @@ void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
             if (hasTrack && playerService.cloudMusicLyricsForTrack(cur.id)) {
                 // Current lyric line -- same interaction as local playback.
                 const char* lyric = playerService.cloudMusicCurrentLyricLine(state.positionSeconds * 1000UL);
-                lv_label_set_text(m_detail, (lyric && lyric[0]) ? lyric : "");
+                uiSetText(m_detail, (lyric && lyric[0]) ? lyric : "");
             } else {
                 const CloudLyricsState ls = playerService.cloudMusicLyricsState();
-                if (ls == CloudLyricsState::Loading) lv_label_set_text(m_detail, "正在加载歌词…");
-                else if (ls == CloudLyricsState::NotFound) lv_label_set_text(m_detail, "未找到歌词,点击重试");
-                else if (ls == CloudLyricsState::Error) lv_label_set_text(m_detail, "歌词加载失败,点击重试");
-                else lv_label_set_text(m_detail, state.detail[0] ? state.detail : "");
+                if (ls == CloudLyricsState::Loading) uiSetText(m_detail, "正在加载歌词…");
+                else if (ls == CloudLyricsState::NotFound) uiSetText(m_detail, "未找到歌词,点击重试");
+                else if (ls == CloudLyricsState::Error) uiSetText(m_detail, "歌词加载失败,点击重试");
+                else uiSetText(m_detail, state.detail[0] ? state.detail : "");
             }
         } else {
             const CloudMusicRequestState rs = playerService.cloudMusicResolveState();
-            if (rs == CloudMusicRequestState::Error) lv_label_set_text(m_detail, cloudErrToCn(playerService.cloudMusicLastError()));
-            else lv_label_set_text(m_detail, "");
+            if (rs == CloudMusicRequestState::Error) uiSetText(m_detail, cloudErrToCn(playerService.cloudMusicLastError()));
+            else uiSetText(m_detail, "");
         }
     }
     if (m_elapsed) {
         char elapsed[16];
         formatTime(elapsed, sizeof(elapsed), state.positionSeconds);
-        lv_label_set_text(m_elapsed, elapsed);
+        uiSetText(m_elapsed, elapsed);
     }
     if (m_total) {
         char total[16];
         formatTime(total, sizeof(total), state.durationSeconds);
-        lv_label_set_text(m_total, total);
+        uiSetText(m_total, total);
     }
     if (m_progress) {
         const uint32_t value = state.durationSeconds ? (state.positionSeconds * 1000UL / state.durationSeconds) : 0;
@@ -4985,7 +5080,7 @@ void HifiUi::refreshCloudNowPlaying(const PlayerSnapshot& rawState) {
     }
 
     const bool playing = state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Buffering;
-    if (m_playIcon) lv_label_set_text(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    if (m_playIcon) uiSetText(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 
     // Same rainbow spectrum as local playback (see refreshLocalNowPlaying's
     // comment for the 6-band interpolation rationale).
@@ -5471,7 +5566,7 @@ void HifiUi::refreshAudioEqControls() {
             char buf[12];
             if (m_page == Page::AudioEqBand && i == m_audioEqBandIndex && i != 3) snprintf(buf, sizeof(buf), "%+d dB", static_cast<int>(values[i]));
             else snprintf(buf, sizeof(buf), "%+d", static_cast<int>(values[i]));
-            lv_label_set_text(m_audioEqValueLabels[i], buf);
+            uiSetText(m_audioEqValueLabels[i], buf);
         }
     }
     static const int8_t presets[5][3] = {
@@ -5480,8 +5575,8 @@ void HifiUi::refreshAudioEqControls() {
     for (uint8_t i = 0; i < 5; ++i) {
         if (!m_audioEqPresetButtons[i]) continue;
         const bool selected = m_audioTone.low == presets[i][0] && m_audioTone.mid == presets[i][1] && m_audioTone.high == presets[i][2];
-        lv_obj_set_style_bg_color(m_audioEqPresetButtons[i], selected ? kAccentDeep : kPanel, 0);
-        lv_obj_set_style_border_color(m_audioEqPresetButtons[i], selected ? kAccentBright : kInkFaint, 0);
+        uiSetBgColor(m_audioEqPresetButtons[i], selected ? kAccentDeep : kPanel, 0);
+        uiSetBorderColor(m_audioEqPresetButtons[i], selected ? kAccentBright : kInkFaint, 0);
     }
     m_audioEqRefreshing = false;
 }
@@ -6002,7 +6097,7 @@ void HifiUi::refreshSettingsWifi(const PlayerSnapshot& state) {
         if (state.wifiApFallbackActive) snprintf(status, sizeof(status), "未连接 -- 已开启配网热点 %s", state.wifiApSsid);
         else if (state.wifiConnected) snprintf(status, sizeof(status), "已连接: %s (%d dBm)", state.wifiSsid, state.wifiRssi);
         else snprintf(status, sizeof(status), "未连接WiFi");
-        if (m_wifiStatusText) lv_label_set_text(m_wifiStatusText, status);
+        if (m_wifiStatusText) uiSetText(m_wifiStatusText, status);
         return;
     }
 
@@ -6017,17 +6112,17 @@ void HifiUi::refreshSettingsWifi(const PlayerSnapshot& state) {
         qrContent[0] = '\0';
         snprintf(hint, sizeof(hint), "请先连接WiFi后再使用后台管理");
     }
-    if (m_wifiHintText) lv_label_set_text(m_wifiHintText, hint);
+    if (m_wifiHintText) uiSetText(m_wifiHintText, hint);
 #if LV_USE_QRCODE
     if (m_wifiQr) {
         if (qrContent[0]) {
-            lv_obj_clear_flag(m_wifiQr, LV_OBJ_FLAG_HIDDEN);
+            uiSetHidden(m_wifiQr, false);
             if (strcmp(qrContent, m_wifiQrLastContent) != 0) {
                 lv_qrcode_update(m_wifiQr, qrContent, strlen(qrContent));
                 strlcpy(m_wifiQrLastContent, qrContent, sizeof(m_wifiQrLastContent));
             }
         } else {
-            lv_obj_add_flag(m_wifiQr, LV_OBJ_FLAG_HIDDEN);
+            uiSetHidden(m_wifiQr, true);
             m_wifiQrLastContent[0] = '\0';
         }
     }
@@ -6116,7 +6211,7 @@ void HifiUi::refreshQuickPanel() {
         if (m_quickVolumeLabel) {
             char buf[8];
             snprintf(buf, sizeof(buf), "%u%%", pct);
-            lv_label_set_text(m_quickVolumeLabel, buf);
+            uiSetText(m_quickVolumeLabel, buf);
         }
     }
     if (m_quickBrightnessSlider) {
@@ -6125,7 +6220,7 @@ void HifiUi::refreshQuickPanel() {
         if (m_quickBrightnessLabel) {
             char buf[8];
             snprintf(buf, sizeof(buf), "%u%%", pct);
-            lv_label_set_text(m_quickBrightnessLabel, buf);
+            uiSetText(m_quickBrightnessLabel, buf);
         }
     }
     const int8_t eq[3] = {m_audioTone.low, m_audioTone.mid, m_audioTone.high};
@@ -6135,7 +6230,7 @@ void HifiUi::refreshQuickPanel() {
         if (m_quickEqLabels[i]) {
             char buf[8];
             snprintf(buf, sizeof(buf), "%+ddB", eq[i]);
-            lv_label_set_text(m_quickEqLabels[i], buf);
+            uiSetText(m_quickEqLabels[i], buf);
         }
     }
 }
@@ -6313,30 +6408,30 @@ void HifiUi::refresh() {
     }
     m_lastSourceSeen = state.source;
 
-    if (m_statusTime) lv_label_set_text(m_statusTime, state.timeHM[0] ? state.timeHM : "--:--");
+    if (m_statusTime) uiSetText(m_statusTime, state.timeHM[0] ? state.timeHM : "--:--");
     // The WiFi icon's own color now carries signal strength (no separate
     // bar graph, per feedback that it looked like a second volume meter):
     // grey disconnected, orange weak, green strong.
     if (m_statusWifiIcon) {
         lv_color_t wifiColor = kInkFaint;
         if (state.wifiConnected) wifiColor = state.wifiRssi >= -67 ? kLive : kMute;
-        lv_obj_set_style_text_color(m_statusWifiIcon, wifiColor, 0);
+        uiSetTextColor(m_statusWifiIcon, wifiColor, 0);
     }
     if (m_statusTag) {
         if (state.muted) {
-            lv_label_set_text(m_statusTag, "MUTE");
-            lv_obj_set_style_text_color(m_statusTag, kMute, 0);
+            uiSetText(m_statusTag, "MUTE");
+            uiSetTextColor(m_statusTag, kMute, 0);
         } else if (state.transport == PlayerTransport::Buffering) {
-            lv_label_set_text(m_statusTag, "BUFF");
-            lv_obj_set_style_text_color(m_statusTag, kLive, 0);
+            uiSetText(m_statusTag, "BUFF");
+            uiSetTextColor(m_statusTag, kLive, 0);
         } else if (state.sampleRate) {
             char tag[24];
             snprintf(tag, sizeof(tag), "%lu.%luk/%u", static_cast<unsigned long>(state.sampleRate / 1000),
                      static_cast<unsigned long>((state.sampleRate / 100) % 10), state.bitsPerSample);
-            lv_label_set_text(m_statusTag, tag);
-            lv_obj_set_style_text_color(m_statusTag, kInkDim, 0);
+            uiSetText(m_statusTag, tag);
+            uiSetTextColor(m_statusTag, kInkDim, 0);
         } else {
-            lv_label_set_text(m_statusTag, "");
+            uiSetText(m_statusTag, "");
         }
     }
     // Amp "on" = actually producing audible sound right now (playing and
@@ -6346,19 +6441,19 @@ void HifiUi::refresh() {
     if (m_statusAmp && m_statusAmpBox) {
         const bool ampOn = !state.muted && state.transport == PlayerTransport::Playing;
         const lv_color_t ampColor = ampOn ? kLive : kInkFaint;
-        lv_obj_set_style_text_color(m_statusAmp, ampColor, 0);
-        lv_obj_set_style_border_color(m_statusAmpBox, ampColor, 0);
+        uiSetTextColor(m_statusAmp, ampColor, 0);
+        uiSetBorderColor(m_statusAmpBox, ampColor, 0);
     }
-    if (m_statusCodec) lv_label_set_text(m_statusCodec, state.codec[0] ? state.codec : "");
+    if (m_statusCodec) uiSetText(m_statusCodec, state.codec[0] ? state.codec : "");
     const uint8_t volumeLevel = state.volumeSteps ? static_cast<uint8_t>((state.muted ? 0 : state.volume) * 5 / state.volumeSteps) : 0;
     for (uint8_t i = 0; i < 5; ++i) {
         if (!m_volumeBars[i]) continue;
-        lv_obj_set_style_bg_color(m_volumeBars[i], i < volumeLevel ? kInk : kInkFaint, 0);
+        uiSetBgColor(m_volumeBars[i], i < volumeLevel ? kInk : kInkFaint, 0);
     }
     if (m_statusVolPct) {
         char pct[8];
         snprintf(pct, sizeof(pct), "%u%%", state.volumeSteps ? (state.muted ? 0 : state.volume) * 100 / state.volumeSteps : 0);
-        lv_label_set_text(m_statusVolPct, pct);
+        uiSetText(m_statusVolPct, pct);
     }
 
     if (m_homeClockHour || m_homeClockMinute) {
@@ -6372,18 +6467,18 @@ void HifiUi::refresh() {
             minuteBuf[1] = state.timeHM[4];
             minuteBuf[2] = '\0';
         }
-        if (m_homeClockHour) lv_label_set_text(m_homeClockHour, hourBuf);
-        if (m_homeClockMinute) lv_label_set_text(m_homeClockMinute, minuteBuf);
+        if (m_homeClockHour) uiSetText(m_homeClockHour, hourBuf);
+        if (m_homeClockMinute) uiSetText(m_homeClockMinute, minuteBuf);
     }
-    if (m_homeClockDate) lv_label_set_text(m_homeClockDate, state.dateStr);
+    if (m_homeClockDate) uiSetText(m_homeClockDate, state.dateStr);
     if (m_homeClockWeather) {
         if (state.weatherTempC > -900) {
             char weather[24];
             snprintf(weather, sizeof(weather), "%s %d℃", state.weatherDesc[0] ? state.weatherDesc : "--",
                      static_cast<int>(state.weatherTempC));
-            lv_label_set_text(m_homeClockWeather, weather);
+            uiSetText(m_homeClockWeather, weather);
         } else {
-            lv_label_set_text(m_homeClockWeather, "");
+            uiSetText(m_homeClockWeather, "");
         }
     }
     if (m_weatherIconBody) {
@@ -6421,18 +6516,18 @@ void HifiUi::refresh() {
             default: // no reading yet
                 break;
         }
-        lv_obj_set_style_bg_color(m_weatherIconBody, bodyColor, 0);
+        uiSetBgColor(m_weatherIconBody, bodyColor, 0);
         if (m_weatherIconLobe) {
-            if (showLobe) lv_obj_clear_flag(m_weatherIconLobe, LV_OBJ_FLAG_HIDDEN);
-            else lv_obj_add_flag(m_weatherIconLobe, LV_OBJ_FLAG_HIDDEN);
+            if (showLobe) uiSetHidden(m_weatherIconLobe, false);
+            else uiSetHidden(m_weatherIconLobe, true);
         }
         for (lv_obj_t* drop : {m_weatherIconDrop1, m_weatherIconDrop2}) {
             if (!drop) continue;
             if (showDrops) {
-                lv_obj_clear_flag(drop, LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_bg_color(drop, dropColor, 0);
+                uiSetHidden(drop, false);
+                uiSetBgColor(drop, dropColor, 0);
             } else {
-                lv_obj_add_flag(drop, LV_OBJ_FLAG_HIDDEN);
+                uiSetHidden(drop, true);
             }
         }
     }
@@ -6466,10 +6561,10 @@ void HifiUi::refresh() {
         // regardless made the marquee stutter.
         if (strcmp(m_homeTitleLastText, text) != 0) {
             strlcpy(m_homeTitleLastText, text, sizeof(m_homeTitleLastText));
-            lv_label_set_text(m_homeNowTitle, text);
+            uiSetText(m_homeNowTitle, text);
         }
     }
-    if (m_homeNowDetail) lv_label_set_text(m_homeNowDetail, state.detail[0] ? state.detail : "电台 / 本地 / 网络");
+    if (m_homeNowDetail) uiSetText(m_homeNowDetail, state.detail[0] ? state.detail : "电台 / 本地 / 网络");
     if (m_homeNowLyric) {
         // Synced lyrics only exist for local tracks (see loadLyrics()) --
         // radio/nothing-playing falls back to blank rather than repeating
@@ -6478,7 +6573,7 @@ void HifiUi::refresh() {
         if (!lyric) lyric = "";
         if (strcmp(m_homeLyricLastText, lyric) != 0) {
             strlcpy(m_homeLyricLastText, lyric, sizeof(m_homeLyricLastText));
-            lv_label_set_text(m_homeNowLyric, lyric);
+            uiSetText(m_homeNowLyric, lyric);
         }
     }
     // Radio has no seek position -- show the VU ladder in that slot instead
@@ -6486,11 +6581,11 @@ void HifiUi::refresh() {
     const bool homeIsRadio = state.source == PlayerSource::Radio;
     if (m_homeProgress) {
         if (homeIsRadio) {
-            lv_obj_add_flag(m_homeProgress, LV_OBJ_FLAG_HIDDEN);
+            uiSetHidden(m_homeProgress, true);
         } else {
-            lv_obj_clear_flag(m_homeProgress, LV_OBJ_FLAG_HIDDEN);
+            uiSetHidden(m_homeProgress, false);
             const uint32_t value = state.durationSeconds ? (state.positionSeconds * 1000UL / state.durationSeconds) : 0;
-            lv_bar_set_value(m_homeProgress, value, LV_ANIM_OFF);
+            uiSetBarValue(m_homeProgress, value, LV_ANIM_OFF);
         }
     }
     {
@@ -6500,16 +6595,16 @@ void HifiUi::refresh() {
         for (uint8_t i = 0; i < 9; ++i) {
             if (!m_homeVfdSegments[i]) continue;
             if (homeIsRadio) {
-                lv_obj_clear_flag(m_homeVfdSegments[i], LV_OBJ_FLAG_HIDDEN);
-                lv_obj_set_style_bg_opa(m_homeVfdSegments[i], i < lit ? LV_OPA_COVER : LV_OPA_20, 0);
+                uiSetHidden(m_homeVfdSegments[i], false);
+                uiSetBgOpa(m_homeVfdSegments[i], i < lit ? LV_OPA_COVER : LV_OPA_20, 0);
             } else {
-                lv_obj_add_flag(m_homeVfdSegments[i], LV_OBJ_FLAG_HIDDEN);
+                uiSetHidden(m_homeVfdSegments[i], true);
             }
         }
     }
     if (m_homeMetricsRow) {
-        if (homeIsRadio) lv_obj_clear_flag(m_homeMetricsRow, LV_OBJ_FLAG_HIDDEN);
-        else lv_obj_add_flag(m_homeMetricsRow, LV_OBJ_FLAG_HIDDEN);
+        if (homeIsRadio) uiSetHidden(m_homeMetricsRow, false);
+        else uiSetHidden(m_homeMetricsRow, true);
     }
     if (m_homeMetricPeak || m_homeMetricBuffer || m_homeMetricRate) {
         const bool homePlaying = state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Buffering;
@@ -6532,24 +6627,24 @@ void HifiUi::refresh() {
                     if (ratio < 0.008f) ratio = 0.008f;
                     snprintf(buf, sizeof(buf), "%.0fdB", 20.0f * log10f(ratio));
                 }
-                lv_label_set_text(m_homeMetricPeak, buf);
+                uiSetText(m_homeMetricPeak, buf);
             }
             if (m_homeMetricBuffer) {
                 char buf[8];
                 snprintf(buf, sizeof(buf), "%u%%", state.bufferFillPercent);
-                lv_label_set_text(m_homeMetricBuffer, buf);
+                uiSetText(m_homeMetricBuffer, buf);
             }
             if (m_homeMetricRate) {
                 char buf[12];
                 if (state.bitRate > 0) snprintf(buf, sizeof(buf), "%uk", state.bitRate / 1000);
                 else snprintf(buf, sizeof(buf), "--");
-                lv_label_set_text(m_homeMetricRate, buf);
+                uiSetText(m_homeMetricRate, buf);
             }
         } else {
             m_homePeakHoldRaw = 0;
-            if (m_homeMetricPeak) lv_label_set_text(m_homeMetricPeak, "");
-            if (m_homeMetricBuffer) lv_label_set_text(m_homeMetricBuffer, "");
-            if (m_homeMetricRate) lv_label_set_text(m_homeMetricRate, "");
+            if (m_homeMetricPeak) uiSetText(m_homeMetricPeak, "");
+            if (m_homeMetricBuffer) uiSetText(m_homeMetricBuffer, "");
+            if (m_homeMetricRate) uiSetText(m_homeMetricRate, "");
         }
     }
     if (m_homeSpecCanvas && m_page == Page::Home) {
@@ -6611,8 +6706,8 @@ void HifiUi::refreshMediaPage(const PlayerSnapshot& state) {
     const bool isRadioSource = state.source == PlayerSource::Radio;
     const bool isLive = isRadioSource && state.durationSeconds == 0;
 
-    if (m_title) lv_label_set_text(m_title, state.title[0] ? state.title : stateText(state.transport));
-    if (m_detail) lv_label_set_text(m_detail, state.detail[0] ? state.detail : (state.error[0] ? state.error : "Select from Home"));
+    if (m_title) uiSetText(m_title, state.title[0] ? state.title : stateText(state.transport));
+    if (m_detail) uiSetText(m_detail, state.detail[0] ? state.detail : (state.error[0] ? state.error : "Select from Home"));
     if (m_techLine) {
         char tech[64];
         if (state.codec[0] && state.sampleRate) {
@@ -6622,45 +6717,45 @@ void HifiUi::refreshMediaPage(const PlayerSnapshot& state) {
         } else {
             snprintf(tech, sizeof(tech), "%s", stateText(state.transport));
         }
-        lv_label_set_text(m_techLine, tech);
+        uiSetText(m_techLine, tech);
     }
     if (m_coverLabel && isRadioSource && state.title[0]) {
         char monogram[4];
         snprintf(monogram, sizeof(monogram), "%.3s", state.title);
-        lv_label_set_text(m_coverLabel, monogram);
+        uiSetText(m_coverLabel, monogram);
     }
     if (m_progress) {
-        lv_obj_set_style_bg_color(m_progress, isLive ? kLive : kAccent, LV_PART_INDICATOR);
-        lv_obj_set_style_shadow_color(m_progress, isLive ? kLive : kAccent, LV_PART_INDICATOR);
+        uiSetBgColor(m_progress, isLive ? kLive : kAccent, LV_PART_INDICATOR);
+        uiSetShadowColor(m_progress, isLive ? kLive : kAccent, LV_PART_INDICATOR);
     }
 
     char elapsed[16];
     formatTime(elapsed, sizeof(elapsed), state.positionSeconds);
-    if (m_elapsed) lv_label_set_text(m_elapsed, elapsed);
+    if (m_elapsed) uiSetText(m_elapsed, elapsed);
     if (isLive) {
         if (m_total) {
-            lv_label_set_text(m_total, "LIVE");
-            lv_obj_set_style_text_color(m_total, kLive, 0);
+            uiSetText(m_total, "LIVE");
+            uiSetTextColor(m_total, kLive, 0);
         }
         // Real input-buffer occupancy, not a VU-driven fake animation --
         // this is a number the firmware actually knows, per the "only show
         // verifiable state" rule.
-        if (m_progress) lv_bar_set_value(m_progress, state.bufferFillPercent * 10, LV_ANIM_OFF);
+        if (m_progress) uiSetBarValue(m_progress, state.bufferFillPercent * 10, LV_ANIM_OFF);
     } else {
         char total[16];
         formatTime(total, sizeof(total), state.durationSeconds);
         if (m_total) {
-            lv_label_set_text(m_total, total);
-            lv_obj_set_style_text_color(m_total, kInkDim, 0);
+            uiSetText(m_total, total);
+            uiSetTextColor(m_total, kInkDim, 0);
         }
         if (m_progress) {
             const uint32_t value = state.durationSeconds ? (state.positionSeconds * 1000UL / state.durationSeconds) : 0;
-            lv_bar_set_value(m_progress, value, LV_ANIM_OFF);
+            uiSetBarValue(m_progress, value, LV_ANIM_OFF);
         }
     }
 
     const bool playing = state.transport == PlayerTransport::Playing || state.transport == PlayerTransport::Buffering;
-    if (m_playIcon) lv_label_set_text(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    if (m_playIcon) uiSetText(m_playIcon, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 }
 
 // Disc spin + spectrum ring, shared by whichever page currently owns
@@ -6716,9 +6811,9 @@ void HifiUi::refreshCoverSpin(const PlayerSnapshot& state) {
             const uint8_t wave = phase < 50 ? phase : 100 - phase;
             h = std::min<uint8_t>(16, std::max<uint8_t>(4, static_cast<uint8_t>(vu * (10 + wave) / 255)));
         }
-        lv_obj_set_height(m_ringBars[i], h);
+        uiSetHeight(m_ringBars[i], h);
         const float a = (static_cast<float>(i) / static_cast<float>(barCount ? barCount : 10)) * 2.0f * 3.14159265f;
-        lv_obj_set_pos(m_ringBars[i], m_ringCx + static_cast<int16_t>(cosf(a) * m_ringR) - 1,
+        uiSetPos(m_ringBars[i], m_ringCx + static_cast<int16_t>(cosf(a) * m_ringR) - 1,
                         m_ringCy + static_cast<int16_t>(sinf(a) * m_ringR) - h / 2);
     }
 }
