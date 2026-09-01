@@ -1,6 +1,5 @@
 #include "waveshare_lvgl_port.h"
 
-#include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include <algorithm>
 #include <cmath>
@@ -56,10 +55,6 @@ constexpr int kRowsPerBuffer = 16;
 constexpr uint32_t kTftSpiHz = 80000000;
 constexpr uint8_t kTouchAddress = 0x15;
 constexpr uint8_t kImuAddress = 0x6B;
-constexpr bool kLcdSelfTest = false;
-constexpr bool kBootColorFlash = true;
-constexpr uint8_t kDisplayRotationNormal = 3;
-constexpr uint8_t kDisplayRotationFlipped = 1;
 constexpr bool kInvertTouchX = false;
 constexpr bool kInvertTouchY = false;
 constexpr uint16_t kEdgeBackPx = 54;
@@ -90,12 +85,6 @@ constexpr int LCD_DC = 11;
 constexpr int LCD_CS = 12;
 constexpr int LCD_DIN = 13;
 constexpr int LCD_BL = 14;
-constexpr uint16_t kBlack = 0x0000;
-constexpr uint16_t kRed = 0xF800;
-constexpr uint16_t kGreen = 0x07E0;
-constexpr uint16_t kBlue = 0x001F;
-constexpr uint16_t kCyan = 0x07FF;
-constexpr uint16_t kWhite = 0xFFFF;
 
 bool writeRegister(uint8_t address, uint8_t reg, uint8_t value) {
     i2cBusOne.beginTransmission(address);
@@ -113,23 +102,21 @@ bool readRegisters(uint8_t address, uint8_t reg, uint8_t* data, size_t len) {
     return true;
 }
 
-// Both stay null since the 2026-09-03 esp_lcd migration -- the panel is now
-// driven by s_panel/s_panelIo below. Every remaining s_gfx user is null-
-// guarded and therefore a no-op; kept (rather than deleted along with the
-// Arduino_GFX dependency) only until the migration has proven stable on
-// hardware, so a revert stays a one-file change. What that costs today:
-//   - drawFallbackHome(): the pre-LVGL placeholder screen no longer draws.
-//     Harmless -- LVGL takes over within a second of boot either way.
-//   - runSelfTest(): already dead (kLcdSelfTest == false).
-//   - applyDisplayRotation() / pollImuOrientation(): already inert (IMU
-//     auto-rotate was removed by request 2026-07-24); orientation is now
-//     fixed at init via esp_lcd_panel_swap_xy/mirror.
-// s_bus is gone entirely -- nothing referenced it once Arduino_HWSPI was
-// dropped. s_gfx stays only because the null-guarded no-op users listed
-// above still name it.
-Arduino_GFX* s_gfx = nullptr;
+// 2026-09-05: Arduino_GFX 依赖已彻底移除。09-03 迁移到 esp_lcd 之后 s_gfx/s_bus
+// 就只是空指针了，当时保留是为了让回退保持"改一个文件"的成本；迁移在硬件上跑稳
+// 之后一并删掉。同时删掉的是那批只在 s_gfx 非空时才有意义、因而早已是 no-op 的
+// 代码：
+//   - drawFallbackHome()：开机前的占位画面。LVGL 一秒内就接管，无实际影响。
+//   - runSelfTest() + kLcdSelfTest：常量恒为 false，本来就是死代码。
+//   - kBootColorFlash：同上，没有任何使用者。
+//   - applyDisplayRotation() 里的 setRotation() 调用：屏幕方向现在在 initPanel()
+//     里由 esp_lcd_panel_swap_xy/mirror 一次性固定（IMU 自动旋转 2026-07-24 按
+//     要求移除），函数本身保留只为继续维护 m_displayFlipped 这个触摸映射用的标志。
+//
+// 注意：**lib/tftLib 不在移除范围内，它仍然是活的**——main.cpp 有 4 处
+// getTFT().decodeJpgFromMemory() 在解本地/云音乐封面。tftLib 又依赖
+// src/waveshare/esp_lcd_sh8601.*，所以那两个文件同样不能删。
 uint32_t s_flushCount = 0;
-uint32_t s_lastFallbackDraw = 0;
 
 // 2026-09-03: 显示链路迁移到官方 esp_lcd（方案见 docs/PLAN_esp_lcd_migration.md）。
 // 目的是把 flush 从"同步阻塞直到传完"改成"提交给 DMA 后立刻返回、传输完成中断
@@ -181,44 +168,12 @@ uint32_t s_perfTimerHandlerCalls = 0;
 uint32_t s_perfTimerHandlerBusyUs = 0;
 uint32_t s_perfTimerHandlerMaxUs = 0;
 
-void drawFallbackHome() {
-    if (!s_gfx) return;
-    s_gfx->fillScreen(kBlack);
-    s_gfx->drawRect(0, 0, kWidth, kHeight, kCyan);
-    s_gfx->drawFastHLine(0, 28, kWidth, kCyan);
-    s_gfx->setTextSize(2);
-    s_gfx->setTextColor(kWhite, kBlack);
-    s_gfx->setCursor(12, 7);
-    s_gfx->print("NOW PLAYING");
-    s_gfx->setTextSize(1);
-    s_gfx->setCursor(248, 10);
-    s_gfx->print("OFFLINE");
-
-    const char* labels[] = {"PLAY", "LOCAL", "RADIO", "SAVED", "SET"};
-    for (uint8_t i = 0; i < 5; ++i) {
-        const int16_t x = 10 + i * 62;
-        const uint16_t border = i == 0 ? kGreen : kCyan;
-        s_gfx->drawRoundRect(x, 44, 54, 84, 7, border);
-        s_gfx->drawRoundRect(x + 1, 45, 52, 82, 7, border);
-        s_gfx->setTextSize(2);
-        s_gfx->setTextColor(i == 0 ? kGreen : kCyan, kBlack);
-        s_gfx->setCursor(x + 20, 65);
-        s_gfx->print(i == 0 ? ">" : (i == 1 ? "M" : (i == 2 ? "R" : (i == 3 ? "*" : "="))));
-        s_gfx->setTextSize(1);
-        s_gfx->setTextColor(kWhite, kBlack);
-        s_gfx->setCursor(x + 12, 103);
-        s_gfx->print(labels[i]);
-    }
-    s_gfx->setTextColor(kCyan, kBlack);
-    s_gfx->setCursor(82, 151);
-    s_gfx->print("MINIWEBRADIO HIFI PLAYER");
-}
 } // namespace
 
 WaveshareLvglPort* WaveshareLvglPort::s_instance = nullptr;
 
 bool WaveshareLvglPort::initPanel() {
-    printf("[LCD] init Arduino_GFX ST7789 320x170\n");
+    printf("[LCD] init esp_lcd ST7789 320x170\n");
     // This board's backlight driver is active-low (every prior version of
     // this code only ever wrote LOW here, and the panel lights up) --
     // setBacklightPercent() accounts for that when it takes over via PWM.
@@ -324,8 +279,6 @@ void WaveshareLvglPort::setBacklightPercent(uint8_t percent) {
 bool WaveshareLvglPort::begin() {
     printf("[LVGL] port begin\n");
     if (!initPanel()) return false;
-    if (kLcdSelfTest) runSelfTest();
-    drawFallbackHome();
     i2cBusOne.setClock(400000);
     m_imuReady = initImu();
 
@@ -423,16 +376,6 @@ bool WaveshareLvglPort::begin() {
     return true;
 }
 
-void WaveshareLvglPort::runSelfTest() {
-    if (!s_gfx) return;
-    const uint16_t colors[] = {kRed, kGreen, kBlue, kWhite, kBlack};
-    while (true) {
-        for (uint16_t color : colors) {
-            s_gfx->fillScreen(color);
-            delay(700);
-        }
-    }
-}
 
 void WaveshareLvglPort::tick() {
     const uint32_t now = millis();
@@ -471,10 +414,6 @@ void WaveshareLvglPort::tick() {
         s_perfTimerHandlerBusyUs = 0;
         s_perfTimerHandlerMaxUs = 0;
     }
-    if (s_flushCount == 0 && now - s_lastFallbackDraw > 2000) {
-        s_lastFallbackDraw = now;
-        drawFallbackHome();
-    }
 }
 
 bool WaveshareLvglPort::consumeGesture(TouchGesture* gesture) {
@@ -485,8 +424,10 @@ bool WaveshareLvglPort::consumeGesture(TouchGesture* gesture) {
 }
 
 void WaveshareLvglPort::applyDisplayRotation(bool flipped) {
+    // 只更新标志位：屏幕方向已在 initPanel() 里由 esp_lcd_panel_swap_xy/mirror
+    // 固定，这里不再需要（也没有办法）改驱动的 rotation。m_displayFlipped 仍然
+    // 参与触摸坐标映射，所以函数保留。
     m_displayFlipped = flipped;
-    if (s_gfx) s_gfx->setRotation(flipped ? kDisplayRotationFlipped : kDisplayRotationNormal);
 }
 
 bool WaveshareLvglPort::initImu() {
@@ -523,7 +464,7 @@ bool WaveshareLvglPort::readImuGyroZ(int16_t* gz) {
 }
 
 void WaveshareLvglPort::pollImuOrientation() {
-    if (!m_autoRotation || !m_imuReady || !s_gfx) return;
+    if (!m_autoRotation || !m_imuReady) return;
     const uint32_t now = millis();
     if (now - m_lastImuPoll < kImuPollMs) return;
     const uint32_t deltaMs = m_lastGyroMs == 0 ? kImuPollMs : now - m_lastGyroMs;

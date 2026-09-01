@@ -28,7 +28,6 @@ class WaveshareLvglPort {
     bool readImuAccel(int16_t* ax, int16_t* ay, int16_t* az);
     bool readImuGyroZ(int16_t* gz);
     void applyDisplayRotation(bool flipped);
-    void runSelfTest();
     bool readTouchPoint(uint16_t* x, uint16_t* y);
     void updateGesture(bool pressed, uint16_t x, uint16_t y);
 

@@ -328,8 +328,71 @@ flushes=17758  trans_done=17758  draw_err=0
 
 ## 9. 遗留项 / 下一步候选
 
-- [ ] 删掉 `Arduino_GFX` 依赖和 `src/waveshare/esp_lcd_sh8601.*` 残留
-      （等迁移在硬件上再稳一段时间；现在保留是为了让回退成本保持在一个文件）
+- [x] ~~删掉 `Arduino_GFX` 依赖~~ —— **已完成 2026-09-05，见 §10。**
+- [ ] ~~删掉 `src/waveshare/esp_lcd_sh8601.*` 残留~~ —— **这条是错的，已撤销。**
+      那两个文件**不是残留**：`lib/tftLib/tft_spi.h:18` include 它，
+      `tft_spi.cpp` 实际调用 `esp_lcd_new_panel_sh8601()` 一整套；而 tftLib 本身
+      在运行时是活的（`main.cpp` 有 4 处 `getTFT().decodeJpgFromMemory()` 在解
+      本地/云音乐封面）。删掉会直接编译失败。
 - [ ] 重新做一次干净的 A/B 性能对比 + 扫 `kRowsPerBuffer`（见 §5）
 - [ ] `refresh()` 里的冗余 invalidate 优化
 - [ ] 08-07 日志的未完项：lrclib.net 模糊匹配、SYLT `tsFormat==1`
+
+---
+
+## 10. 2026-09-05 追加：移除 Arduino_GFX 依赖
+
+### 改了什么
+
+- `src/ui/waveshare_lvgl_port.cpp`
+  - 删 `#include <Arduino_GFX_Library.h>`、删 `Arduino_GFX* s_gfx = nullptr;`
+  - 删 `drawFallbackHome()` 整个函数 + 两处调用（`begin()` 里一处、
+    `tick()` 里那个 `s_flushCount == 0` 时每 2 秒重绘的兜底块）
+  - 删 `runSelfTest()` + `kLcdSelfTest`（常量恒为 false，本来就是死代码）
+  - 删随之失去使用者的常量：`kBootColorFlash`、`kDisplayRotationNormal/Flipped`、
+    六个颜色常量 `kBlack/kRed/kGreen/kBlue/kCyan/kWhite`、`s_lastFallbackDraw`
+  - `applyDisplayRotation()` 去掉 `setRotation()` 调用，只保留 `m_displayFlipped`
+    赋值（该标志仍参与触摸坐标映射，函数不能删）
+  - `pollImuOrientation()` 的守卫去掉 `|| !s_gfx` 项。该函数目前没有任何调用点，
+    行为不变。
+  - 初始化日志文案 `[LCD] init Arduino_GFX ST7789` → `[LCD] init esp_lcd ST7789`
+- `src/ui/waveshare_lvgl_port.h`：删 `void runSelfTest();` 声明
+- `platformio.ini`：更新 `lib_deps` 上方注释，说明依赖已移除、
+  以及 `lib/lvgl`、`lib/tftLib` 不要一起清理
+
+`lib/Arduino_GFX/`（vendored、gitignored）**目录本身保留未删** ——
+`probes/lvgl9_probe/` 是个独立的 PlatformIO 探针工程，仍然 include 它。
+主工程这边没有任何源文件再 include，LDF 不会把它拉进依赖图，所以留着不产生成本。
+
+### 实测结果 —— 两条预期收益只兑现了一条
+
+真机验证：编译通过、烧录校验通过、板子正常启动，
+`[LCD] init esp_lcd ST7789` → `panel ready (SPI2, 80000000 Hz)` → flush 正常，
+`[PERF] flush/s≈192~204, busy≈25~28%`。显示、触摸无异常。
+
+**固件体积：没有减小，反而略微增大。**
+
+| | 移除前（`149cb4e`） | 移除后 | 变化 |
+|---|---|---|---|
+| Flash | 5170158 B | 5172134 B | **+1976 B（+0.04%）** |
+| RAM | 98828 B | 98820 B | −8 B |
+
+原因：ESP-IDF 默认带 `-ffunction-sections -fdata-sections` + `--gc-sections`，
+迁移到 esp_lcd 之后没有任何符号再引用 Arduino_GFX，**链接器早就已经把它整个丢掉了**
+——固件里本来就没有它，自然没有体积可回收。
+反证也成立：如果之前真被链进去了，去掉 100 个 `.o` 应该掉几十 KB，而不是这个量级。
+`nm firmware.elf | grep -c Arduino_GFX` 现在是 `0`。
+那 +2KB 属于链接布局/对齐噪音，在 16MB flash 上无实际意义。
+
+**编译时间：只在完整重编译时有收益，增量编译没有。**
+
+Arduino_GFX 是 **100 个编译单元**，占本工程 1744 个 `.o` 的约 **5.7%**。
+完整重编译时这部分开销消失；但增量编译本来就命中缓存
+（改动前那批 `.o` 时间戳还停在 08-31，最近几次构建根本没重编过它们），所以没有差别。
+
+> ⚠️ **未做严格测量**：没有跑「移除前 / 移除后各一次 clean 全量构建」的计时对比，
+> 上面 5.7% 是编译单元占比推算，不是实测秒数。要准确数字得跑两次全量构建。
+
+**结论**：这次改动的实际价值主要是**代码清晰度**——删掉了一整套永远不会执行的
+no-op 代码路径和随之悬空的常量，以及一条已经名不副实的第三方依赖。
+体积和增量编译时间上都不要期待收益。
