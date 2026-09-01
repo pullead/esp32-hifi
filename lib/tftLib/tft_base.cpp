@@ -1051,6 +1051,17 @@ bool TFT_Base::decodeJpgFromMemory(const uint8_t* data, size_t len, uint8_t scal
     m_array_index = 0;
     JPEG_setJpgScale(scaleFactor);
 
+    // 2026-09-04: every caller of this function hands the result straight to
+    // LVGL as an LV_IMG_CF_TRUE_COLOR image (cover art, station logos, cloud
+    // artwork), so the output has to match LVGL's lv_color_t byte order. That
+    // is now big-endian -- LV_COLOR_16_SWAP was turned on in src/lv_conf.h
+    // when the display moved to esp_lcd, because esp_lcd DMAs the framebuffer
+    // out verbatim while Arduino_GFX used to byte-swap on the way to the
+    // panel. Without this the UI renders correctly but every decoded image
+    // comes out as noise. Set here rather than at the four call sites so a
+    // new caller can't forget it.
+    JPEG_setSwapBytes(true);
+
     JDEC    jdec;
     jdec.swap = m_swap;
     uint8_t r = JPEG_jd_prepare(&jdec, m_workspace, TJPGD_WORKSPACE_SIZE, 0);

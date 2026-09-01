@@ -10,10 +10,15 @@ def convert(png_path, c_path, var_name):
         for x in range(w):
             r, g, b = px[x, y]
             v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-            out.append(v & 0xFF)
+            # Big-endian (high byte first) to match LV_COLOR_16_SWAP=1, which
+            # src/lv_conf.h turned on when the display moved to esp_lcd (esp_lcd
+            # DMAs the framebuffer out verbatim; Arduino_GFX used to byte-swap
+            # on the way to the panel). Emitting low-byte-first here, as this
+            # script used to, makes these images render as noise.
             out.append((v >> 8) & 0xFF)
+            out.append(v & 0xFF)
     with open(c_path, "w") as f:
-        f.write("// Auto-generated RGB565 pixel data, %dx%d, LV_COLOR_16_SWAP=0\n" % (w, h))
+        f.write("// Auto-generated RGB565 pixel data, %dx%d, LV_COLOR_16_SWAP=1 (big-endian)\n" % (w, h))
         f.write("#include <stdint.h>\n")
         f.write("const uint16_t %s_w = %d;\n" % (var_name, w))
         f.write("const uint16_t %s_h = %d;\n" % (var_name, h))

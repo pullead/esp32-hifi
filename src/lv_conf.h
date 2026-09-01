@@ -27,7 +27,23 @@
 #define LV_COLOR_DEPTH 16
 
 /*Swap the 2 bytes of RGB565 color. Useful if the display has an 8-bit interface (e.g. SPI)*/
-#define LV_COLOR_16_SWAP 0
+// 2026-09-04: 0 -> 1，配合显示链路迁移到 esp_lcd（见
+// docs/DEV_LOG_2026-09-03_esp_lcd_wip.md）。
+//
+// ST7789 走 SPI 期望大端 RGB565（高字节先发），而 LVGL 在 SWAP=0 时按 ESP32
+// 的原生小端存。以前这个不匹配被 Arduino_GFX 悄悄补上了——它的
+// writePixels() 是逐像素拆成 msb/lsb 再写出去的；而 esp_lcd 的
+// esp_lcd_panel_draw_bitmap() 把缓冲区字节**原样**交给 DMA，不做任何交换。
+// 于是迁移后每个像素的两个字节都是反的，整屏花屏。
+//
+// 打开 SWAP 让 LVGL 直接产出大端数据，DMA 就能零拷贝直传，比在 flush() 里
+// 逐像素交换省一整遍内存读写。
+//
+// 注意：这会改变 LVGL 全局的 lv_color_t 内存布局。任何**绕过 LVGL 直接写
+// 原始 RGB565 像素**的代码都得跟着交换——本项目里就是封面图解码那条路径
+// （decodeLocalTrackCover / 云音乐封面 LRU 缓存）。如果改完发现只有封面
+// 颜色不对、UI 其它部分正常，就是这里。
+#define LV_COLOR_16_SWAP 1
 
 /*Enable features to draw on transparent background.
  *It's required if opa, and transform_* style properties are used.

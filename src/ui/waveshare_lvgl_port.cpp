@@ -29,7 +29,14 @@ constexpr int kHeight = 170;
 // 变），只是把覆盖同一块屏幕区域所需的 flush() 调用次数减少，省掉相应的
 // 函数调用/LVGL 调度开销——80 行已经接近屏幕高度(170)的一半，再往上加边
 // 际收益会更小。
-constexpr int kRowsPerBuffer = 80;
+// 2026-09-04：80 -> 16，配合缓冲从 PSRAM 移回内部 DMA 内存（见下面
+// begin() 里的分配处）。80 行 x2 在 PSRAM 里没问题，但换成内部 RAM 就是
+// 100KB，这块板绝对给不起。16 行 x2 = 20KB。
+//
+// 这个数字变小**不会**让传输总字节数变多——覆盖同一块脏区域的数据量不
+// 变，只是拆成更多次 flush()。而且现在 flush 是异步的（提交完就返回，DMA
+// 在后台搬），多几次调用的开销远小于以前同步阻塞时代。
+constexpr int kRowsPerBuffer = 16;
 // 这个常量之前一直是这条 LVGL/Arduino_GFX 路径真正生效的 LCD SPI 频率——
 // settings.h 里的 TFT_FREQUENCY 只给旧的非 LVGL 驱动路径用，那条路径在
 // MWR_LVGL_UI 打开时被 setup() 里的提前 return 挡住，根本不会执行到，所以
@@ -128,10 +135,6 @@ uint32_t s_lastFallbackDraw = 0;
 // 目的是把 flush 从"同步阻塞直到传完"改成"提交给 DMA 后立刻返回、传输完成中断
 // 里才通知 LVGL"，这样 LVGL 的双缓冲才真正吃到"渲染下一块 / 传输上一块"的并行。
 //
-// 这一步（第一阶段）只替换驱动，flush 仍然保持同步语义——先单独验证方向/偏移/
-// 颜色都对，再改异步。两个问题分开验证，避免出问题时分不清是驱动没配好还是异步
-// 逻辑有错。
-//
 // SPI host：ESP32-S3 上 Arduino 的 FSPI=0 对应 SPI2 总线，全局 SPI 对象就是
 // SPIClass SPI(FSPI)，而 Arduino_HWSPI 默认用它——所以此前能正常出画面的这条
 // 路径实际跑在 SPI2 上。注意 common.h:100 那条"必须用 SPI3、FSPI 收不到数据"的
@@ -141,22 +144,18 @@ constexpr spi_host_device_t kLcdSpiHost = SPI2_HOST;
 esp_lcd_panel_io_handle_t s_panelIo = nullptr;
 esp_lcd_panel_handle_t s_panel = nullptr;
 
-// Migration diagnostics. These have to be reported from the periodic [PERF]
-// line rather than printed once at init: this board re-enumerates USB when
-// the app starts, so a reset-and-capture drops the connection before any
-// app-level output arrives, and a capture without reset joins the stream too
-// late to see init messages. Periodic printing is the only thing a serial
-// capture can reliably observe here.
+// Dropped-transfer accounting. A transfer esp_lcd refuses is otherwise
+// completely silent, and the only visible effect is that region of the screen
+// keeping its previous content -- which is exactly how the migration's
+// garbling presented, so it stays instrumented.
+//
+// Debugging note for anything added here later: this board re-enumerates USB
+// when the app starts, so init-time printf is unobservable (a reset-and-
+// capture loses the connection, a capture without reset joins too late).
+// Report from the periodic [PERF] tick instead.
 esp_err_t s_lastDrawErr = ESP_OK;
 uint32_t s_drawErrCount = 0;
 uint32_t s_transDoneCount = 0;
-// How far begin() got, for the same "can't see init printf" reason. Each
-// step bumps it, so the periodic line shows exactly where it stopped:
-//   1 spi_bus_initialize  2 new_panel_io_spi  3 new_panel_st7789
-//   4 panel init/config   5 lv_init           6 draw buffers alloc'd
-//   7 lv_disp_drv_register  8 callbacks registered  9 fully ready
-volatile int s_beginStage = 0;
-esp_err_t s_lastInitErr = ESP_OK;
 
 // Runs in ISR context from the SPI DMA completion interrupt. Must stay tiny
 // and must not call anything that blocks -- lv_disp_flush_ready() only flips
@@ -245,12 +244,10 @@ bool WaveshareLvglPort::initPanel() {
     busCfg.quadwp_io_num = -1;
     busCfg.quadhd_io_num = -1;
     busCfg.max_transfer_sz = kWidth * kRowsPerBuffer * static_cast<int>(sizeof(lv_color_t));
-    s_lastInitErr = spi_bus_initialize(kLcdSpiHost, &busCfg, SPI_DMA_CH_AUTO);
-    if (s_lastInitErr != ESP_OK) {
+    if (spi_bus_initialize(kLcdSpiHost, &busCfg, SPI_DMA_CH_AUTO) != ESP_OK) {
         printf("[LCD] spi_bus_initialize failed\n");
         return false;
     }
-    s_beginStage = 1;
 
     // ---- panel IO ------------------------------------------------------
     esp_lcd_panel_io_spi_config_t ioCfg = {};
@@ -265,24 +262,20 @@ bool WaveshareLvglPort::initPanel() {
     // user_ctx has to be &m_displayDriver and that isn't initialized until
     // after lv_disp_drv_init().
     // esp_lcd_spi_bus_handle_t is just an int holding the host number.
-    s_lastInitErr = esp_lcd_new_panel_io_spi(static_cast<esp_lcd_spi_bus_handle_t>(kLcdSpiHost), &ioCfg, &s_panelIo);
-    if (s_lastInitErr != ESP_OK) {
+    if (esp_lcd_new_panel_io_spi(static_cast<esp_lcd_spi_bus_handle_t>(kLcdSpiHost), &ioCfg, &s_panelIo) != ESP_OK) {
         printf("[LCD] esp_lcd_new_panel_io_spi failed\n");
         return false;
     }
-    s_beginStage = 2;
 
     // ---- ST7789 panel --------------------------------------------------
     esp_lcd_panel_dev_config_t panelCfg = {};
     panelCfg.reset_gpio_num = LCD_RST;
     panelCfg.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
     panelCfg.bits_per_pixel = 16;
-    s_lastInitErr = esp_lcd_new_panel_st7789(s_panelIo, &panelCfg, &s_panel);
-    if (s_lastInitErr != ESP_OK) {
+    if (esp_lcd_new_panel_st7789(s_panelIo, &panelCfg, &s_panel) != ESP_OK) {
         printf("[LCD] esp_lcd_new_panel_st7789 failed\n");
         return false;
     }
-    s_beginStage = 3;
     esp_lcd_panel_reset(s_panel);
     esp_lcd_panel_init(s_panel);
     // This board's panel wants INVON -- previously expressed as Arduino_GFX's
@@ -294,11 +287,22 @@ bool WaveshareLvglPort::initPanel() {
     // swap_xy turns the axes, mirror fixes the resulting handedness, and the
     // 35px RAM offset (portrait x) follows the swap onto the y axis.
     // All three are empirical -- verify on hardware, see the plan's §6.
+    // 这三个参数不是推导的，是从此前能正常工作的 Arduino_GFX 配置反推出来
+    // 的（旧代码：Arduino_ST7789(..., 170, 320, 35, 0, 35, 0) + setRotation(3)）：
+    //   Arduino_ST7789::setRotation 的 case 3 => MADCTL = MY | MV | RGB
+    //     MV  -> swap_xy(true)
+    //     MX  没有 -> mirror_x = false
+    //     MY  有   -> mirror_y = true
+    //   Arduino_TFT::setRotation 的 case 3 => _xStart = ROW_OFFSET2 = 0
+    //                                        _yStart = COL_OFFSET1 = 35
+    //     -> set_gap(0, 35)
+    // 2026-09-04：mirror 的两个参数最初被我写反成 (true, false)，画面方向/
+    // 位置全错，连带触摸也"没反应"——因为显示位置和 LVGL 控件的逻辑坐标对
+    // 不上，点哪都命不中。
     esp_lcd_panel_swap_xy(s_panel, true);
-    esp_lcd_panel_mirror(s_panel, true, false);
+    esp_lcd_panel_mirror(s_panel, false, true);
     esp_lcd_panel_set_gap(s_panel, 0, 35);
     esp_lcd_panel_disp_on_off(s_panel, true);
-    s_beginStage = 4;
 
     printf("[LCD] esp_lcd ST7789 panel ready (SPI%d, %lu Hz)\n", static_cast<int>(kLcdSpiHost) + 1,
            static_cast<unsigned long>(kTftSpiHz));
@@ -326,36 +330,49 @@ bool WaveshareLvglPort::begin() {
     m_imuReady = initImu();
 
     lv_init();
-    s_beginStage = 5;
-    const size_t bufferBytes = kWidth * kRowsPerBuffer * sizeof(lv_color_t);
-    // PSRAM, not MALLOC_CAP_DMA|MALLOC_CAP_INTERNAL: Arduino_HWSPI (the
-    // driver actually in use here, see initPanel()) doesn't DMA straight out
-    // of this buffer anyway -- writePixels() already copies through its own
-    // internal bounce buffer via plain CPU reads before handing bytes to
-    // SPI.transfer(). So there's no hardware requirement for this buffer to
-    // be internal/DMA-capable; PSRAM just costs a bit more read latency
-    // during that copy. Moving it here gives back ~25KB of internal RAM
-    // that used to be permanently reserved by these two buffers -- see
-    // setupLvglRuntime()'s comment in main.cpp on why that RAM matters (WiFi
-    // was failing esp_wifi_init() for lack of exactly this much headroom).
-    m_bufferA = static_cast<lv_color_t*>(heap_caps_malloc(bufferBytes, MALLOC_CAP_SPIRAM));
-    m_bufferB = static_cast<lv_color_t*>(heap_caps_malloc(bufferBytes, MALLOC_CAP_SPIRAM));
+    // Rounded up to a whole number of 64-byte cache lines for the same
+    // writeback reason as the alignment below (a partial trailing line is
+    // exactly where stale-data artifacts like to appear). 320 * 2 bytes per
+    // row is already a multiple of 64, so this is currently a no-op -- it's
+    // here so a future kWidth/kRowsPerBuffer change can't silently break it.
+    const size_t bufferBytes = ((kWidth * kRowsPerBuffer * sizeof(lv_color_t)) + 63u) & ~static_cast<size_t>(63u);
+    // INTERNAL DMA memory, not PSRAM. This is forced by how the SPI master
+    // driver handles a tx buffer it can't DMA from directly
+    // (esp_driver_spi/src/gpspi/spi_master.c, ~line 1163):
+    //
+    //     if (!esp_ptr_dma_capable(send_ptr) || tx_unaligned) {
+    //         temp = heap_caps_aligned_alloc(alignment, tx_byte_len, MALLOC_CAP_DMA);
+    //         if (temp == NULL) { goto clean_up; }   // -> ESP_ERR_NO_MEM
+    //         memcpy(temp, send_ptr, ...);
+    //     }
+    //
+    // esp_ptr_dma_capable() is false for PSRAM unconditionally (it means
+    // "internal DMA-capable", not "the GDMA can reach it"), so with the
+    // buffers in PSRAM the driver allocated a fresh internal bounce buffer
+    // *the size of the whole transfer* and memcpy'd into it on every single
+    // flush -- ~150 times a second. Consequences, all observed:
+    //   - transient 51KB internal allocations; when one failed we got
+    //     ESP_ERR_NO_MEM and the transfer was silently dropped, leaving that
+    //     screen region showing stale content (the "花屏" patches).
+    //   - the PSRAM->internal copy the migration was supposed to remove was
+    //     still happening, just relocated into the driver.
+    // Aligning the PSRAM allocation didn't help and couldn't have: the
+    // esp_ptr_dma_capable() half of that condition is false either way.
+    //
+    // Internal DMA memory takes the zero-copy path instead. At 16 rows the
+    // two buffers cost 20KB, which is *less* internal-RAM pressure than the
+    // 51KB transient allocations it replaces -- and internal RAM here is
+    // genuinely scarce (see setupLvglRuntime() in main.cpp; a 48KB increase
+    // for cache sizing bricked boot on 2026-09-03).
+    m_bufferA = static_cast<lv_color_t*>(heap_caps_aligned_alloc(64, bufferBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    m_bufferB = static_cast<lv_color_t*>(heap_caps_aligned_alloc(64, bufferBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     printf("[LVGL] draw buffers: A=%p B=%p (internal free=%u, psram free=%u)\n", m_bufferA, m_bufferB,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    // esp_lcd hands these straight to the SPI DMA now, so whether they're
-    // reachable by DMA stopped being a don't-care (it was fine under
-    // Arduino_HWSPI, which copied through its own bounce buffer with plain
-    // CPU reads). See the plan's §6 -- this is the top risk of the migration.
-    if (m_bufferA) {
-        printf("[LVGL] buffer A: psram=%d dma_capable=%d\n", static_cast<int>(esp_ptr_external_ram(m_bufferA)),
-               static_cast<int>(esp_ptr_dma_capable(m_bufferA)));
-    }
     if (!m_bufferA || !m_bufferB) {
         printf("[LVGL] draw buffer alloc failed\n");
         return false;
     }
 
-    s_beginStage = 6;
     lv_disp_draw_buf_init(&m_drawBuffer, m_bufferA, m_bufferB, kWidth * kRowsPerBuffer);
     lv_disp_drv_init(&m_displayDriver);
     m_displayDriver.hor_res = kWidth;
@@ -369,7 +386,6 @@ bool WaveshareLvglPort::begin() {
         return false;
     }
     lv_disp_set_default(m_display);
-    s_beginStage = 7;
 
     // Async completion: flush() queues the DMA transfer and returns; this
     // callback is what actually tells LVGL the buffer is free again. Has to
@@ -401,7 +417,6 @@ bool WaveshareLvglPort::begin() {
     m_touchDriver.gesture_limit = 56;
     m_touchDriver.long_press_time = 450;
     m_touchIndev = lv_indev_drv_register(&m_touchDriver);
-    s_beginStage = 8;
     s_instance = this;
     m_lastTick = millis();
     printf("[LVGL] port ready\n");
@@ -442,18 +457,14 @@ void WaveshareLvglPort::tick() {
                static_cast<unsigned long>(s_perfTimerHandlerBusyUs),
                static_cast<double>(s_perfTimerHandlerBusyUs) / 10000.0,
                static_cast<unsigned long>(s_perfTimerHandlerMaxUs));
-        // esp_lcd migration diagnostics -- remove once it's working.
-        // flushes = how many times flush() ran at all; trans_done = how many
-        // DMA completion callbacks came back. flushes>0 with trans_done==0 is
-        // the "transfer never completes" case; draw_err>0 means the transfer
-        // was rejected outright (then err tells us why, e.g. a buffer the SPI
-        // DMA can't reach).
-        printf("[LCDDBG] stage=%d init_err=%s flushes=%lu trans_done=%lu draw_err=%lu last_err=%s bufA_psram=%d bufA_dma=%d\n",
-               s_beginStage, esp_err_to_name(s_lastInitErr),
-               static_cast<unsigned long>(s_flushCount), static_cast<unsigned long>(s_transDoneCount),
-               static_cast<unsigned long>(s_drawErrCount), esp_err_to_name(s_lastDrawErr),
-               s_instance && s_instance->m_bufferA ? static_cast<int>(esp_ptr_external_ram(s_instance->m_bufferA)) : -1,
-               s_instance && s_instance->m_bufferA ? static_cast<int>(esp_ptr_dma_capable(s_instance->m_bufferA)) : -1);
+        // A dropped transfer leaves that screen region showing stale content
+        // (this is what the pre-fix garbling was), and it is otherwise
+        // completely silent -- so keep reporting it, but only when it
+        // actually happens rather than on every line.
+        if (s_drawErrCount) {
+            printf("[LCD] draw_bitmap dropped %lu transfer(s), last=%s\n",
+                   static_cast<unsigned long>(s_drawErrCount), esp_err_to_name(s_lastDrawErr));
+        }
         s_perfWindowStartMs = now;
         s_perfFlushAtWindowStart = s_flushCount;
         s_perfTimerHandlerCalls = 0;
