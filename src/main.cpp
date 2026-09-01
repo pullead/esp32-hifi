@@ -25,6 +25,18 @@
 #define MWR_USB_MSC_SUPPORTED 0
 #endif
 
+// USB 声卡（UAC2）模式。和 U 盘模式并列的第三个独立模式，两者互斥——
+// 一个 USB 口、一套 TinyUSB 配置，同时只能是一种用途。
+#if MWR_USB_DAC && SOC_USB_OTG_SUPPORTED && CONFIG_TINYUSB_ENABLED && !ARDUINO_USB_MODE
+#include "usb_dac.h"
+// usb_persist_restart() / restart_type_t 在这里声明（<USB.h> 不转出来），
+// 退出声卡模式时要用它把 USB PHY 干净地交还给 ROM 的 USB-Serial/JTAG。
+#include "esp32-hal-tinyusb.h"
+#define MWR_USB_DAC_SUPPORTED 1
+#else
+#define MWR_USB_DAC_SUPPORTED 0
+#endif
+
 // Unified memory snapshot for the LVGL-96KB-to-PSRAM A/B test (see
 // src/lv_conf.h's LV_ATTRIBUTE_LARGE_RAM_ARRAY comment) -- ESP.getFreeHeap()
 // alone can't distinguish internal vs PSRAM, and doesn't capture largest-
@@ -867,6 +879,31 @@ static void usbMscSetModeFlag(bool on) {
     }
 }
 
+// USB 声卡模式标志。和 MSC 那个是同一套机制、同样的理由：这块板运行时调
+// USB.begin() 会触发 ESP_RST_USB 复位（见本文件上面那段注释），TinyUSB 只能
+// 在开机时启动，所以切换模式必须写标志 + 重启，绕不过去。
+//
+// 两个标志互斥由 usbDacSetModeFlag()/usbMscSetModeFlag() 的调用方保证：
+// UI 上是三选一的单选，选中任意一个就会把另一个清掉。
+static constexpr const char* kUsbDacModePrefKey = "usb_dac_mode";
+
+static bool usbDacModeFlag() {
+    bool value = false;
+    if (lockPreferences()) {
+        value = pref.getBool(kUsbDacModePrefKey, false);
+        unlockPreferences();
+    }
+    return value;
+}
+
+static void usbDacSetModeFlag(bool on) {
+    if (lockPreferences(pdMS_TO_TICKS(1000))) {
+        pref.putBool(kUsbDacModePrefKey, on);
+        if (on) pref.putBool(kUsbMscModePrefKey, false); // 互斥
+        unlockPreferences();
+    }
+}
+
 static ps_ptr<char> wifiPrefGet(uint8_t i) {
     ps_ptr<char> line;
     if (!lockPreferences()) {
@@ -1546,6 +1583,7 @@ static volatile bool s_localLibraryScanning = false;
 static volatile bool s_usbStorageBusy = false;
 static volatile bool s_usbStorageHostEjected = false;
 static bool s_usbMscModeActive = false;
+static bool s_usbDacModeActive = false;
 static volatile uint32_t s_usbStorageLastAccessMs = 0;
 static volatile uint32_t s_usbMscReadCount = 0;
 static volatile uint32_t s_usbMscWriteCount = 0;
@@ -2350,6 +2388,66 @@ bool playerCoreUsbStorageFormatInfo(UsbStorageFormatInfo* out) {
     if (!out) return false;
     *out = s_usbStorageFormatInfo;
     return s_usbStorageFormatInfo.valid || s_usbStorageFormatInfo.totalBytes > 0;
+}
+
+// USB 声卡模式的进入/退出。和 U 盘模式共用同一套机制、同样的理由：这块板
+// 运行时调 USB.begin() 会触发 ESP_RST_USB 复位，TinyUSB 只能在开机时启动，
+// 所以切换模式必须"写 NVS 标志 + 重启"，没有别的办法。
+//
+// 短延时是留给 UI 把状态画出来，和 usbStorageRebootToMscTask 一个道理。
+static void usbDacRebootTask(void*) {
+    vTaskDelay(pdMS_TO_TICKS(400));
+#if MWR_USB_DAC_SUPPORTED
+    // ⚠️ 从声卡模式退出时**不能**用普通的 ESP.restart()。
+    //
+    // ESP32-S3 的 USB-OTG（TinyUSB）和 USB-Serial/JTAG 共用同一对 D+/D- 引脚，
+    // 同时只能有一个生效。本次启动里调过 USB.begin() 之后 PHY 就被 OTG 控制器
+    // 占住了，普通重启不保证把它干净地交还给 ROM 的 USB-Serial/JTAG——实测表现
+    // 是重启后板子在 USB 上彻底消失：没有串口、没有音频设备、连 VID_303A 都
+    // 查不到，必须按住 BOOT 拔插才能恢复。
+    //
+    // usb_persist_restart(RESTART_NO_PERSIST) 会先复位 USB 外设再重启，让 PHY
+    // 回到干净状态。只在确实进过声卡模式时才用——正常模式下 TinyUSB 从没启动
+    // 过，没必要动 USB 外设。
+    if (s_usbDacModeActive) {
+        usb_persist_restart(RESTART_NO_PERSIST);
+        vTaskDelay(pdMS_TO_TICKS(200)); // 上面那个不返回；万一返回了就走下面兜底
+    }
+#endif
+    ESP.restart();
+    vTaskDelete(nullptr);
+}
+
+bool playerCoreUsbDacEnter() {
+#if MWR_USB_DAC_SUPPORTED
+    stopSong(); // 先停播放，I2S 要交给声卡模式独占
+    usbDacSetModeFlag(true); // 内部会同时清掉 U 盘模式标志（两者互斥）
+    if (xTaskCreatePinnedToCore(usbDacRebootTask, "usbDacOn", 4096, nullptr, 2, nullptr, 0) != pdPASS) {
+        usbDacSetModeFlag(false);
+        MWR_LOG_ERROR("Failed to create USB DAC reboot task");
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool playerCoreUsbDacExit() {
+#if MWR_USB_DAC_SUPPORTED
+    usbDacSetModeFlag(false);
+    if (xTaskCreatePinnedToCore(usbDacRebootTask, "usbDacOff", 4096, nullptr, 2, nullptr, 0) != pdPASS) {
+        MWR_LOG_ERROR("Failed to create USB DAC exit reboot task");
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool playerCoreUsbDacActive() {
+    return s_usbDacModeActive;
 }
 
 bool playerCoreUsbStorageMount() {
@@ -5182,6 +5280,33 @@ static bool setupLvglRuntime() {
     logMemoryState("runtime_start");
     if (!init_SD_card()) return false;
     ensureLocalMusicDir();
+#if MWR_USB_DAC_SUPPORTED
+    if (usbDacModeFlag()) {
+        // USB 声卡模式：不起 WiFi / 音频播放器 / 音乐扫描，只跑 UAC -> I2S。
+        // 屏幕照常工作，是这个模式下唯一的仪表盘——USB 口被 TinyUSB 占用后
+        // USB-Serial/JTAG 控制台会消失，printf 什么都抓不到。
+        s_usbDacModeActive = true;
+        if (!usbDacBegin()) {
+            MWR_LOG_ERROR("USB DAC mode init failed -- clearing flag and rebooting to normal mode");
+            usbDacSetModeFlag(false);
+            s_usbDacModeActive = false;
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ESP.restart();
+            return false;
+        }
+        printfln(s_tag.setup, ANSI_ESC_GREEN "[LVGL] display begin (USB DAC mode)");
+        if (!lvglRuntimeBegin()) {
+            MWR_LOG_ERROR("LVGL display begin failed in USB DAC mode");
+            usbDacSetModeFlag(false);
+            s_usbDacModeActive = false;
+            vTaskDelay(pdMS_TO_TICKS(300));
+            ESP.restart();
+            return false;
+        }
+        lvglRuntimeShowUsbDacPage();
+        return true;
+    }
+#endif
 #if MWR_USB_MSC_SUPPORTED
     if (usbMscModeFlag()) {
         // USB storage mode: expose the SD card to the host immediately.
@@ -5287,6 +5412,15 @@ static bool setupLvglRuntime() {
 
 static void loopLvglRuntime() {
     processUsbStorage();
+#if MWR_USB_DAC_SUPPORTED
+    if (s_usbDacModeActive) {
+        // 声卡模式：不跑 dlna/audio/web/ftp/播放器。音频搬运由 usb_dac.cpp 里
+        // 那个钉在 core 0 的 I2S 任务负责，这里只维持 UI。
+        usbDacLoop();
+        lvglRuntimeTick();
+        return;
+    }
+#endif
 #if MWR_USB_MSC_SUPPORTED
     if (s_usbMscModeActive) {
         // USB storage mode: no audio/WiFi/web/dlna ticks -- just keep the

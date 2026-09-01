@@ -17,3 +17,7 @@ void lvglRuntimeTick() {
 void lvglRuntimeShowUsbStoragePage() {
     s_hifiUi.showUsbStoragePage();
 }
+
+void lvglRuntimeShowUsbDacPage() {
+    s_hifiUi.showUsbDacPage();
+}

@@ -3,6 +3,15 @@
 
 #include "hifi_fonts.h"  // subsetted CJK fonts (lv_font_cjk_16 / _13)
 #include "images/cassette_images.h"
+#if MWR_USB_DAC
+#include "../usb_dac.h"
+// 由 main.cpp 提供：写 NVS 标志并重启。和 U 盘模式同一套机制——这块板运行时
+// 调 USB.begin() 会触发 ESP_RST_USB 复位，TinyUSB 只能开机启动，所以切换模式
+// 必须重启，绕不过去。
+extern bool playerCoreUsbDacEnter();
+extern bool playerCoreUsbDacExit();
+extern bool playerCoreUsbDacActive();
+#endif
 #include <time.h>
 
 #include <algorithm>
@@ -945,6 +954,10 @@ lv_obj_t* HifiUi::makeCard(lv_obj_t* parent, const char* icon, const char* label
     return card;
 }
 
+void HifiUi::showUsbDacPage() {
+    if (s_instance) s_instance->show(Page::UsbDac);
+}
+
 void HifiUi::showUsbStoragePage() {
     if (s_instance) s_instance->show(Page::UsbStorage);
 }
@@ -1056,6 +1069,8 @@ void HifiUi::show(Page page) {
     m_usbStorageFormat = m_usbStorageCapacity = m_usbStorageHint = nullptr;
     m_usbStorageDebug = nullptr;
     m_usbStorageButton = m_usbStorageButtonLabel = nullptr;
+    m_usbDacEnterButton = m_usbDacState = m_usbDacFormat = nullptr;
+    m_usbDacBuffer = m_usbDacCounters = nullptr;
     m_lastUsbStorageState = UsbStorageState::Unsupported;
     m_cloudEditField = m_cloudKeyboard = nullptr;
     m_cloudEditError = nullptr;
@@ -1098,6 +1113,7 @@ void HifiUi::show(Page page) {
     else if (page == Page::Settings) buildSettings();
     else if (page == Page::SettingsWifi) buildSettingsWifi();
     else if (page == Page::UsbStorage) buildUsbStorage();
+    else if (page == Page::UsbDac) buildUsbDac();
     else if (page == Page::FontPreview) buildFontPreview();
     else if (page == Page::AudioHome) buildAudioHome();
     else if (page == Page::AudioDecode) buildAudioDecode();
@@ -3165,7 +3181,7 @@ void HifiUi::buildUsbStorage() {
 
         m_usbStorageButton = lv_btn_create(usbScreen);
         lv_obj_set_pos(m_usbStorageButton, 10, 140);
-        lv_obj_set_size(m_usbStorageButton, 300, 26);
+        lv_obj_set_size(m_usbStorageButton, 148, 26);
         lv_obj_set_style_radius(m_usbStorageButton, 8, 0);
         lv_obj_set_style_border_width(m_usbStorageButton, 0, 0);
         lv_obj_set_style_shadow_width(m_usbStorageButton, 0, 0);
@@ -3174,6 +3190,30 @@ void HifiUi::buildUsbStorage() {
         addPressFx(m_usbStorageButton);
         lv_obj_add_event_cb(m_usbStorageButton, onUsbStorageAction, LV_EVENT_CLICKED, nullptr);
         m_usbStorageButtonLabel = makeText(m_usbStorageButton, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_CENTER, 0, 0);
+
+#if MWR_USB_DAC
+        // 「USB 用途」在这块板上天然是互斥的单选：一个 USB 口、一套 TinyUSB
+        // 配置，同时只能是 U 盘或声卡之一。两个入口并排放在同一行，让互斥
+        // 关系一眼可见。
+        //
+        // 注意这里用的是 usbScreen 而不是 screen —— buildUsbStorage() 开头是
+        // 一个无条件的裸块并以 return 结束，本函数后半段那套旧布局是**死代码**，
+        // 永远执行不到。往那里加东西界面上不会有任何反应（已经踩过一次）。
+        m_usbDacEnterButton = lv_btn_create(usbScreen);
+        lv_obj_set_pos(m_usbDacEnterButton, 162, 140);
+        lv_obj_set_size(m_usbDacEnterButton, 148, 26);
+        lv_obj_set_style_radius(m_usbDacEnterButton, 8, 0);
+        lv_obj_set_style_bg_color(m_usbDacEnterButton, kPanel, 0);
+        lv_obj_set_style_bg_opa(m_usbDacEnterButton, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_color(m_usbDacEnterButton, kAccent, 0);
+        lv_obj_set_style_border_width(m_usbDacEnterButton, 1, 0);
+        lv_obj_set_style_shadow_width(m_usbDacEnterButton, 0, 0);
+        lv_obj_set_style_pad_all(m_usbDacEnterButton, 0, 0);
+        lv_obj_clear_flag(m_usbDacEnterButton, LV_OBJ_FLAG_SCROLLABLE);
+        addPressFx(m_usbDacEnterButton);
+        lv_obj_add_event_cb(m_usbDacEnterButton, onUsbDacEnterAction, LV_EVENT_CLICKED, nullptr);
+        makeText(m_usbDacEnterButton, "声卡模式", &lv_font_cjk_13, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+#endif
 
         refreshUsbStorage();
         return;
@@ -3231,6 +3271,116 @@ void HifiUi::buildUsbStorage() {
     m_usbStorageButtonLabel = makeText(m_usbStorageButton, "", &lv_font_cjk_13, kInk, LV_ALIGN_CENTER, 0, 0);
 
     refreshUsbStorage();
+}
+
+// ---------------------------------------------------------------------------
+// USB 声卡页
+//
+// ⚠️ 这一页在声卡模式下是**唯一**的仪表盘。TinyUSB 接管 USB 口之后
+// USB-Serial/JTAG 控制台会消失，printf 一个字都抓不到——时钟同步要不要调、
+// 调得对不对，全靠这里的欠载/溢出计数。这是 esp_lcd 迁移那次的教训：
+// 新外设的诊断必须和第一版代码一起写，不能等出问题再补。
+// ---------------------------------------------------------------------------
+void HifiUi::buildUsbDac() {
+#if MWR_USB_DAC
+    lv_obj_t* screen = lv_scr_act();
+    // 标题走 buildAudioTopBar，用的是 cjk_16（子集字体，见下面 m_usbDacState 处
+    // 的说明）。这里用纯 ASCII，避免又踩一次缺字乱码。
+    buildAudioTopBar("USB DAC", nullptr);
+
+    lv_obj_t* panel = lv_obj_create(screen);
+    lv_obj_set_pos(panel, 12, 36);
+    lv_obj_set_size(panel, 296, 86);
+    lv_obj_set_style_radius(panel, 8, 0);
+    lv_obj_set_style_bg_color(panel, kPanel, 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, kInkFaint, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_pad_all(panel, 0, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    // 动态中文必须用 HIFI_FONT_DYNAMIC_TEXT（= lv_font_cjk_13，广字符集）。
+    // lv_font_cjk_16 是**子集化**的，只含固定 UI 标题用字（见 hifi_fonts.h 的
+    // 注释："intentionally limited to fixed UI title glyphs"），拿它渲染新写的
+    // 中文会直接出乱码——第一版就是这么翻车的。
+    m_usbDacState    = makeText(panel, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_TOP_LEFT, 10, 6);
+    m_usbDacFormat   = makeText(panel, "", &lv_font_montserrat_12, kInkDim,   LV_ALIGN_TOP_LEFT, 10, 28);
+    m_usbDacBuffer   = makeText(panel, "", &lv_font_montserrat_12, kInkDim,   LV_ALIGN_TOP_LEFT, 10, 46);
+    m_usbDacCounters = makeText(panel, "", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 10, 64);
+    for (lv_obj_t* l : {m_usbDacState, m_usbDacFormat, m_usbDacBuffer, m_usbDacCounters}) {
+        lv_obj_set_width(l, 276);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    }
+
+    // 退出按钮。屏幕和触摸完全独立于 USB，所以这条退路在声卡模式下始终可用，
+    // 不会出现"变成声卡就回不来了"的情况。
+    lv_obj_t* exitBtn = lv_btn_create(screen);
+    lv_obj_set_pos(exitBtn, 42, 126);
+    lv_obj_set_size(exitBtn, 236, 32);
+    lv_obj_set_style_radius(exitBtn, 8, 0);
+    lv_obj_set_style_bg_color(exitBtn, kPanel, 0);
+    lv_obj_set_style_bg_opa(exitBtn, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(exitBtn, kAccent, 0);
+    lv_obj_set_style_border_width(exitBtn, 1, 0);
+    lv_obj_set_style_shadow_width(exitBtn, 0, 0);
+    lv_obj_set_style_pad_all(exitBtn, 0, 0);
+    lv_obj_clear_flag(exitBtn, LV_OBJ_FLAG_SCROLLABLE);
+    addPressFx(exitBtn);
+    lv_obj_add_event_cb(exitBtn, onUsbDacExitAction, LV_EVENT_CLICKED, nullptr);
+    makeText(exitBtn, "退出声卡模式（重启）", &lv_font_cjk_13, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+
+    refreshUsbDac();
+#endif
+}
+
+void HifiUi::refreshUsbDac() {
+#if MWR_USB_DAC
+    UsbDacStatus st{};
+    usbDacGetStatus(&st);
+
+    const char* state = "等待主机连接...";
+    if (st.streaming)     state = "正在播放";
+    else if (st.mounted)  state = "已连接（待机）";
+    uiSetText(m_usbDacState, state);
+    uiSetTextColor(m_usbDacState, st.streaming ? kLive : (st.mounted ? kInk : kInkDim));
+
+    char buf[80];
+    snprintf(buf, sizeof(buf), "%lu Hz  %u bit  %uch%s",
+             static_cast<unsigned long>(st.sampleRateHz), st.bitsPerSample, st.channels,
+             st.muted ? "  [静音]" : "");
+    uiSetText(m_usbDacFormat, buf);
+
+    const uint32_t pct = st.bufferCapacity ? (st.bufferLevelBytes * 100 / st.bufferCapacity) : 0;
+    snprintf(buf, sizeof(buf), "buf %lu/%lu B (%lu%%)  target 25%%%s",
+             static_cast<unsigned long>(st.bufferLevelBytes),
+             static_cast<unsigned long>(st.bufferCapacity),
+             static_cast<unsigned long>(pct), st.primed ? "" : "  [预填中]");
+    uiSetText(m_usbDacBuffer, buf);
+
+    // 这一行是调时钟同步的核心读数：稳定运行时 under/over 应当长时间不涨。
+    // 只要有一个在持续增长，就是反馈环增益没调对（见 usb_dac.cpp 的 kFeedbackGain）。
+    snprintf(buf, sizeof(buf), "under %lu  over %lu  pkts %lu",
+             static_cast<unsigned long>(st.bufferUnderruns),
+             static_cast<unsigned long>(st.bufferOverruns),
+             static_cast<unsigned long>(st.framesReceived));
+    uiSetText(m_usbDacCounters, buf);
+    uiSetTextColor(m_usbDacCounters,
+                   (st.bufferUnderruns || st.bufferOverruns) ? kMute : kInkFaint);
+#endif
+}
+
+void HifiUi::onUsbDacEnterAction(lv_event_t*) {
+#if MWR_USB_DAC
+    if (!s_instance) return;
+    playerCoreUsbDacEnter();
+#endif
+}
+
+void HifiUi::onUsbDacExitAction(lv_event_t*) {
+#if MWR_USB_DAC
+    if (!s_instance) return;
+    playerCoreUsbDacExit();
+#endif
 }
 
 void HifiUi::refreshUsbStorage() {
@@ -6679,6 +6829,7 @@ void HifiUi::refresh() {
     else if (m_page == Page::LocalNowPlaying) refreshLocalNowPlaying(state);
     else if (m_page == Page::SettingsWifi) refreshSettingsWifi(state);
     else if (m_page == Page::UsbStorage) refreshUsbStorage();
+    else if (m_page == Page::UsbDac) refreshUsbDac();
     else if (m_page == Page::CloudMusicSettings) refreshCloudMusicSettings();
     else if (m_page == Page::CloudMusicHome) refreshCloudMusicHome();
     else if (m_page == Page::CloudMusicSearch) refreshCloudMusicSearch();

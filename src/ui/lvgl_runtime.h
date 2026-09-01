@@ -6,3 +6,4 @@ bool lvglRuntimeBegin();
 void lvglRuntimeTick();
 // USB storage mode: switch the (already-built) UI to the USB storage page.
 void lvglRuntimeShowUsbStoragePage();
+void lvglRuntimeShowUsbDacPage();

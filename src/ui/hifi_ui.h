@@ -10,6 +10,7 @@ class HifiUi {
     // USB storage mode: show the USB page (status/debug/unmount) directly,
     // without going through the normal page stack.
     static void showUsbStoragePage();
+    static void showUsbDacPage();
 
   private:
     // 320x170 design spec: docs/UI_DESIGN_SPEC.md. RadioList is the station
@@ -26,6 +27,7 @@ class HifiUi {
         Settings,
         SettingsWifi,
         UsbStorage,
+        UsbDac,
         FontPreview,
         AudioHome,
         AudioDecode,
@@ -88,6 +90,8 @@ class HifiUi {
     static void onWifiScanRowAction(lv_event_t* event);
     static void onWifiAddSaveAction(lv_event_t* event);
     static void onUsbStorageAction(lv_event_t* event);
+    static void onUsbDacEnterAction(lv_event_t* event);
+    static void onUsbDacExitAction(lv_event_t* event);
     static void onCloudMusicEditBaseUrlAction(lv_event_t* event);
     static void onCloudMusicEditDeviceKeyAction(lv_event_t* event);
     static void onCloudMusicConfigBackAction(lv_event_t* event);
@@ -146,6 +150,8 @@ class HifiUi {
     void buildSettingsWifi();
     void buildUsbStorage();
     void refreshUsbStorage();
+    void buildUsbDac();
+    void refreshUsbDac();
     void buildCloudMusicSettings();
     void refreshCloudMusicSettings();
     void buildCloudMusicHome();
@@ -420,6 +426,13 @@ class HifiUi {
     lv_obj_t* m_usbStorageDebug = nullptr;
     lv_obj_t* m_usbStorageButton = nullptr;
     lv_obj_t* m_usbStorageButtonLabel = nullptr;
+    // USB 声卡模式。这一页在声卡模式下是**唯一**能看到诊断的地方——
+    // TinyUSB 接管 USB 口之后 USB-Serial/JTAG 控制台就没了，printf 抓不到。
+    lv_obj_t* m_usbDacEnterButton = nullptr;
+    lv_obj_t* m_usbDacState = nullptr;
+    lv_obj_t* m_usbDacFormat = nullptr;
+    lv_obj_t* m_usbDacBuffer = nullptr;
+    lv_obj_t* m_usbDacCounters = nullptr;
     UsbStorageState m_lastUsbStorageState = UsbStorageState::Unsupported;
     // Mount confirmation: the first tap on 挂载 arms the button, a second
     // tap within 5s actually mounts (mount now stops playback and reboots

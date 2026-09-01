@@ -123,7 +123,37 @@ extern "C" {
 #define CFG_TUD_VENDOR      CONFIG_TINYUSB_VENDOR_ENABLED
 #define CFG_TUD_DFU         CONFIG_TINYUSB_DFU_ENABLED
 #define CFG_TUD_DFU_RUNTIME CONFIG_TINYUSB_DFU_RT_ENABLED
+// USB Audio Class 2.0（把这块板当电脑/手机的外挂声卡，见 src/usb_dac.cpp）。
+// 只在 MWR_USB_DAC 构建里编进去 —— 关掉时一个字节都不占，正常固件不受影响。
+#if MWR_USB_DAC
+#define CFG_TUD_AUDIO 1
+
+// 描述符总长度。必须和 usb_dac.cpp 里 loadDescriptor() 实际拼出来的完全一致，
+// 驱动按这个长度解析描述符，对不上会枚举失败。逐项：
+//   IAD 8 + STD_AC 9 + CS_AC 9 + CLK_SRC 8 + INPUT_TERM 17
+//   + FEATURE_UNIT(2ch) 18 + OUTPUT_TERM 12
+//   + STD_AS(alt0) 9 + STD_AS(alt1) 9 + CS_AS_INT 16 + TYPE_I_FORMAT 6
+//   + ISO_EP 7 + CS_ISO_EP 8 + ISO_FB_EP 7  = 143
+#define CFG_TUD_AUDIO_FUNC_1_DESC_LEN 143
+
+#define CFG_TUD_AUDIO_FUNC_1_N_AS_INT 1
+#define CFG_TUD_AUDIO_CTRL_BUF_SZ     64
+
+// 只做输出（扬声器），不做录音
+#define CFG_TUD_AUDIO_ENABLE_EP_IN  0
+#define CFG_TUD_AUDIO_ENABLE_EP_OUT 1
+
+// 全速 USB 每毫秒一个等时包。异步同步方式下主机可能多发一个采样，故留余量：
+// (48000/1000 + 1) * 2ch * 2byte = 196
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX    196
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ (196 * 4)
+
+// 反馈端点：主机据此微调发送速率，抵消它和本板晶振之间的时钟漂移。
+// 没有它就会周期性爆音，详见 usb_dac.cpp 里 updateFeedback() 的说明。
+#define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP 1
+#else
 #define CFG_TUD_AUDIO       0
+#endif
 #define CFG_TUD_VIDEO       0
 #define CFG_TUD_BTH         0
 #define CFG_TUD_USBTMC      0
