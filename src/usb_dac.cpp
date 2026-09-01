@@ -80,6 +80,18 @@ volatile uint32_t s_underruns = 0;
 volatile uint32_t s_overruns  = 0;
 volatile uint32_t s_framesReceived = 0;
 
+// 左右声道电平（0..255），供 UI 做 VU 和转轮转速。
+//
+// UAC2 协议里没有任何元数据（歌名/艺术家/封面都不存在），主机能下发的只有
+// 采样率/位深/声道/音量/静音。所以"显示正在放什么"做不到——但 PCM 数据本身
+// 就在我们手上，把**声音**可视化反而比元数据更直接，而且对任何主机都成立，
+// PC / iPhone / Android 都不需要装任何东西。
+//
+// 用峰值而不是真 RMS：每包才 49 帧，峰值更便宜、视觉上也更像传统 VU 表。
+// 弹道是"快起慢落"（attack 立即、decay 每包减 3），和硬件 VU 表的观感一致。
+volatile uint8_t  s_vuLeft  = 0;
+volatile uint8_t  s_vuRight = 0;
+
 uint8_t* s_ring = nullptr;
 volatile size_t s_ringHead = 0; // 写入位置（USB 侧）
 volatile size_t s_ringTail = 0; // 读出位置（I2S 侧）
@@ -419,6 +431,27 @@ bool tud_audio_rx_done_post_read_cb(uint8_t rhport, uint16_t n_bytes_received, u
         // 反馈环也会误判成"主机发慢了"，解除静音时反而更容易爆音。
         memset(scratch, 0, got);
     }
+
+    // 峰值电平检测。放在写环形缓冲之前，静音后 scratch 已经是全零，VU 自然归零。
+    {
+        const int16_t* pcm = reinterpret_cast<const int16_t*>(scratch);
+        const size_t frames = got / (kChannels * kBytesPerSample);
+        uint16_t peakL = 0, peakR = 0;
+        for (size_t i = 0; i < frames; ++i) {
+            // 注意用 int32_t 取绝对值：-INT16_MIN 在 int16_t 里会溢出。
+            const uint16_t al = static_cast<uint16_t>(pcm[2 * i]     < 0 ? -static_cast<int32_t>(pcm[2 * i])     : pcm[2 * i]);
+            const uint16_t ar = static_cast<uint16_t>(pcm[2 * i + 1] < 0 ? -static_cast<int32_t>(pcm[2 * i + 1]) : pcm[2 * i + 1]);
+            if (al > peakL) peakL = al;
+            if (ar > peakR) peakR = ar;
+        }
+        // 快起慢落：新峰值立即顶上去，否则每包（1ms）衰减 3，约 85ms 落到底。
+        const uint8_t l8 = static_cast<uint8_t>(peakL >> 7);
+        const uint8_t r8 = static_cast<uint8_t>(peakR >> 7);
+        const uint8_t curL = s_vuLeft, curR = s_vuRight;
+        s_vuLeft  = l8 > curL ? l8 : (curL > 3 ? static_cast<uint8_t>(curL - 3) : 0);
+        s_vuRight = r8 > curR ? r8 : (curR > 3 ? static_cast<uint8_t>(curR - 3) : 0);
+    }
+
     ringWrite(scratch, got);
     return true;
 }
@@ -498,6 +531,9 @@ void usbDacGetStatus(UsbDacStatus* out) {
     out->channels         = kChannels;
     out->muted            = s_muted;
     out->volumeDb256      = s_volumeDb256;
+    if (!s_streaming) { s_vuLeft = 0; s_vuRight = 0; }
+    out->vuLeft           = s_vuLeft;
+    out->vuRight          = s_vuRight;
     out->primed           = s_primed;
     out->bufferLevelBytes = ringUsed();
     out->bufferCapacity   = kRingBytes;

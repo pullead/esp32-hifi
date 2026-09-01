@@ -92,6 +92,7 @@ class HifiUi {
     static void onUsbStorageAction(lv_event_t* event);
     static void onUsbDacEnterAction(lv_event_t* event);
     static void onUsbDacExitAction(lv_event_t* event);
+    static void onUsbDacDiagToggle(lv_event_t* event);
     static void onCloudMusicEditBaseUrlAction(lv_event_t* event);
     static void onCloudMusicEditDeviceKeyAction(lv_event_t* event);
     static void onCloudMusicConfigBackAction(lv_event_t* event);
@@ -431,6 +432,11 @@ class HifiUi {
     lv_obj_t* m_usbDacEnterButton = nullptr;
     lv_obj_t* m_usbDacState = nullptr;
     lv_obj_t* m_usbDacFormat = nullptr;
+    lv_obj_t* m_usbDacVuL = nullptr;
+    lv_obj_t* m_usbDacVuR = nullptr;
+    // 诊断行默认收起：under/over/pkts 是声卡模式下调时钟同步的唯一手段
+    // （串口控制台被 TinyUSB 占用了），不能删，但不该常驻主画面。
+    bool m_usbDacDiagOpen = false;
     lv_obj_t* m_usbDacBuffer = nullptr;
     lv_obj_t* m_usbDacCounters = nullptr;
     UsbStorageState m_lastUsbStorageState = UsbStorageState::Unsupported;

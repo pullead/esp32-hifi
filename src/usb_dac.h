@@ -34,6 +34,8 @@ struct UsbDacStatus {
     uint8_t  channels;
     bool     muted;            // 主机侧 Feature Unit 下发的静音
     int16_t  volumeDb256;      // 主机侧音量，1/256 dB 为单位（UAC2 规定）
+    uint8_t  vuLeft;           // 左声道峰值电平 0..255（供 VU / 转轮转速用）
+    uint8_t  vuRight;
     bool     primed;           // 已攒够预填水位、正在正常出声（false = 还在攒）
     uint32_t bufferLevelBytes; // 环形缓冲当前水位
     uint32_t bufferCapacity;

@@ -1071,6 +1071,7 @@ void HifiUi::show(Page page) {
     m_usbStorageButton = m_usbStorageButtonLabel = nullptr;
     m_usbDacEnterButton = m_usbDacState = m_usbDacFormat = nullptr;
     m_usbDacBuffer = m_usbDacCounters = nullptr;
+    m_usbDacVuL = m_usbDacVuR = nullptr;
     m_lastUsbStorageState = UsbStorageState::Unsupported;
     m_cloudEditField = m_cloudKeyboard = nullptr;
     m_cloudEditError = nullptr;
@@ -3284,42 +3285,76 @@ void HifiUi::buildUsbStorage() {
 void HifiUi::buildUsbDac() {
 #if MWR_USB_DAC
     lv_obj_t* screen = lv_scr_act();
-    // 标题走 buildAudioTopBar，用的是 cjk_16（子集字体，见下面 m_usbDacState 处
-    // 的说明）。这里用纯 ASCII，避免又踩一次缺字乱码。
-    buildAudioTopBar("USB DAC", nullptr);
 
-    lv_obj_t* panel = lv_obj_create(screen);
-    lv_obj_set_pos(panel, 12, 36);
-    lv_obj_set_size(panel, 296, 86);
-    lv_obj_set_style_radius(panel, 8, 0);
-    lv_obj_set_style_bg_color(panel, kPanel, 0);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(panel, kInkFaint, 0);
-    lv_obj_set_style_border_width(panel, 1, 0);
-    lv_obj_set_style_pad_all(panel, 0, 0);
-    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+    // 磁带视图直接复用本地播放页那套真实位图美术（底图满屏 320x170，两个转轮
+    // 是独立小图，靠 lv_img_set_angle 旋转）。声卡模式下没有任何元数据可显示
+    // ——UAC2 协议里根本不存在歌名/艺术家/封面字段——所以把**声音本身**画出来
+    // 才是这个界面唯一有意义的内容。
+    buildCassetteVisual(screen);
 
-    // 动态中文必须用 HIFI_FONT_DYNAMIC_TEXT（= lv_font_cjk_13，广字符集）。
-    // lv_font_cjk_16 是**子集化**的，只含固定 UI 标题用字（见 hifi_fonts.h 的
-    // 注释："intentionally limited to fixed UI title glyphs"），拿它渲染新写的
-    // 中文会直接出乱码——第一版就是这么翻车的。
-    m_usbDacState    = makeText(panel, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_TOP_LEFT, 10, 6);
-    m_usbDacFormat   = makeText(panel, "", &lv_font_montserrat_12, kInkDim,   LV_ALIGN_TOP_LEFT, 10, 28);
-    m_usbDacBuffer   = makeText(panel, "", &lv_font_montserrat_12, kInkDim,   LV_ALIGN_TOP_LEFT, 10, 46);
-    m_usbDacCounters = makeText(panel, "", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 10, 64);
-    for (lv_obj_t* l : {m_usbDacState, m_usbDacFormat, m_usbDacBuffer, m_usbDacCounters}) {
-        lv_obj_set_width(l, 276);
-        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    // 磁带标签区（两个转轮之间，x 约 80..240）放格式和电平。
+    m_usbDacState  = makeText(screen, "", HIFI_FONT_DYNAMIC_TEXT, kInk, LV_ALIGN_TOP_LEFT, 86, 46);
+    lv_obj_set_width(m_usbDacState, 148);
+    lv_label_set_long_mode(m_usbDacState, LV_LABEL_LONG_DOT);
+
+    m_usbDacFormat = makeText(screen, "", &lv_font_montserrat_12, kInkDim, LV_ALIGN_TOP_LEFT, 86, 66);
+    lv_obj_set_width(m_usbDacFormat, 148);
+    lv_label_set_long_mode(m_usbDacFormat, LV_LABEL_LONG_DOT);
+
+    // 左右声道 VU。峰值由 usb_dac.cpp 从 PCM 直接算出来（见那边 s_vuLeft 的注释）。
+    for (uint8_t ch = 0; ch < 2; ++ch) {
+        lv_obj_t* track = lv_obj_create(screen);
+        lv_obj_set_pos(track, 86, 88 + ch * 12);
+        lv_obj_set_size(track, 148, 7);
+        lv_obj_set_style_radius(track, 3, 0);
+        lv_obj_set_style_bg_color(track, kPanelDeep, 0);
+        lv_obj_set_style_bg_opa(track, LV_OPA_70, 0);
+        lv_obj_set_style_border_width(track, 0, 0);
+        lv_obj_set_style_pad_all(track, 0, 0);
+        lv_obj_clear_flag(track, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t* fill = lv_obj_create(track);
+        lv_obj_set_pos(fill, 0, 0);
+        lv_obj_set_size(fill, 0, 7);
+        lv_obj_set_style_radius(fill, 3, 0);
+        lv_obj_set_style_bg_color(fill, kLive, 0);
+        lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_width(fill, 0, 0);
+        lv_obj_set_style_pad_all(fill, 0, 0);
+        lv_obj_clear_flag(fill, LV_OBJ_FLAG_SCROLLABLE);
+        if (ch == 0) m_usbDacVuL = fill;
+        else m_usbDacVuR = fill;
     }
+
+    // 诊断行。默认隐藏——under/over/pkts 是调时钟同步的唯一手段（声卡模式下
+    // 串口控制台已被 TinyUSB 占用，printf 抓不到任何东西），所以不能删，
+    // 但也不该常驻主画面。点屏幕中间的磁带标签区切换显示。
+    m_usbDacBuffer   = makeText(screen, "", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 12, 116);
+    m_usbDacCounters = makeText(screen, "", &lv_font_montserrat_12, kInkFaint, LV_ALIGN_TOP_LEFT, 12, 130);
+    for (lv_obj_t* l : {m_usbDacBuffer, m_usbDacCounters}) {
+        lv_obj_set_width(l, 296);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_add_flag(l, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // 透明的切换热区，盖在标签区上
+    lv_obj_t* diagToggle = lv_btn_create(screen);
+    lv_obj_set_pos(diagToggle, 80, 40);
+    lv_obj_set_size(diagToggle, 160, 66);
+    lv_obj_set_style_bg_opa(diagToggle, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(diagToggle, 0, 0);
+    lv_obj_set_style_shadow_width(diagToggle, 0, 0);
+    lv_obj_clear_flag(diagToggle, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(diagToggle, onUsbDacDiagToggle, LV_EVENT_CLICKED, nullptr);
 
     // 退出按钮。屏幕和触摸完全独立于 USB，所以这条退路在声卡模式下始终可用，
     // 不会出现"变成声卡就回不来了"的情况。
     lv_obj_t* exitBtn = lv_btn_create(screen);
-    lv_obj_set_pos(exitBtn, 42, 126);
-    lv_obj_set_size(exitBtn, 236, 32);
-    lv_obj_set_style_radius(exitBtn, 8, 0);
-    lv_obj_set_style_bg_color(exitBtn, kPanel, 0);
-    lv_obj_set_style_bg_opa(exitBtn, LV_OPA_COVER, 0);
+    lv_obj_set_pos(exitBtn, 88, 146);
+    lv_obj_set_size(exitBtn, 144, 22);
+    lv_obj_set_style_radius(exitBtn, 6, 0);
+    lv_obj_set_style_bg_color(exitBtn, kPanelDeep, 0);
+    lv_obj_set_style_bg_opa(exitBtn, LV_OPA_80, 0);
     lv_obj_set_style_border_color(exitBtn, kAccent, 0);
     lv_obj_set_style_border_width(exitBtn, 1, 0);
     lv_obj_set_style_shadow_width(exitBtn, 0, 0);
@@ -3327,48 +3362,85 @@ void HifiUi::buildUsbDac() {
     lv_obj_clear_flag(exitBtn, LV_OBJ_FLAG_SCROLLABLE);
     addPressFx(exitBtn);
     lv_obj_add_event_cb(exitBtn, onUsbDacExitAction, LV_EVENT_CLICKED, nullptr);
-    makeText(exitBtn, "退出声卡模式（重启）", &lv_font_cjk_13, kAccentBright, LV_ALIGN_CENTER, 0, 0);
+    makeText(exitBtn, "退出声卡模式", &lv_font_cjk_13, kAccentBright, LV_ALIGN_CENTER, 0, 0);
 
     refreshUsbDac();
 #endif
 }
-
 void HifiUi::refreshUsbDac() {
 #if MWR_USB_DAC
     UsbDacStatus st{};
     usbDacGetStatus(&st);
 
-    const char* state = "等待主机连接...";
-    if (st.streaming)     state = "正在播放";
-    else if (st.mounted)  state = "已连接（待机）";
+    const char* state = "等待主机连接";
+    if (st.streaming)    state = st.muted ? "已静音" : "正在播放";
+    else if (st.mounted) state = "已连接";
     uiSetText(m_usbDacState, state);
-    uiSetTextColor(m_usbDacState, st.streaming ? kLive : (st.mounted ? kInk : kInkDim));
+    uiSetTextColor(m_usbDacState, st.streaming && !st.muted ? kLive : (st.mounted ? kInk : kInkDim));
 
     char buf[80];
-    snprintf(buf, sizeof(buf), "%lu Hz  %u bit  %uch%s",
-             static_cast<unsigned long>(st.sampleRateHz), st.bitsPerSample, st.channels,
-             st.muted ? "  [静音]" : "");
+    snprintf(buf, sizeof(buf), "%lu.%luk / %ubit / %uch",
+             static_cast<unsigned long>(st.sampleRateHz / 1000),
+             static_cast<unsigned long>((st.sampleRateHz / 100) % 10),
+             st.bitsPerSample, st.channels);
     uiSetText(m_usbDacFormat, buf);
 
-    const uint32_t pct = st.bufferCapacity ? (st.bufferLevelBytes * 100 / st.bufferCapacity) : 0;
-    snprintf(buf, sizeof(buf), "buf %lu/%lu B (%lu%%)  target 25%%%s",
-             static_cast<unsigned long>(st.bufferLevelBytes),
-             static_cast<unsigned long>(st.bufferCapacity),
-             static_cast<unsigned long>(pct), st.primed ? "" : "  [预填中]");
-    uiSetText(m_usbDacBuffer, buf);
+    // VU：148px 满程。用 uiSetWidth 之外的直接调用——宽度每帧都在变，
+    // 加脏检查没有意义（这里本来就是需要重画的动画）。
+    if (m_usbDacVuL) lv_obj_set_width(m_usbDacVuL, static_cast<lv_coord_t>(st.vuLeft  * 148 / 255));
+    if (m_usbDacVuR) lv_obj_set_width(m_usbDacVuR, static_cast<lv_coord_t>(st.vuRight * 148 / 255));
 
-    // 这一行是调时钟同步的核心读数：稳定运行时 under/over 应当长时间不涨。
-    // 只要有一个在持续增长，就是反馈环增益没调对（见 usb_dac.cpp 的 kFeedbackGain）。
-    snprintf(buf, sizeof(buf), "under %lu  over %lu  pkts %lu",
-             static_cast<unsigned long>(st.bufferUnderruns),
-             static_cast<unsigned long>(st.bufferOverruns),
-             static_cast<unsigned long>(st.framesReceived));
-    uiSetText(m_usbDacCounters, buf);
-    uiSetTextColor(m_usbDacCounters,
-                   (st.bufferUnderruns || st.bufferOverruns) ? kMute : kInkFaint);
+    // 转轮：只在真正出声时转，和本地播放页同一条动画预算规则。
+    const bool spinning = st.streaming && !st.muted;
+    if (spinning && m_cassetteReelL && !m_cassetteSpinning) {
+        m_cassetteSpinning = true;
+        for (lv_obj_t* reel : {m_cassetteReelL, m_cassetteReelR}) {
+            if (!reel) continue;
+            lv_anim_t a;
+            lv_anim_init(&a);
+            lv_anim_set_var(&a, reel);
+            lv_anim_set_exec_cb(&a, [](void* obj, int32_t v) { lv_img_set_angle(static_cast<lv_obj_t*>(obj), static_cast<int16_t>(v)); });
+            lv_anim_set_values(&a, 0, 3600);
+            lv_anim_set_time(&a, 14000);
+            lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+            lv_anim_set_path_cb(&a, lv_anim_path_linear);
+            lv_anim_start(&a);
+        }
+    } else if (!spinning && m_cassetteReelL && m_cassetteSpinning) {
+        m_cassetteSpinning = false;
+        lv_anim_del(m_cassetteReelL, nullptr);
+        if (m_cassetteReelR) lv_anim_del(m_cassetteReelR, nullptr);
+    }
+
+    // 诊断行：只在切开时才更新，省掉平时的脏区域。
+    if (m_usbDacDiagOpen) {
+        const uint32_t pct = st.bufferCapacity ? (st.bufferLevelBytes * 100 / st.bufferCapacity) : 0;
+        snprintf(buf, sizeof(buf), "buf %lu/%lu (%lu%%) target 25%%%s",
+                 static_cast<unsigned long>(st.bufferLevelBytes),
+                 static_cast<unsigned long>(st.bufferCapacity),
+                 static_cast<unsigned long>(pct), st.primed ? "" : " [预填中]");
+        uiSetText(m_usbDacBuffer, buf);
+
+        // 调时钟同步的核心读数：稳定时 under/over 应当长时间不涨。
+        snprintf(buf, sizeof(buf), "under %lu  over %lu  pkts %lu",
+                 static_cast<unsigned long>(st.bufferUnderruns),
+                 static_cast<unsigned long>(st.bufferOverruns),
+                 static_cast<unsigned long>(st.framesReceived));
+        uiSetText(m_usbDacCounters, buf);
+        uiSetTextColor(m_usbDacCounters, (st.bufferUnderruns || st.bufferOverruns) ? kMute : kInkFaint);
+    }
+    uiSetHidden(m_usbDacBuffer, !m_usbDacDiagOpen);
+    uiSetHidden(m_usbDacCounters, !m_usbDacDiagOpen);
 #endif
 }
 
+void HifiUi::onUsbDacDiagToggle(lv_event_t*) {
+#if MWR_USB_DAC
+    if (!s_instance) return;
+    s_instance->m_usbDacDiagOpen = !s_instance->m_usbDacDiagOpen;
+    s_instance->refreshUsbDac();
+#endif
+}
 void HifiUi::onUsbDacEnterAction(lv_event_t*) {
 #if MWR_USB_DAC
     if (!s_instance) return;
