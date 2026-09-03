@@ -94,6 +94,8 @@ extern const char* playerCoreCloudMusicCurrentLyricLine(uint32_t positionMs);
 extern bool playerCoreCloudMusicPlayTrackStart(const char* trackId);
 extern uint8_t playerCoreCloudMusicResolveState();
 extern bool playerCoreCloudMusicJustStarted();
+extern uint8_t playerCoreLastSource();
+extern void playerCoreSetLastSource(uint8_t source);
 extern bool playerCoreCloudMusicConsumeNowPlaying(CloudTrackItem* outTrack);
 
 PlayerService playerService;
@@ -122,6 +124,15 @@ void PlayerService::tick() {
         copyText(m_snapshot.detail, sizeof(m_snapshot.detail), nowPlaying.artist);
         m_snapshot.durationSeconds = nowPlaying.durationMs / 1000;
         m_snapshot.error[0] = '\0';
+    }
+
+    // 记下最后一次真正播放过的音源，供重启后首页"正在播放"决定跳到哪一页。
+    // 放在这里而不是各个 play*() 里：playerCoreReadSnapshot() 是所有音源的统一
+    // 入口——云音乐的 source 是从 main.cpp 的 s_cloudMusicPlaying 推出来的，
+    // 根本不经过本类的任何 play*() 方法，只有这里能全覆盖。
+    // playerCoreSetLastSource() 内部自带"没变就不写"的判断，不会磨损 flash。
+    if (m_snapshot.source != PlayerSource::None) {
+        playerCoreSetLastSource(static_cast<uint8_t>(m_snapshot.source));
     }
 }
 
@@ -259,6 +270,8 @@ bool PlayerService::localLibraryScanning() const { return playerCoreLocalLibrary
 uint16_t PlayerService::localLibraryCount() const { return playerCoreLocalLibraryCount(); }
 
 bool PlayerService::localTrack(uint16_t index, LocalTrackItem* item) const { return playerCoreLocalTrack(index, item); }
+
+PlayerSource PlayerService::lastSource() const { return static_cast<PlayerSource>(playerCoreLastSource()); }
 
 const char* PlayerService::lastLocalFilePath() const { return playerCoreLastLocalFilePath(); }
 

@@ -7410,14 +7410,19 @@ void HifiUi::onHomeNowPlayingAction(lv_event_t* event) {
     (void)event;
     if (!s_instance) return;
     const PlayerSnapshot state = playerService.snapshot();
-    // Whatever's actually playing decides which Now Playing screen this
-    // opens -- Radio and Sd (local) have their own dedicated pages now;
-    // anything else (nothing playing yet) falls back to the old generic
-    // skeleton, same as before this tap existed.
-    if (state.source == PlayerSource::Radio) s_instance->show(Page::Radio);
-    else if (state.source == PlayerSource::Sd) s_instance->show(Page::LocalNowPlaying);
-    else if (state.source == PlayerSource::CloudMusic) s_instance->show(Page::CloudNowPlaying);
-    else s_instance->show(Page::NowPlaying);
+
+    // 正在播放什么就进哪一页。什么都没播时（典型场景：刚重启）改用**上一次
+    // 播放过的音源**，而不是原来那个 Page::NowPlaying 通用页——那一页早已被
+    // 三个专用播放页取代、不再维护，重启后点进去会看到一个陌生的旧界面。
+    PlayerSource source = state.source;
+    if (source == PlayerSource::None) source = playerService.lastSource();
+
+    if (source == PlayerSource::Radio) s_instance->show(Page::Radio);
+    else if (source == PlayerSource::Sd) s_instance->show(Page::LocalNowPlaying);
+    else if (source == PlayerSource::CloudMusic) s_instance->show(Page::CloudNowPlaying);
+    // 全新设备、从来没播过任何东西：进本地音乐列表让用户挑一首，
+    // 比进一个空的播放页有用。
+    else s_instance->show(Page::Sd);
 }
 
 void HifiUi::onTransportAction(lv_event_t* event) {

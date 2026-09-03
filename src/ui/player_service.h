@@ -266,6 +266,9 @@ class PlayerService {
     bool localLibraryScanning() const;
     uint16_t localLibraryCount() const;
     bool localTrack(uint16_t index, LocalTrackItem* item) const;
+    // 上一次真正播放过的音源（跨重启保留）。什么都没播时首页"正在播放"
+    // 用它决定进哪个播放页；从未播放过则返回 None。
+    PlayerSource lastSource() const;
     const char* lastLocalFilePath() const;
     uint32_t lastLocalFilePosition() const;
     bool playLocalTrack(uint16_t index, uint32_t positionSeconds = 0);

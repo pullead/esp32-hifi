@@ -899,6 +899,40 @@ static bool usbDacModeFlag() {
     return value;
 }
 
+// 记住"最后一次播放过的音源"。
+//
+// 用途：重启后什么都还没播时，首页"正在播放"区域被点击应当进入**上次那个音源
+// 的播放页**，而不是那个早已废弃的通用播放页（见 hifi_ui.cpp 的
+// onHomeNowPlayingAction）。
+//
+// 为什么不复用 s_settings：那里虽然有 lastconnectedhost（电台）和
+// lastconnectedfile（本地），但它们**只记内容、不记顺序**——两者可能同时非空，
+// 无法判断最后一次是哪种；而且云音乐完全没有对应字段。所以单独存一个。
+//
+// 值就是 PlayerSource 枚举（0=None 1=Radio 2=Sd 3=Dlna 4=CloudMusic）。
+static constexpr const char* kLastSourcePrefKey = "last_source";
+static uint8_t s_lastSourceCached = 0xFF; // 0xFF = 还没从 NVS 读过
+
+uint8_t playerCoreLastSource() {
+    if (s_lastSourceCached == 0xFF) {
+        if (!lockPreferences()) return 0;
+        s_lastSourceCached = pref.getUChar(kLastSourcePrefKey, 0);
+        unlockPreferences();
+    }
+    return s_lastSourceCached;
+}
+
+void playerCoreSetLastSource(uint8_t source) {
+    // 只在真的变化时才写 —— 这个函数每 60ms 会被 tick() 调到一次，
+    // 无脑写会毫无必要地磨损 flash。
+    if (source == s_lastSourceCached) return;
+    s_lastSourceCached = source;
+    if (lockPreferences(pdMS_TO_TICKS(1000))) {
+        pref.putUChar(kLastSourcePrefKey, source);
+        unlockPreferences();
+    }
+}
+
 static void usbDacSetModeFlag(bool on) {
     if (lockPreferences(pdMS_TO_TICKS(1000))) {
         pref.putBool(kUsbDacModePrefKey, on);
