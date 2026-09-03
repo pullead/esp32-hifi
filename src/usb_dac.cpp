@@ -100,6 +100,22 @@ volatile uint32_t s_pendingRate = 0;
 uint32_t          s_activeRate  = 0;
 volatile bool     s_muted = false;
 volatile int16_t  s_volumeDb256 = 0;
+
+// 主机音量的实际作用点。
+//
+// 2026-09-07：此前 s_volumeDb256 只是被存下来、并在主机来读时原样回报，
+// **从来没有乘进 PCM**。表现是 iPhone 上音量滑块完全无反应，而 Android 正常
+// ——因为两家策略不同：Android 在主机侧就把音量调好了再送 PCM，iOS 送的是
+// 全幅 PCM，指望设备按 Feature Unit 的值自己衰减。
+//
+// 用 Q16 定点而不是浮点：换算只在音量变化时做一次（powf），采样点上是纯整数
+// 乘加。i2sTask 不是 ISR，浮点本来允许，但每个采样都做浮点没有必要。
+//
+// ⚠️ UAC2 的音量单位是 **1/256 dB**，不是线性刻度。直接把这个 int16 当线性
+// 系数用会完全不对（-60dB 会变成 -15360 这种荒谬的"负增益"）。
+constexpr int32_t kGainUnity = 65536; // Q16 的 1.0
+volatile int32_t  s_gainQ16  = kGainUnity;
+int16_t           s_gainSrcDb256 = 0; // 上次换算用的源值，只有 i2sTask 碰
 volatile uint32_t s_underruns = 0;
 volatile uint32_t s_overruns  = 0;
 volatile uint32_t s_framesReceived = 0;
@@ -206,6 +222,24 @@ bool i2sStart(uint32_t sampleRate) {
 // 权限，比漂移高一个数量级，同时远小于会引起可闻音高抖动的幅度。
 constexpr int32_t kFeedbackGain = 8192;
 
+// 把主机下发的 1/256 dB 换算成 Q16 线性增益。只在值变化时调用。
+void updateGainFromVolume() {
+    const int16_t db256 = s_volumeDb256;
+    if (db256 == s_gainSrcDb256) return;
+    s_gainSrcDb256 = db256;
+
+    // UAC2 规定 0x8000 表示负无穷（静音）
+    if (db256 == static_cast<int16_t>(0x8000)) {
+        s_gainQ16 = 0;
+        return;
+    }
+    const float db  = static_cast<float>(db256) / 256.0f;
+    float       lin = powf(10.0f, db / 20.0f);
+    if (lin > 1.0f) lin = 1.0f; // 我们声明的范围上限就是 0dB，不做提升
+    if (lin < 0.0f) lin = 0.0f;
+    s_gainQ16 = static_cast<int32_t>(lin * 65536.0f + 0.5f);
+}
+
 void updateFeedback() {
     const uint32_t nominal = (s_sampleRate << 16) / 1000;
     const int32_t  error   = static_cast<int32_t>(ringUsed()) - static_cast<int32_t>(kRingTargetBytes);
@@ -275,6 +309,19 @@ void i2sTask(void*) {
             continue;
         }
         emptyStreak = 0;
+        // 应用主机音量。满音量时整段旁路，保持 bit-perfect 直通——对声卡这种
+        // 设备这是该有的取舍（数字衰减必然损失有效位数）。
+        updateGainFromVolume();
+        const int32_t gain = s_gainQ16;
+        if (gain != kGainUnity) {
+            int16_t*     pcm = reinterpret_cast<int16_t*>(chunk);
+            const size_t n   = got / sizeof(int16_t);
+            // gain < 65536 时最大乘积 32768 * 65535 < 2^31，不会溢出。
+            for (size_t i = 0; i < n; ++i) {
+                pcm[i] = static_cast<int16_t>((static_cast<int32_t>(pcm[i]) * gain) >> 16);
+            }
+        }
+
         size_t written = 0;
         i2s_channel_write(s_i2sTx, chunk, got, &written, portMAX_DELAY);
     }
@@ -347,7 +394,25 @@ uint16_t loadDescriptor(uint8_t* dst, uint8_t* itf) {
         // 的 USB 只有全速。配套还要打 TinyUSB 的补丁——它原本按 UAC 版本而不是
         // 按总线速度选格式，全速 UAC2 会错发 4 字节 16.16，主机解析出来是真值的
         // 4 倍（192 采样/帧），于是不停重新协商流。详见 audiod_fb_send() 里的注释。
-        TUD_AUDIO20_DESC_STD_AS_ISO_FB_EP((uint8_t)(0x80 | s_epFb), 3, 0x01),
+        // ⚠️ wMaxPacketSize 这里声明 **4**，而实际发送的是 **3 字节**（见上面和
+        // patches/patch_tinyusb_feedback.py）。这个不一致是**故意的**，用来同时
+        // 满足两种主机：
+        //
+        // - 规范侧（USB 2.0 §5.12.4.2）：全速反馈是 10.14 的 3 字节。macOS /
+        //   iOS / Android 按这个来，收到 3 字节短包解析正确。等时 IN 端点发短包
+        //   是合法的，声明 4 只表示"最多能装 4"。
+        // - Windows：usbaudio2.sys 内部一律按 4 字节处理（不实现全速的 10.14
+        //   变体，是已知的互操作问题），声明 3 的端点会被它直接跳过，然后报
+        //   "could not find a feedback endpoint for an asynchronous data OUT
+        //   endpoint"（系统事件日志里的原话），驱动启动失败 → 设备管理器 Code 10、
+        //   声音设置里根本不出现。
+        //
+        // 2026-09-06 那版按规范改成 3，macOS 正常但 Windows 就是这么坏掉的。
+        // 现实中大量全速 UAC2 设备都采用"声明 4、发 3"这个折中。
+        //
+        // 改这里务必两边都复测：Windows 看设备能否正常出现在声音输出列表，
+        // macOS/Android 看声音是否仍然连续（反馈格式错会表现为断断续续）。
+        TUD_AUDIO20_DESC_STD_AS_ISO_FB_EP((uint8_t)(0x80 | s_epFb), 4, 0x01),
     };
 
     *itf += 2; // 本功能占用 AC + AS 两个接口

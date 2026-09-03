@@ -355,3 +355,145 @@ PCM510x 只取高 24 位）：白噪消失、LATENCY 回到 40-43ms 正常区间
       播放/暂停/上下一首。标准协议、主机零安装、PC 和手机都认。
 - [ ] 频谱当前是 UI 线程每次刷新算一次 512 点 FFT，没测过它对这一页 CPU 占用的
       影响（正常模式脏区域治理后是 4.3%，这页有持续动画会明显更高）
+
+---
+
+## 9. 2026-09-07 追加：Windows 回归（已定位）+ iPhone 音量无效（已定位）
+
+这一轮补测了 §8 里挂着的主机复测，两个问题都定位到了根因。
+
+### 9.1 多主机实测结果
+
+| 主机 | 出声 | 音量控制 | 备注 |
+|---|---|---|---|
+| macOS | ✅ | （未单独测） | 9/6 验证 |
+| Android | ✅ | ✅ 正常 | |
+| iOS | ✅ | ❌ **滑块无反应** | 见 §9.3 |
+| **Windows** | ❌ | — | **声音设置里根本不出现**，见 §9.2 |
+
+### 9.2 Windows 回归：反馈端点 `wMaxPacketSize=3` 被 usbaudio2 跳过
+
+**这是 9/6 那轮引入的回归** —— 9/5 版在 Windows 上能正常枚举出设备（有截图为证），
+9/6 把反馈端点的 `wMaxPacketSize` 按规范从 4 改成 3 之后就坏了。
+
+现象很容易误判成"没枚举"：
+
+- 板子屏幕显示**已连接**（`tud_mounted()` 为真 → 主机确实下发了 SET_CONFIGURATION）
+- 设备管理器里**没有黄色感叹号**（它不在「其他设备」下，而是在音频类别里）
+- 但声音输出列表里没有这台设备
+
+**从 Windows 侧查才看得清**（这套命令值得复用）：
+
+```powershell
+# 1) 设备在不在、什么状态
+Get-PnpDevice -PresentOnly | Where-Object { $_.FriendlyName -match 'MiniWebRadio' } |
+    Select-Object Status, Class, Problem, ProblemDescription
+
+#   -> Status=Error  Class=MEDIA  Problem=10  "This device cannot start. (Code 10)"
+#      DEVPKEY_Device_Service = usbaudio2   <- 驱动绑对了，是启动失败
+
+# 2) 驱动为什么拒绝 —— 这一步给出了确切答案
+Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddHours(-3)} |
+    Where-Object { $_.ProviderName -match 'usbaudio' }
+```
+
+事件日志原话：
+
+> **The driver could not find a feedback endpoint for an asynchronous data OUT
+> endpoint on device ...**
+
+即：数据 OUT 端点声明为异步，但 `usbaudio2.sys` **找不到配套的反馈端点**。
+描述符里那个端点是存在的、`bmAttributes` 也对（ISO | NO_SYNC | EXPLICIT_FB = 0x11），
+唯一改过的就是包大小。
+
+**根因**：Microsoft 的 `usbaudio2.sys` 内部一律按 **4 字节**处理反馈值
+（不实现全速的 10.14 变体，是已知的互操作问题），声明 3 字节的反馈端点会被它
+直接跳过。
+
+**修复（同时满足两边）**：描述符声明 `wMaxPacketSize = 4`，实际**仍然发 3 字节的
+10.14**（`patch_tinyusb_feedback.py` 不动）。等时 IN 端点发短包是合法的，声明 4
+只表示"最多能装 4"：
+
+- Windows 看到端点能装 4 → 肯启动
+- 规范侧主机收到 3 字节短包 → 按全速规矩解析，仍然正确
+
+现实中大量全速 UAC2 设备都用这个折中。
+
+> ⚠️ **改这里必须两边都复测**：Windows 看设备能否出现在声音输出列表；
+> macOS/Android 看声音是否仍然连续（反馈格式错会表现为断断续续，见 §2.2）。
+
+**方法论补充**：§5.1 说的"先从对端确认"这次又一次奏效，而且比 macOS 那轮更彻底 ——
+Windows 的 `Get-PnpDevice` + `Get-WinEvent` 直接把失败原因用人话打印了出来。
+遇到"设备认不到"这类问题，**先去问主机为什么拒绝**，不要从自己的描述符开始猜。
+
+### 9.3 iPhone 音量滑块无反应：主机音量根本没被应用
+
+`s_volumeDb256` 只是被**存下来、并在主机来读时原样回报**，
+**从来没有作用到 PCM 上**：
+
+- `usb_dac.cpp` 主机下发 → 存进变量
+- 主机读取 → 原样返回
+- 中间没有任何一处把它乘进音频数据
+
+（`s_muted` 是有效的 —— rx 回调里把 buffer 清零，所以静音能用、音量不能用。）
+
+**这解释了 Android 正常而 iOS 不正常**：
+
+| 主机 | 音量策略 |
+|---|---|
+| Android | **主机侧衰减** —— 送过来的 PCM 已经调过音量，设备做不做无所谓 |
+| iOS | **送全幅 PCM**，期待设备按 Feature Unit 的值自己衰减 → 我们没做 → 滑块无效 |
+
+这正是 §6.1 那块"做了又回退"的输出级 DSP。**只把音量那部分捡回来就能修好 iPhone**，
+EQ / 平衡可以先不动。
+
+⚠️ 必须放在 `i2sTask` 里，**不能放 rx 回调** —— 那个回调现在是 ISR 上下文
+（`_isr` 后缀），ESP32 的 FreeRTOS 默认不允许在中断里做浮点运算。
+
+⚠️ 另一个要点：UAC2 的音量单位是 **1/256 dB**，不是线性刻度。换算成线性增益是
+`10^(dB/20)`，直接把这个 int16 当线性系数用会完全不对。
+
+### 9.4 本轮状态
+
+- [x] Windows 回归定位并修复（描述符 `wMaxPacketSize` 3 → 4）—— **待复测**
+- [ ] iPhone 音量：根因已定位，代码未写（当天无耳机，改了也验证不了听感）
+- [ ] 96k/24bit：用户反馈仍有沙沙声，与 §6.2 记录一致，本轮不做
+
+### 9.5 Windows 修复已确认 + 退出后 USB 消失的真正原因
+
+**Windows 回归修复：实测通过。** 描述符 `wMaxPacketSize` 3 → 4（实际仍发 3 字节
+10.14）之后：
+
+```
+Status = OK      Problem = CM_PROB_NONE     "This device is working properly"
+Class  = MEDIA   + AudioEndpoint「ヘッドホン (2- MiniWebRadio DAC)」
+```
+
+电脑播放时板子屏幕上的频谱正常跳动。（修复前是 `Status=Error` / `Problem=10`。）
+
+⚠️ 仍未复测：macOS / Android 的声音连续性。这次改的是**所有主机共用**的描述符
+字段，"声明 4、发 3 对规范侧主机无害"目前只是推理。
+
+**退出后 USB 消失 —— `usb_persist_restart` 那个修复是无效的（见 §4.9 的更正）。**
+
+2026-09-07 实测复现：点「退出声卡模式」→ 板子重启 → **烧录没反应**，必须
+**按住 BOOT 插数据线**串口才回来；而且烧录完成后不会自动重启，要手按 RESET。
+（后半段是正常的：手动按 BOOT 进下载模式后，esptool 的 RTS 复位序列对
+USB-Serial/JTAG 不总是生效。）
+
+根因：`usb_persist_shutdown_handler()` 整个函数体包在
+`if (usb_persist_mode != RESTART_NO_PERSIST)` 里，我们传的恰好是那个空操作分支。
+而 USB PHY 归属位在 `RTC_CNTL_USB_CONF_REG`（**RTC 域，软复位不清除**），
+所以重启后 PHY 仍归 USB-OTG。
+
+可行的修法（**未实现、未验证**）：重启前自己清掉那几个 RTC 位，复刻
+`usb_switch_to_cdc_jtag()` 里的关键动作：
+
+```c
+CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG,
+    RTC_CNTL_SW_HW_USB_PHY_SEL | RTC_CNTL_SW_USB_PHY_SEL | RTC_CNTL_USB_PAD_ENABLE);
+CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_PHY_SEL);
+```
+
+⚠️ 这是寄存器级改动，风险有界但真实：改错的最坏结果就是现在这个状态
+（USB 上认不到，按 BOOT 可恢复），不会变砖。

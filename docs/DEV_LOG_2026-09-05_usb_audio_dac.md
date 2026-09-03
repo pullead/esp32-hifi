@@ -221,8 +221,21 @@ ESP32-S3 的 USB-OTG（TinyUSB）和 USB-Serial/JTAG **共用同一对 D+/D- 引
 `VID_303A` 都查不到，必须按住 BOOT 拔插才能恢复（花了一次物理干预）。
 
 改用 `usb_persist_restart(RESTART_NO_PERSIST)`（声明在 `esp32-hal-tinyusb.h`，
-`<USB.h>` 不转出来，要显式包含），它会先复位 USB 外设再重启。只在确实进过声卡
-模式时才用——正常模式下 TinyUSB 从没启动过，没必要动 USB 外设。
+`<USB.h>` 不转出来，要显式包含）。
+
+> ⚠️ **2026-09-07 更正：上面这个修复是无效的，本条结论作废。**
+>
+> `usb_persist_shutdown_handler()` 的函数体整个包在
+> `if (usb_persist_mode != RESTART_NO_PERSIST)` 里面——**`RESTART_NO_PERSIST`
+> 恰好是唯一什么都不做的分支**，这个调用和普通 `ESP.restart()` 完全等价。
+>
+> 真正的原因：USB PHY 的归属选择位在 `RTC_CNTL_USB_CONF_REG`，属于 **RTC 域，
+> 软复位不清除**，所以重启后 PHY 仍归 USB-OTG，ROM 的 USB-Serial/JTAG 拿不回来。
+> 框架里干这件事的是 `usb_switch_to_cdc_jtag()`，但它是 `static`，只在
+> `RESTART_BOOTLOADER` 分支里被调用（那个会强制进下载模式，不是我们要的）。
+>
+> 2026-09-07 实测：退出声卡模式后板子依然从 USB 上消失，必须按住 BOOT 拔插
+> 才能恢复。详见 §9.5。
 
 ---
 
