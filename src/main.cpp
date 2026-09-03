@@ -35,6 +35,7 @@
 // 退出声卡模式时要把 USB PHY 的归属交还给 ROM 的 USB-Serial/JTAG，
 // 见 usbDacRebootTask() 里的详细说明。
 #include "soc/usb_pins.h"  // USBPHY_DP_NUM / USBPHY_DM_NUM
+#include "library/library_store.h"  // 本地音乐库 2.0 索引持久化
 #define MWR_USB_DAC_SUPPORTED 1
 #else
 #define MWR_USB_DAC_SUPPORTED 0
@@ -1622,12 +1623,20 @@ static void weatherTask(void*) {
 //                          封面解码缓冲，5000 太紧，第一版不取
 constexpr uint16_t kMaxLocalTracks = 2000;
 static constexpr const char* kLocalMusicDir = "/Music";
-static LocalTrackItem* s_localTracks = nullptr;
+// 本地音乐库 2.0：内存里的记录换成 TrackRecord。它刻意保持了与 LocalTrackItem
+// 同名同序的前几个字段（path/title/artist/album/hasArt），所以下面 20 多处
+// s_localTracks[i].path 之类的代码一行都不用改。
+static TrackRecord* s_localTracks = nullptr;
 static uint16_t s_localTrackCount = 0;
 static volatile bool s_localLibraryScanning = false;
 // 实际分配到的容量。分配失败会逐级减半，所以它可能小于 kMaxLocalTracks——
 // 扫描的边界检查必须用它，不能用编译期常量。
 static uint16_t s_localTrackCapacity = 0;
+
+// 扫描期的对账上下文。scanMusicDir() 是递归的，把这些做成文件级静态比一路传参
+// 干净。只在 localMusicScanTask() 里读写，不跨任务。
+static uint8_t* s_scanSeenBits = nullptr;   // 大小见 libraryStoreSeenBytes()
+static uint32_t s_scanNowEpoch = 0;
 // s_usbStorageState itself is declared earlier now (see playerCorePlaySdFile()'s comment) -- the rest of the USB-storage statics stay here.
 static volatile bool s_usbStorageBusy = false;
 static volatile bool s_usbStorageHostEjected = false;
@@ -2056,7 +2065,7 @@ static void decodeId3Text(const uint8_t* data, size_t len, char* out, size_t out
 // lazily, only for whichever track is actually being displayed, by
 // extractId3Picture() below (re-opens/re-parses; cheap, and avoids holding
 // image data for a whole library scan).
-static void parseId3Tags(File& file, LocalTrackItem* item) {
+static void parseId3Tags(File& file, TrackRecord* item) {
     uint8_t header[10];
     if (file.read(header, 10) != 10) return;
     if (memcmp(header, "ID3", 3) != 0) return;
@@ -2206,8 +2215,9 @@ static void scanMusicDir(const char* path, uint8_t depth) {
             continue;
         }
         if (endsWithIcase(entry.name(), ".mp3")) {
-            LocalTrackItem item{};
+            TrackRecord item{};
             strlcpy(item.path, entry.path(), sizeof(item.path));
+            item.fileSize = static_cast<uint32_t>(entry.size());
             parseId3Tags(entry, &item);
             if (!item.title[0]) { // no TIT2 -- fall back to filename minus extension
                 strlcpy(item.title, entry.name(), sizeof(item.title));
@@ -2215,7 +2225,11 @@ static void scanMusicDir(const char* path, uint8_t depth) {
                 if (dot) *dot = '\0';
             }
             printf("[MUSIC] #%u title=\"%s\" artist=\"%s\" album=\"%s\" hasArt=%d\n", s_localTrackCount, item.title, item.artist, item.album, item.hasArt);
-            s_localTracks[s_localTrackCount++] = item;
+            // 并入索引而不是直接追加：已存在的曲目要保留播放统计和 favorite，
+            // 重扫一次 SD 不该把用户行为的产物清零
+            //（见 library_store.h 里 libraryStoreUpsert 的说明）。
+            libraryStoreUpsert(s_localTracks, &s_localTrackCount, s_localTrackCapacity,
+                               item, s_scanSeenBits, s_scanNowEpoch);
         }
         entry.close();
     }
@@ -2239,10 +2253,10 @@ static void localMusicScanTask(void*) {
     // 扩容到 2000 首（644KB PSRAM）之后这个失败路径的概率明显上升，必须有声音。
     uint16_t capacity = kMaxLocalTracks;
     while (capacity >= 128) {
-        s_localTracks = static_cast<LocalTrackItem*>(ps_calloc(capacity, sizeof(LocalTrackItem)));
+        s_localTracks = static_cast<TrackRecord*>(ps_calloc(capacity, sizeof(TrackRecord)));
         if (s_localTracks) break;
         printf("[MUSIC] ps_calloc(%u tracks, %u B) failed, halving\n",
-               capacity, static_cast<unsigned>(capacity * sizeof(LocalTrackItem)));
+               capacity, static_cast<unsigned>(capacity * sizeof(TrackRecord)));
         capacity /= 2;
     }
     if (!s_localTracks) {
@@ -2254,9 +2268,34 @@ static void localMusicScanTask(void*) {
     }
     s_localTrackCapacity = capacity;
 
+    // 先把已有索引读回来（顺带回放 events.log），扫描再往上 upsert。
+    // 这样重扫一次 SD 不会丢掉播放次数、favorite 这些用户行为的产物。
+    const uint32_t loadStart = millis();
+    s_localTrackCount = libraryStoreLoad(s_localTracks, capacity);
+    const uint32_t loadMs = millis() - loadStart;
+
+    // seen 位图：记录本轮扫描碰过哪些下标，扫完把没碰过的标成 missing。
+    // 2000 首 = 250 字节，栈上放得下（扫描任务栈 8192）。
+    const uint16_t seenBytes = libraryStoreSeenBytes(capacity);
+    uint8_t seenBits[libraryStoreSeenBytes(kMaxLocalTracks)]{};
+    memset(seenBits, 0, seenBytes);
+    s_scanSeenBits = seenBits;
+    // RTC 没同步时给 0：libraryStoreApplyEvent/Upsert 会只更新计数不写时间戳，
+    // 避免把 1970 年写进 lastPlayedAt 让淘汰算法判反（见 library_store.cpp）。
+    s_scanNowEpoch = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
+
     const uint32_t allocMs = millis();
     scanMusicDir("/", 0);
     const uint32_t doneMs = millis();
+
+    // 索引里有、这次没扫到的 → 标 missing（不删除，留住 favorite 与播放历史）。
+    // 最典型的成因是用户在 U 盘模式下用电脑删了歌，见审计 §10。
+    const uint16_t nowMissing = libraryStoreFinishScan(s_localTracks, s_localTrackCount, seenBits);
+    s_scanSeenBits = nullptr; // seenBits 是栈上的，函数返回后就失效了
+
+    libraryStoreSave(s_localTracks, s_localTrackCount);
+    if (nowMissing) printf("[LIB] %u track(s) newly marked missing\n", nowMissing);
+    printf("[LIB][PERF] load=%lums\n", static_cast<unsigned long>(loadMs));
 
     // Phase 1 实测埋点：扩容之后必须知道分配成本、扫描耗时和单首均摊，才能推算
     // 真实曲库规模下的开机等待时间（见 docs/LOCAL_LIBRARY_V2_AUDIT.md §12）。
@@ -2294,7 +2333,14 @@ uint16_t playerCoreLocalLibraryCount() { return s_localTrackCount; }
 bool playerCoreLocalTrack(uint16_t index, LocalTrackItem* item) {
     if (s_localLibraryScanning || usbStorageBlocksSdAppAccess()) return false;
     if (!s_localTracks || index >= s_localTrackCount || !item) return false;
-    *item = s_localTracks[index];
+    // TrackRecord 比 LocalTrackItem 多了一堆 2.0 的统计字段，不能整体赋值。
+    // 对外 API 仍然给 LocalTrackItem，UI 侧一行不用改。
+    const TrackRecord& r = s_localTracks[index];
+    strlcpy(item->path, r.path, sizeof(item->path));
+    strlcpy(item->title, r.title, sizeof(item->title));
+    strlcpy(item->artist, r.artist, sizeof(item->artist));
+    strlcpy(item->album, r.album, sizeof(item->album));
+    item->hasArt = r.hasArt;
     return true;
 }
 
@@ -2975,7 +3021,7 @@ static bool jsonStringField(const String& body, const char* key, String& out) {
 // which for /search is whichever result the API ranked first/most
 // relevant. Extracted from what used to be fetchLyricsOnline()'s entire
 // body, now that it tries several URLs per track (see fetchLyricsOnline()).
-static bool tryLyricsRequest(const String& url, const LocalTrackItem& item, uint16_t index) {
+static bool tryLyricsRequest(const String& url, const TrackRecord& item, uint16_t index) {
     printf("[LYRICS] GET %s\n", url.c_str());
     WiFiClientSecure client;
     client.setInsecure(); // no cert pinning, same tradeoff as the weather fetch
@@ -3325,7 +3371,7 @@ static bool stripParentheticalSuffix(const char* title, char* out, size_t outSiz
 static bool fetchLyricsOnline(uint16_t index) {
     if (!s_localTracks || index >= s_localTrackCount) return false;
     if (!WiFi.isConnected()) return false;
-    const LocalTrackItem& item = s_localTracks[index];
+    const TrackRecord& item = s_localTracks[index];
     if (!item.title[0]) return false;
 
     char shortTitle[64];
@@ -5592,6 +5638,25 @@ static void loopLvglRuntime() {
     if (s_f_1sec) {
         s_f_1sec = false;
         s_totalRuntime++;
+
+        // 曲库状态：每 10 秒打一次。
+        //
+        // 为什么要周期打而不是只在扫描结束时打一次：开机那一瞬间的 printf 在这块板
+        // 上**基本抓不到**——app 启动时 USB 会重新枚举，带复位抓取会断线、不带复位
+        // 抓取又错过开头。这条教训在 esp_lcd 迁移那轮就总结过（见
+        // DEV_LOG_2026-09-04 §5），这次做曲库索引又踩了一遍，所以补上。
+        if (s_localTrackCapacity && (s_totalRuntime % 10) == 0) {
+            uint16_t missing = 0, favorite = 0, played = 0;
+            for (uint16_t i = 0; i < s_localTrackCount; ++i) {
+                if (s_localTracks[i].flags & kTrackFlagMissing) ++missing;
+                if (s_localTracks[i].flags & kTrackFlagFavorite) ++favorite;
+                if (s_localTracks[i].playCount) ++played;
+            }
+            printf("[LIB][STATE] tracks=%u/%u missing=%u fav=%u played=%u rec_size=%u\n",
+                   s_localTrackCount, s_localTrackCapacity, missing, favorite, played,
+                   static_cast<unsigned>(sizeof(TrackRecord)));
+        }
+
         if (s_memLogRadioAtSec && s_totalRuntime >= s_memLogRadioAtSec) {
             logMemoryState("radio_playing_stable");
             s_memLogRadioAtSec = 0;
