@@ -34,8 +34,6 @@
 #include "esp32-hal-tinyusb.h"
 // 退出声卡模式时要把 USB PHY 的归属交还给 ROM 的 USB-Serial/JTAG，
 // 见 usbDacRebootTask() 里的详细说明。
-#include "soc/rtc_cntl_reg.h"
-#include "soc/usb_serial_jtag_reg.h"
 #include "soc/usb_pins.h"  // USBPHY_DP_NUM / USBPHY_DM_NUM
 #define MWR_USB_DAC_SUPPORTED 1
 #else
@@ -2425,60 +2423,50 @@ static void usbDacRebootTask(void* arg) {
     // 从声卡模式退出时，光 ESP.restart() 不够：必须先把 USB PHY 的归属交还给
     // ROM 的 USB-Serial/JTAG，否则重启后板子在 USB 上彻底消失。详见下面。
     if (s_usbDacModeActive) {
-        // ⚠️ 这里**不能**用 usb_persist_restart(RESTART_NO_PERSIST)。
+        // 制造一次 USB 总线断开，让主机把这台设备从列表里移除。
         //
-        // 那是 2026-09-06 的做法，实测无效（9/5 日志 §4.9 已作废）：
-        // usb_persist_shutdown_handler() 的整个函数体包在
-        //     if (usb_persist_mode != RESTART_NO_PERSIST) { ... }
-        // 里面 —— RESTART_NO_PERSIST 恰好是唯一什么都不做的分支，
-        // 那个调用和普通 ESP.restart() 完全等价。
+        // 为什么必须显式做这件事（2026-09-07 实测确认）：
+        // ESP.restart() 是**软件 CPU 复位**，它不复位 USB 外设、也不产生总线
+        // 断开。板子确实重启并回到正常模式（屏幕能看到主界面），但主机从头到尾
+        // 没看到断开，于是 MiniWebRadio DAC **一直留在设备列表里不消失**，
+        // 成为一个没人应答的僵尸枚举。
         //
-        // 真正的原因：ESP32-S3 的 USB-OTG 和 USB-Serial/JTAG 共用同一对
-        // D+/D- 引脚，归属由 RTC_CNTL_USB_CONF_REG 里几个位决定。这个寄存器
-        // 在 **RTC 域**，**软复位不会清除** —— 所以进过一次声卡模式之后，
-        // 无论怎么 ESP.restart()，PHY 都还归 USB-OTG，ROM 的 USB-Serial/JTAG
-        // 再也拿不回来。表现就是重启后板子在 USB 上彻底消失（没有串口、
-        // 没有音频设备、连 VID_303A 都查不到），必须按住 BOOT 拔插才能恢复。
+        // ⚠️ 注意历史记录里那句「退出后板子从 USB 上消失」是**错误描述**，
+        // 它把排查方向带偏了两轮——真实现象是旧设备赖着不走，不是设备没了。
         //
-        // 框架里干这件事的是 usb_switch_to_cdc_jtag()，但它是 static，
-        // 只在 usb_persist_restart(RESTART_BOOTLOADER) 分支里被调用——而那个
-        // 会强制进下载模式，不是我们要的。所以这里复刻它的关键动作：
-        // 把 PHY 选择交还给硬件默认（即 USB-Serial/JTAG），并关掉 OTG 的
-        // pad enable。剩下的外设复位由 esp_restart() 自己完成。
-        CLEAR_PERI_REG_MASK(RTC_CNTL_USB_CONF_REG,
-                            RTC_CNTL_SW_HW_USB_PHY_SEL | RTC_CNTL_SW_USB_PHY_SEL | RTC_CNTL_USB_PAD_ENABLE);
-        CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_PHY_SEL);
-
-        // 光交还 PHY 还不够，必须再制造一次**总线断开**。
-        //
-        // 2026-09-07 实测发现的关键事实：ESP.restart() 是**软件 CPU 复位**，
-        // 它不复位 USB 外设、也不会让主机看到断开。表现非常有迷惑性：
-        //   - 板子确实重启了、标志也确实清了，它真的进了正常模式
-        //   - 但主机侧那个 MiniWebRadio DAC **一直留在设备列表里不消失**，
-        //     是个已经没人应答的僵尸枚举
-        //   - 主机还以为在跟旧设备通信，USB-Serial/JTAG 就接管不了
-        // 只有按硬件 RESET 键才会真的掉线。
-        //
-        // 所以历史上"退出后板子从 USB 上消失"这个描述本身就是错的——它不是
-        // 消失，而是卡成了一个僵尸设备。这也是为什么之前只清 RTC 位没解决问题。
-        //
-        // 把 D+/D- 拉低就是 USB 断开的物理表现，主机会据此重新枚举。
-        // 这一段抄自框架里的 usb_switch_to_cdc_jtag()（static，不能直接调用）。
+        // 拉低 D+/D- 就是 USB 断开的物理表现。这段抄自框架的
+        // usb_switch_to_cdc_jtag()（static，不能直接调用）。
         pinMode(USBPHY_DM_NUM, OUTPUT_OPEN_DRAIN);
         pinMode(USBPHY_DP_NUM, OUTPUT_OPEN_DRAIN);
         digitalWrite(USBPHY_DM_NUM, LOW);
         digitalWrite(USBPHY_DP_NUM, LOW);
         vTaskDelay(pdMS_TO_TICKS(20)); // 留够主机识别断开的时间
 
-        // ⚠️ 必须再把引脚释放回高阻，不能带着"被驱动为低"的状态去重启。
-        //
-        // 框架里那个 usb_switch_to_cdc_jtag() 是给**不重启的运行时切换**设计的：
-        // 它拉低之后会挂一个中断等 BUS_RESET 再自行恢复。我们这条路径是拉低之后
-        // 直接 ESP.restart()，如果就这么走，引脚会一直被压着 —— 实测表现是主机
-        // 侧设备确实消失了（断开成功），但重启后 USB 上**什么都不出现**，
-        // USB-Serial/JTAG 也起不来。
+        // 必须再释放回高阻，不能带着"被驱动为低"的状态去重启。那个参考函数是给
+        // **不重启的运行时切换**设计的（拉低后挂中断等 BUS_RESET 再自行恢复），
+        // 只抄前半截就 restart，引脚会一直被压着 —— 实测表现是设备确实消失了，
+        // 但重启后 USB 上什么都不出现。
         pinMode(USBPHY_DM_NUM, INPUT);
         pinMode(USBPHY_DP_NUM, INPUT);
+
+        // —— 以下两条已实测无效，**不要再加回来** ——
+        //
+        // 1) 清 RTC_CNTL_USB_CONF_REG 的 PHY 归属位
+        //    （SW_HW_USB_PHY_SEL / SW_USB_PHY_SEL / USB_PAD_ENABLE）
+        //    实测：加与不加结果完全一样，既无害也无用。
+        // 2) periph_module_reset/disable(PERIPH_USB_MODULE) 复位 OTG 外设
+        //    实测：同样不改变结果。
+        //
+        // 也就是说：断开脉冲能让主机干净地移除设备，但重启后
+        // USB-Serial/JTAG 仍需**一次物理插拔**才会被主机重新枚举。
+        // 已知拔插能正常恢复（等于断电冷启动），所以硬件没有被弄坏。
+        //
+        // 退出键按下时屏幕会显示「已退出，请重新插拔 USB 线」，
+        // 并把重启延时放长到 1.5s 让用户读完。
+        //
+        // 下次若要再攻这个问题，换个思路：正常模式**冷启动**时把
+        // RTC_CNTL_USB_CONF_REG 的原始值读出来打印（正常模式串口是通的），
+        // 退出时**原样恢复那个值**，而不是猜该清哪几位。
     }
 #endif
     ESP.restart();
