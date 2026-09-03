@@ -3793,6 +3793,22 @@ void HifiUi::onUsbDacEnterAction(lv_event_t*) {
 void HifiUi::onUsbDacExitAction(lv_event_t*) {
 #if MWR_USB_DAC
     if (!s_instance) return;
+
+    // 退出后主机侧需要一次物理插拔才能重新枚举出串口。
+    //
+    // 原因（2026-09-07 实测确认）：ESP.restart() 是**软件 CPU 复位**，板子确实
+    // 重启并回到正常模式（屏幕能看到主界面），但它不复位 USB 外设。我们主动把
+    // D+/D- 拉低制造了断开，主机侧的 MiniWebRadio DAC 会正确消失，可
+    // USB-Serial/JTAG 仍然要等一次真正的插拔才会被主机枚举到。
+    //
+    // 试过三种纯软件的办法都没能做到全自动（usb_persist_restart 是空操作、
+    // 清 RTC PHY 位、拉低 D+/D- 后释放引脚），详见日志。与其继续盲试，不如
+    // 先把预期讲清楚——这已经比最初"必须按住 BOOT 拔插"好很多了。
+    if (s_instance->m_usbDacState) {
+        uiSetText(s_instance->m_usbDacState, "已退出，请重新插拔 USB 线");
+        uiSetTextColor(s_instance->m_usbDacState, kAccentBright);
+        lv_refr_now(nullptr); // 立刻画出来，别等下一个刷新周期
+    }
     playerCoreUsbDacExit();
 #endif
 }
