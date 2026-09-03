@@ -1611,11 +1611,23 @@ static void weatherTask(void*) {
 // Deliberately independent of the Audio class's own ID3 parsing, which
 // only runs while a file is actually being decoded -- not useful for
 // batch-scanning hundreds of files on disk without playing each one.
-constexpr uint16_t kMaxLocalTracks = 300;
+// 本地曲库上限。
+//
+// 2026-09-07：300 -> 2000（本地音乐库 2.0 Phase 1，见
+// docs/LOCAL_LIBRARY_V2_AUDIT.md §2）。LocalTrackItem 约 322 字节、走 ps_calloc
+// 分配在 PSRAM：
+//     300 首 =  97 KB
+//    2000 首 = 644 KB
+//    5000 首 = 1.6 MB   <- PSRAM 空闲约 2.58MB，还要留给 LVGL 的 96KB 池和
+//                          封面解码缓冲，5000 太紧，第一版不取
+constexpr uint16_t kMaxLocalTracks = 2000;
 static constexpr const char* kLocalMusicDir = "/Music";
 static LocalTrackItem* s_localTracks = nullptr;
 static uint16_t s_localTrackCount = 0;
 static volatile bool s_localLibraryScanning = false;
+// 实际分配到的容量。分配失败会逐级减半，所以它可能小于 kMaxLocalTracks——
+// 扫描的边界检查必须用它，不能用编译期常量。
+static uint16_t s_localTrackCapacity = 0;
 // s_usbStorageState itself is declared earlier now (see playerCorePlaySdFile()'s comment) -- the rest of the USB-storage statics stay here.
 static volatile bool s_usbStorageBusy = false;
 static volatile bool s_usbStorageHostEjected = false;
@@ -2174,7 +2186,7 @@ static bool extractId3Picture(const char* path, uint8_t** outData, size_t* outLe
 
 static void scanMusicDir(const char* path, uint8_t depth) {
     if (usbStorageBlocksSdAppAccess()) return;
-    if (!s_localTracks || s_localTrackCount >= kMaxLocalTracks || depth > 6) return;
+    if (!s_localTracks || s_localTrackCount >= s_localTrackCapacity || depth > 6) return;
     File dir = SD_MMC.open(path);
     if (!dir || !dir.isDirectory()) {
         if (dir) dir.close();
@@ -2183,7 +2195,7 @@ static void scanMusicDir(const char* path, uint8_t depth) {
     for (;;) {
         File entry = dir.openNextFile();
         if (!entry) break;
-        if (s_localTrackCount >= kMaxLocalTracks) {
+        if (s_localTrackCount >= s_localTrackCapacity) {
             entry.close();
             break;
         }
@@ -2217,9 +2229,49 @@ static void localMusicScanTask(void*) {
         s_localTracks = nullptr;
     }
     s_localTrackCount = 0;
-    s_localTracks = static_cast<LocalTrackItem*>(ps_calloc(kMaxLocalTracks, sizeof(LocalTrackItem)));
-    if (s_localTracks) scanMusicDir("/", 0);
-    printf("[MUSIC] scan done, %u tracks\n", s_localTrackCount);
+
+    const uint32_t psramBefore = ESP.getFreePsram();
+    const uint32_t startMs = millis();
+
+    // 分配失败时逐级退让，而不是直接把曲库变成空的。
+    // 之前这里是 `if (s_localTracks) scanMusicDir(...)` —— ps_calloc 失败会
+    // **静默**跳过整个扫描，用户看到的是"一首歌都没有"，日志里却什么都没有。
+    // 扩容到 2000 首（644KB PSRAM）之后这个失败路径的概率明显上升，必须有声音。
+    uint16_t capacity = kMaxLocalTracks;
+    while (capacity >= 128) {
+        s_localTracks = static_cast<LocalTrackItem*>(ps_calloc(capacity, sizeof(LocalTrackItem)));
+        if (s_localTracks) break;
+        printf("[MUSIC] ps_calloc(%u tracks, %u B) failed, halving\n",
+               capacity, static_cast<unsigned>(capacity * sizeof(LocalTrackItem)));
+        capacity /= 2;
+    }
+    if (!s_localTracks) {
+        MWR_LOG_ERROR("local music index alloc failed -- library will be empty");
+        s_localTrackCapacity = 0;
+        s_localLibraryScanning = false;
+        vTaskDelete(nullptr);
+        return;
+    }
+    s_localTrackCapacity = capacity;
+
+    const uint32_t allocMs = millis();
+    scanMusicDir("/", 0);
+    const uint32_t doneMs = millis();
+
+    // Phase 1 实测埋点：扩容之后必须知道分配成本、扫描耗时和单首均摊，才能推算
+    // 真实曲库规模下的开机等待时间（见 docs/LOCAL_LIBRARY_V2_AUDIT.md §12）。
+    // 本机 SD 上只有几十首，2000 首的耗时只能靠 per_track 外推。
+    printf("[MUSIC] scan done, %u tracks (capacity %u)\n", s_localTrackCount, capacity);
+    printf("[MUSIC][PERF] alloc=%lums scan=%lums per_track=%.1fms\n",
+           static_cast<unsigned long>(allocMs - startMs),
+           static_cast<unsigned long>(doneMs - allocMs),
+           s_localTrackCount ? static_cast<double>(doneMs - allocMs) / s_localTrackCount : 0.0);
+    printf("[MUSIC][PERF] psram before=%lu after=%lu used=%ld internal_free=%lu\n",
+           static_cast<unsigned long>(psramBefore),
+           static_cast<unsigned long>(ESP.getFreePsram()),
+           static_cast<long>(psramBefore) - static_cast<long>(ESP.getFreePsram()),
+           static_cast<unsigned long>(ESP.getFreeHeap()));
+
     s_localLibraryScanning = false;
     vTaskDelete(nullptr);
 }
