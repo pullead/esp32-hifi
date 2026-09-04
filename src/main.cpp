@@ -1636,6 +1636,10 @@ static uint16_t s_localTrackCapacity = 0;
 // 扫描期的对账上下文。scanMusicDir() 是递归的，把这些做成文件级静态比一路传参
 // 干净。只在 localMusicScanTask() 里读写，不跨任务。
 static uint8_t* s_scanSeenBits = nullptr;   // 大小见 libraryStoreSeenBytes()
+// 开机时从 tracks.idx **读回**了多少条。
+// 这是区分"索引真的持久化了"和"每次开机都重扫一遍"的唯一判据——两种情况下
+// 最终的 tracks 数量是一样的，光看总数分不出来。
+static uint16_t s_libLoadedAtBoot = 0;
 static uint32_t s_scanNowEpoch = 0;
 // s_usbStorageState itself is declared earlier now (see playerCorePlaySdFile()'s comment) -- the rest of the USB-storage statics stay here.
 static volatile bool s_usbStorageBusy = false;
@@ -2272,6 +2276,7 @@ static void localMusicScanTask(void*) {
     // 这样重扫一次 SD 不会丢掉播放次数、favorite 这些用户行为的产物。
     const uint32_t loadStart = millis();
     s_localTrackCount = libraryStoreLoad(s_localTracks, capacity);
+    s_libLoadedAtBoot = s_localTrackCount;
     const uint32_t loadMs = millis() - loadStart;
 
     // seen 位图：记录本轮扫描碰过哪些下标，扫完把没碰过的标成 missing。
@@ -5652,9 +5657,12 @@ static void loopLvglRuntime() {
                 if (s_localTracks[i].flags & kTrackFlagFavorite) ++favorite;
                 if (s_localTracks[i].playCount) ++played;
             }
-            printf("[LIB][STATE] tracks=%u/%u missing=%u fav=%u played=%u rec_size=%u\n",
-                   s_localTrackCount, s_localTrackCapacity, missing, favorite, played,
-                   static_cast<unsigned>(sizeof(TrackRecord)));
+            printf("[LIB][STATE] tracks=%u/%u loaded_at_boot=%u missing=%u fav=%u played=%u "
+                   "rec=%uB idx=%uKB psram_free=%luKB\n",
+                   s_localTrackCount, s_localTrackCapacity, s_libLoadedAtBoot, missing, favorite, played,
+                   static_cast<unsigned>(sizeof(TrackRecord)),
+                   static_cast<unsigned>(s_localTrackCapacity * sizeof(TrackRecord) / 1024),
+                   static_cast<unsigned long>(ESP.getFreePsram() / 1024));
         }
 
         if (s_memLogRadioAtSec && s_totalRuntime >= s_memLogRadioAtSec) {
