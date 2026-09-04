@@ -37,6 +37,7 @@
 #include "soc/usb_pins.h"  // USBPHY_DP_NUM / USBPHY_DM_NUM
 #include "library/library_store.h"  // 本地音乐库 2.0 索引持久化
 #include "library/library_cleaner.h"  // 空间评估与淘汰（第一版只做 dry-run）
+#include "discovery/jamendo_provider.h"  // Phase 3：候选发现（不下载）
 #define MWR_USB_DAC_SUPPORTED 1
 #else
 #define MWR_USB_DAC_SUPPORTED 0
@@ -1664,26 +1665,166 @@ static uint16_t s_libLoadedAtBoot = 0;
 // 分配表，几百毫秒起步，每 10 秒来一次会和音频抢 SD。
 static CleanerPlan s_cleanerPlan{};
 
+// —— Phase 3：候选发现 ——
+//
+// client_id 存 NVS，**不进仓库**（审计 R12）。没配置时 provider 的
+// available() 为 false，整条发现链路直接跳过，不影响其它功能。
+static constexpr const char* kJamendoClientIdPrefKey = "jamendo_id";
+
+// 构建期默认值。真实的 client_id 放在 src/jamendo_secret.h —— **gitignored**，
+// 和 platformio_override.ini 里的 WiFi 密码同样处理（审计 R12）。
+// 代码里**绝不硬编码**任何凭据；文件不存在时留空，available() 为 false，
+// 整条发现链路静默跳过。
+//
+// 用独立头文件而不是 platformio.ini 的 -D：改 [common].build_flags 会改变每个
+// 源文件的编译命令，触发 45 分钟全量重编；这个头文件只被本文件包含。
+#if defined(__has_include)
+#if __has_include("jamendo_secret.h")
+#include "jamendo_secret.h"
+#endif
+#endif
+#ifndef JAMENDO_CLIENT_ID
+#define JAMENDO_CLIENT_ID ""
+#endif
+static JamendoProvider s_jamendo;
+
+// 解析器自检结果。**不联网、不需要 client_id** —— 喂一段真实格式的样本进去，
+// 验证 JSON 扫描逻辑本身。这样 Phase 3 的核心（解析）能独立于网络和凭据被验证，
+// 不用等申请 client_id，也不受网络波动影响。
+static uint8_t s_jamendoSelfTestParsed = 0xFF;  // 0xFF = 还没跑
+
+// 联网后的一次性真实拉取（Phase 3 验收）。只发现候选，**不下载任何文件**。
+static volatile bool s_jamendoProbeDone = false;
+static volatile uint8_t s_jamendoProbeCount = 0;
+static char s_jamendoProbeErr[64] = "";
+
+// 联网后拉一次真实候选，确认整条链路（HTTPS → JSON → RemoteTrack）通。
+//
+// 单开任务而不是在 loop 里做：HTTPS 握手会阻塞几百毫秒到几秒，放主循环会卡 UI。
+// 沿用 weatherTask 的模式（core 0、优先级 1、10KB 栈——TLS 握手吃栈）。
+static void jamendoProbeTask(void*) {
+    // RemoteTrack 约 512B，5 条 2.5KB。放 PSRAM 而不是任务栈：栈要留给 TLS。
+    RemoteTrack* tracks = static_cast<RemoteTrack*>(ps_calloc(5, sizeof(RemoteTrack)));
+    if (tracks) {
+        DiscoveryRequest req;
+        req.lang = nullptr;              // 先不限语言，只验链路通不通
+        req.limit = 5;
+        req.offset = 0;
+        req.order = "popularity_month";
+        const uint8_t n = s_jamendo.fetchCandidates(req, tracks, 5);
+        s_jamendoProbeCount = n;
+        strlcpy(s_jamendoProbeErr, s_jamendo.lastError(), sizeof(s_jamendoProbeErr));
+        for (uint8_t i = 0; i < n; ++i) {
+            printf("[JAMENDO][PROBE] %u id=%s dur=%lus ~%luKB \"%s\" - \"%s\"\n",
+                   i + 1, tracks[i].providerTrackId,
+                   static_cast<unsigned long>(tracks[i].durationSec),
+                   static_cast<unsigned long>(tracks[i].sizeHintBytes / 1024),
+                   tracks[i].title, tracks[i].artist);
+        }
+        free(tracks);
+    } else {
+        strlcpy(s_jamendoProbeErr, "ps_calloc failed", sizeof(s_jamendoProbeErr));
+    }
+    s_jamendoProbeDone = true;
+    vTaskDelete(nullptr);
+}
+
+static void jamendoSelfTest() {
+    // 一段按 Jamendo tracks API 真实格式构造的样本，覆盖三种情况：
+    //   1. 正常曲目
+    //   2. 标题里带转义（\" 和 \/），验证字符串扫描不会被引号截断
+    //   3. audiodownload_allowed=false —— **必须被过滤掉**
+    static const char kSample[] =
+        "{\"headers\":{\"status\":\"success\",\"results_count\":3},\"results\":["
+        "{\"id\":\"1880336\",\"name\":\"Sunrise\",\"duration\":204,"
+        "\"artist_name\":\"Alpha\",\"album_name\":\"First\","
+        "\"image\":\"https:\\/\\/usercontent.jamendo.com?id=1\","
+        "\"audiodownload\":\"https:\\/\\/prod.jamendo.com\\/?trackid=1880336\","
+        "\"audiodownload_allowed\":true},"
+        "{\"id\":\"1880337\",\"name\":\"He said \\\"hi\\\" \\/ bye\",\"duration\":180,"
+        "\"artist_name\":\"Beta\",\"album_name\":\"Second\","
+        "\"image\":\"https:\\/\\/usercontent.jamendo.com?id=2\","
+        "\"audiodownload\":\"https:\\/\\/prod.jamendo.com\\/?trackid=1880337\","
+        "\"audiodownload_allowed\":true},"
+        "{\"id\":\"1880338\",\"name\":\"NotAllowed\",\"duration\":300,"
+        "\"artist_name\":\"Gamma\",\"album_name\":\"Third\","
+        "\"image\":\"\",\"audiodownload\":\"https:\\/\\/x\","
+        "\"audiodownload_allowed\":false}"
+        "]}";
+
+    RemoteTrack tracks[4]{};
+    const uint8_t n = jamendoParseTracks(kSample, tracks, 4);
+    s_jamendoSelfTestParsed = n;
+    printf("[JAMENDO][SELFTEST] parsed=%u (expect 2, the third must be filtered)\n", n);
+    for (uint8_t i = 0; i < n; ++i) {
+        printf("[JAMENDO][SELFTEST]  id=%s dur=%lus title=\"%s\" artist=\"%s\" url=%.40s\n",
+               tracks[i].providerTrackId, static_cast<unsigned long>(tracks[i].durationSec),
+               tracks[i].title, tracks[i].artist, tracks[i].audioUrl);
+    }
+}
+
 // —— 播放事件记录（Phase 1）——
 //
 // 放在 main.cpp 而不是审计 §8 建议的 src/library/play_history.cpp：这几个函数
 // 本质上只是 libraryStoreAppendEvent() 的薄包装，而它们需要的状态
 //（当前在放哪首、放到哪了）全都在 main.cpp 里。独立成模块反而要把这些状态
 // 反向暴露出去，得不偿失。真正的存储逻辑仍然在 library_store 里。
-// 记录一条事件：既写盘（追加，不重写索引）也立刻更新内存，两边始终一致。
+// —— 事件队列 ——
+//
+// ⚠️ **播放路径绝不能碰 SD。**
+//
+// 第一版是在 libraryLogEvent() 里直接 SD_MMC.open(...,"a") 写盘，而它被
+// playerCorePlaySdFile() 调用——就在 connecttoFS() 刚让音频库打开音乐文件、
+// 正要开始流式读取的那一刻。在 1-bit SD_MMC 总线上这么干，实测**本地播放和
+// 电台都点了没反应**（电台也中招是因为 playRadioUrl 会先 stop()，同样走到这里）。
+// 而且 libraryStoreAppendEvent() 内部还有 ensureLibraryDir() 的两次
+// SD_MMC.exists()，开销比看上去大得多。
+//
+// 现在改成：事件先进内存队列（纯赋值，微秒级），由 1 秒 tick 择机批量落盘，
+// 且**优先在没有播放时才写**。内存状态仍然立即更新，UI 读到的数字不延迟。
+constexpr uint8_t kLibraryEventQueueSize = 32;
+static LibraryEvent s_libEventQueue[kLibraryEventQueueSize];
+static volatile uint8_t s_libEventQueueCount = 0;
+static uint32_t s_libEventDropped = 0;
+
+// 记录一条事件：立刻更新内存，落盘交给队列。
 static void libraryLogEvent(uint32_t localId, uint8_t type) {
     if (!localId) return;
     // RTC 没同步时传 0：libraryStoreApplyEvent() 会只累加计数、不写时间戳，
     // 避免把 1970 年写进 lastPlayedAt 让淘汰算法判反（见 library_store.cpp）。
     const uint32_t ts = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
-    libraryStoreAppendEvent(localId, type, ts);
-    if (s_localTracks) {
-        LibraryEvent e{};
-        e.localId = localId;
-        e.timestamp = ts;
-        e.type = type;
-        libraryStoreApplyEvent(s_localTracks, s_localTrackCount, e);
+
+    LibraryEvent e{};
+    e.localId = localId;
+    e.timestamp = ts;
+    e.type = type;
+
+    if (s_localTracks) libraryStoreApplyEvent(s_localTracks, s_localTrackCount, e);
+
+    if (s_libEventQueueCount < kLibraryEventQueueSize) {
+        s_libEventQueue[s_libEventQueueCount++] = e;
+    } else {
+        // 队列满：丢掉这条并计数。丢的是**落盘**，内存统计上面已经加过了，
+        // 所以 UI 不受影响；只是这条在重启后会丢失。32 条的队列配上每秒一次的
+        // 冲刷，正常使用几乎不可能满。
+        ++s_libEventDropped;
     }
+}
+
+// 由 1 秒 tick 调用。把队列里的事件一次性追加到 events.log。
+//
+// 时机选择：**正在播放时默认不写**，避免和音频抢 SD 总线——除非队列快满了，
+// 那时宁可短暂争用也不能丢事件。
+static void libraryFlushEvents(bool audioBusy) {
+    const uint8_t n = s_libEventQueueCount;
+    if (!n) return;
+    if (audioBusy && n < kLibraryEventQueueSize * 3 / 4) return;
+
+    for (uint8_t i = 0; i < n; ++i) {
+        libraryStoreAppendEvent(s_libEventQueue[i].localId, s_libEventQueue[i].type,
+                                s_libEventQueue[i].timestamp);
+    }
+    s_libEventQueueCount = 0;
 }
 
 // 上一首还没播完就换歌 / 停止 —— 记为跳过。
@@ -2358,6 +2499,23 @@ static void localMusicScanTask(void*) {
     libraryCleanerDryRun(s_localTracks, s_localTrackCount, 0, s_scanNowEpoch,
                          s_playingLocalId, nullptr, 0);
     libraryCleanerAssess(s_localTracks, s_localTrackCount, 0, s_playingLocalId, &s_cleanerPlan);
+
+    // Phase 3：解析器自检（不联网、不需要 client_id），以及读取已配置的 client_id。
+    jamendoSelfTest();
+    // client_id 优先取 NVS（将来可以从 UI 配），没有就退回构建期的宏。
+    //
+    // ⚠️ 那个宏定义在 platformio_override.ini 里——**gitignored**，和 WiFi 密码
+    // 同一个地方。凭据不进仓库（审计 R12）。没配置时 available() 为 false，
+    // 整条发现链路静默跳过，不影响其它功能。
+    {
+        String id;
+        if (lockPreferences()) {
+            id = pref.getString(kJamendoClientIdPrefKey, "");
+            unlockPreferences();
+        }
+        if (id.isEmpty()) id = JAMENDO_CLIENT_ID;
+        s_jamendo.setClientId(id.c_str());
+    }
     if (nowMissing) printf("[LIB] %u track(s) newly marked missing\n", nowMissing);
     printf("[LIB][PERF] load=%lums\n", static_cast<unsigned long>(loadMs));
 
@@ -5384,6 +5542,11 @@ static void onWifiNetworkReady() {
     s_lvglNetworkReady = true;
     if (!s_weatherMutex) s_weatherMutex = xSemaphoreCreateMutex();
     if (xTaskCreatePinnedToCore(weatherTask, "weather", 10240, nullptr, 1, nullptr, 0) != pdPASS) MWR_LOG_ERROR("Failed to create weather task");
+    // Phase 3 验收：联网后拉一次真实候选。**只发现，不下载任何文件。**
+    if (s_jamendo.available() && !s_jamendoProbeDone) {
+        if (xTaskCreatePinnedToCore(jamendoProbeTask, "jamendoProbe", 10240, nullptr, 1, nullptr, 0) != pdPASS)
+            MWR_LOG_ERROR("Failed to create jamendo probe task");
+    }
 }
 
 // startWifiApFallback() (WiFi.mode(WIFI_AP_STA) + softAP + DNSServer) is
@@ -5775,6 +5938,9 @@ static void loopLvglRuntime() {
         s_f_1sec = false;
         s_totalRuntime++;
 
+        // 事件落盘。放在这里而不是播放路径里——见 libraryLogEvent() 的说明。
+        libraryFlushEvents(audio.isRunning());
+
         // 曲库状态：每 10 秒打一次。
         //
         // 为什么要周期打而不是只在扫描结束时打一次：开机那一瞬间的 printf 在这块板
@@ -5794,8 +5960,15 @@ static void loopLvglRuntime() {
                    static_cast<unsigned>(sizeof(TrackRecord)),
                    static_cast<unsigned>(s_localTrackCapacity * sizeof(TrackRecord) / 1024),
                    static_cast<unsigned long>(ESP.getFreePsram() / 1024));
+            printf("[LIB][EVQ] queued=%u dropped=%lu\n",
+                   s_libEventQueueCount, static_cast<unsigned long>(s_libEventDropped));
             // 空间评估。数字来自扫描时的一次快照，不是实时读 SD——见 s_cleanerPlan
             // 的注释。所以 free 不会随播放/下载实时变化，够用来确认策略是否合理。
+            printf("[JAMENDO][STATE] selftest=%u(expect 2) client_id=%s probe_done=%d "
+                   "probe_tracks=%u err=\"%s\"\n",
+                   s_jamendoSelfTestParsed,
+                   s_jamendo.available() ? "configured" : "MISSING",
+                   s_jamendoProbeDone ? 1 : 0, s_jamendoProbeCount, s_jamendoProbeErr);
             if (s_cleanerPlan.sdReadable) {
                 printf("[CLEAN][STATE] free=%lluMB reserve=%lluMB need_clean=%d "
                        "candidates=%u reclaim=%lluMB user_owned=%u\n",

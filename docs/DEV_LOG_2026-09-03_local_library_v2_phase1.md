@@ -338,3 +338,118 @@ dry-run 的理由。
 - [ ] 删除时同步维护封面引用（同 album 共享的封面，只有没有其他曲目引用才能删）
 - [ ] 删除后写 `recent_history`，避免 90~180 天内重新下载同一首
 - [ ] 用真实数据校准 §8.2 的权重
+
+---
+
+## 9. Phase 3：JamendoProvider（只发现，不下载）—— 2026-09-04
+
+### 9.1 新增文件
+
+| 文件 | 内容 |
+|---|---|
+| `src/discovery/music_provider.h` | `MusicProvider` 抽象 / `RemoteTrack` / `DiscoveryRequest` |
+| `src/discovery/jamendo_provider.h/.cpp` | Jamendo 实现 + 可独立测试的解析函数 |
+| `src/jamendo_secret.h` | client_id，**gitignored** |
+
+### 9.2 为什么自己写 JSON 扫描器
+
+`main.cpp` 里那三个 helper（`jsonNumber` / `jsonStringField` / `jsonArrayItems`）用不了，
+两个原因：
+
+1. 它们是 `static`，跨编译单元拿不到
+2. **语义不对**：它们是"在整个 body 里找某个 key"，而这里要"results 数组里每个
+   对象各取一次同名字段"。直接用会串台——第 2 个对象的 `name` 会被第 1 个的匹配挡住
+
+所以先按花括号深度把数组切成对象区间（**跳过字符串内部的括号**，否则歌名里带
+`}` 就切错），再在区间内取字段。
+
+### 9.3 结构性保证：不该下载的进不来
+
+`audiodownload_allowed` 的过滤放在 **provider 内部**而不是调用方：
+
+```cpp
+t.downloadAllowed = getBool(p, objEnd, "audiodownload_allowed");
+if (t.downloadAllowed) { ...填充... }
+```
+
+这样"不允许下载的东西根本不会流入下游"是结构上的保证，而不是依赖每个调用方
+都记得检查。
+
+### 9.4 解析器自检：不联网、不需要 client_id
+
+内嵌一段真实格式的样本，覆盖三种情况：正常曲目、标题带 `\"` 和 `\/` 转义、
+`audiodownload_allowed=false`（必须被过滤）。
+
+这让 **Phase 3 的核心（解析）可以独立于网络和凭据被验证** —— 不用等申请
+client_id，也不受网络波动影响。
+
+### 9.5 实测（2026-09-04）
+
+```
+[JAMENDO][STATE] selftest=2(expect 2) client_id=configured probe_done=1 probe_tracks=5 err=""
+```
+
+| 项 | 结果 |
+|---|---|
+| 解析器自检 | ✅ 2 条（第三条被正确过滤） |
+| 凭据装载 | ✅ |
+| **真实 Jamendo API** | ✅ **5 条候选，无错误** |
+
+`probe_tracks=5` 是硬证据：解析器只在 `id` 与 `audioUrl` 都非空时才计数。
+
+⚠️ 未抓到逐条的 `[JAMENDO][PROBE]` 明细（那几行在 WiFi 连上后立刻打印，
+开串口总是慢一步）。曲目标题是否有乱码尚未肉眼确认。
+
+### 9.6 凭据处理
+
+`src/jamendo_secret.h`，已加入 `.gitignore`（`git check-ignore` 确认）。
+代码用 `__has_include` 探测，文件不存在时 `available()` 为 false，
+整条发现链路静默跳过。**任何凭据都不硬编码进仓库**（审计 R12）。
+
+⚠️ 一个失算：本想用独立头文件**避免**全量重编（改 `[common].build_flags` 会
+改变每个文件的编译命令），结果 `src/CMakeLists.txt` 是
+`FILE(GLOB_RECURSE src/*.*)` —— **在 `src/` 下新增任何文件（含 .h）都会改变
+glob 结果、触发 CMake 重配和全量重编**。真要避开得把文件放在 `src/` 之外。
+
+---
+
+## 10. ⚠️ 一个我引入的回归：SD 写操作进了播放路径
+
+### 10.1 现象
+
+Phase 1 的固件烧进去之后，**本地音乐和电台都点了没反应**。
+
+### 10.2 根因
+
+```cpp
+bool playerCorePlaySdFile(const char* path, uint32_t positionSeconds) {
+    libraryFinishCurrentTrack();          // ← 可能 SD 写
+    connecttoFS("SD_MMC", path, ...);     // ← 音频库在这里打开音乐文件
+    if (s_f_isFSConnected) {
+        libraryLogEvent(..., kEventPlayStarted);   // ← SD 写，音频流刚建立的那一刻
+    }
+}
+```
+
+`libraryLogEvent()` 内部还有 `ensureLibraryDir()` 的两次 `SD_MMC.exists()`，
+开销比看上去大得多。在 **1-bit SD_MMC 总线**上、音频正要开始流式读取时去
+创建/追加另一个文件，是最容易出事的时机。
+
+**电台也中招**是因为 `PlayerService::playRadioUrl()` 会先调 `stop()` →
+`playerCoreStop()` → 同样走到那段代码。
+
+### 10.3 修法：播放路径绝不碰 SD
+
+事件先进**内存队列**（32 条，纯赋值），由 1 秒 tick 择机批量落盘，
+且**正在播放时默认不写** —— 除非队列到 3/4 满，那时宁可短暂争用也不丢事件。
+
+内存统计仍然立即更新，UI 数字不延迟；队列满时丢的只是**落盘**，
+影响仅限于重启后丢失那几条。新增 `[LIB][EVQ] queued=N dropped=M` 诊断。
+
+### 10.4 值得记的一点
+
+**审计文档里已经写着这条风险**（R6：「下载写 SD 与播放读 SD 争用」），
+是我自己写的。实现 Phase 1 时却把 SD 写直接塞进了播放启动路径 ——
+**写下风险不等于会在实现时想起它**。
+
+下次涉及 SD 的改动，先问一句：这段代码会不会和音频流同时访问 SD？

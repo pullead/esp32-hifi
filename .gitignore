@@ -2,6 +2,7 @@
 .vscode
 .env
 platformio_override.ini
+src/jamendo_secret.h
 build
 logs
 managed_components
