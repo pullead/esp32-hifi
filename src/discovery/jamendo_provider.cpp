@@ -182,9 +182,18 @@ uint8_t JamendoProvider::fetchCandidates(const DiscoveryRequest& request,
     if (limit > maxOut) limit = maxOut;
 
     char url[400];
+    // ⚠️ **不要往这里加 audiodownload_allowed。** 它不是 /tracks/ 方法的合法
+    // 查询参数，Jamendo 收到后会返回：
+    //   warnings: "The following parameters are not recognized for this
+    //              method: [audiodownload_allowed]", results_count: 0
+    // 而且是**时灵时不灵**的——同一个 URL 有时正常返回 5 条，有时返回空数组。
+    // 2026-09-04 为此排查了两轮，一度误判成"服务器一过性故障"。
+    //
+    // 不需要它：可下载与否的过滤在 jamendoParseTracks() 里按**响应体**中的
+    // audiodownload_allowed 字段做（那个是合法的响应字段），语义完全一样。
     int len = snprintf(url, sizeof(url),
                        "https://api.jamendo.com/v3.0/tracks/?client_id=%s&format=json"
-                       "&limit=%u&offset=%u&audiodownload_allowed=true"
+                       "&limit=%u&offset=%u"
                        "&audiodlformat=mp32&imagesize=200&include=musicinfo",
                        m_clientId, limit, request.offset);
     if (request.lang && request.lang[0] && len > 0 && len < static_cast<int>(sizeof(url))) {
@@ -215,7 +224,16 @@ uint8_t JamendoProvider::fetchCandidates(const DiscoveryRequest& request,
     http.end();
 
     const uint8_t n = jamendoParseTracks(body.c_str(), out, limit);
-    if (!n) snprintf(m_lastError, sizeof(m_lastError), "0 tracks from %u bytes", body.length());
+    if (!n) {
+        snprintf(m_lastError, sizeof(m_lastError), "0 tracks from %u bytes", body.length());
+        // ⚠️ 解析不出东西时**必须把响应本身打出来**，否则只能靠猜。
+        // 实测遇到过 probe_tracks 从 5 变成 0 而代码一行没改的情况 —— 那只能是
+        // 服务器返回了别的内容（限流 / 配额 / 参数被拒），不看响应根本无从判断。
+        // 截断到 300 字符：Jamendo 的错误信息都在 headers 里、开头就有。
+        char head[301];
+        strlcpy(head, body.c_str(), sizeof(head));
+        printf("[JAMENDO][RAW] %s\n", head);
+    }
     printf("[JAMENDO] lang=%s offset=%u -> %u tracks (%u bytes)\n",
            request.lang ? request.lang : "any", request.offset, n, body.length());
     return n;

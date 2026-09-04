@@ -38,6 +38,7 @@
 #include "library/library_store.h"  // 本地音乐库 2.0 索引持久化
 #include "library/library_cleaner.h"  // 空间评估与淘汰（第一版只做 dry-run）
 #include "discovery/jamendo_provider.h"  // Phase 3：候选发现（不下载）
+#include "discovery/download_manager.h"  // Phase 4：流式下载 .part + rename
 #define MWR_USB_DAC_SUPPORTED 1
 #else
 #define MWR_USB_DAC_SUPPORTED 0
@@ -1698,6 +1699,10 @@ static volatile bool s_jamendoProbeDone = false;
 static volatile uint8_t s_jamendoProbeCount = 0;
 static char s_jamendoProbeErr[64] = "";
 
+// Phase 4：单首下载测试的结果，供周期打印。
+static volatile bool s_dlTestDone = false;
+static char s_dlTestResult[96] = "";
+
 // 联网后拉一次真实候选，确认整条链路（HTTPS → JSON → RemoteTrack）通。
 //
 // 单开任务而不是在 loop 里做：HTTPS 握手会阻塞几百毫秒到几秒，放主循环会卡 UI。
@@ -1721,6 +1726,48 @@ static void jamendoProbeTask(void*) {
                    static_cast<unsigned long>(tracks[i].sizeHintBytes / 1024),
                    tracks[i].title, tracks[i].artist);
         }
+        // —— Phase 4：单首下载测试（方案 §32 要求先手动验证单首闭环）——
+        //
+        // 只下第一条、只下一次、只在**没有播放**时下。
+        // 这是受控实验不是自动同步：自动每日下载是 Phase 5 的事。
+        //
+        // ⚠️ "没在播放才下"是 R6 的第一道防线。Phase 1 已经因为在播放路径里写 SD
+        // 把本地和电台都搞挂过一次（见 DEV_LOG §10），这次从一开始就避开。
+        if (n > 0 && !audio.isRunning()) {
+            // ⚠️ **audiodownload_allowed=true 不保证真的下得下来。**
+            // 实测 2026-09-04：同一批候选里 id=2034080 的下载地址恒定返回
+            // HTTP 500（PC 直连 curl 同样 500，排除了板子和 TLS 的嫌疑），
+            // 而同批的 1593988 / 1932670 都正常 206。API 层的许可标志和
+            // 存储层的可用性是两回事。
+            //
+            // 所以这里往下试，不死磕第一条。Phase 5 的每日同步同理：
+            // 单曲失败要跳过并记账，不能卡住整轮，也不能无限重试。
+            constexpr uint8_t kMaxAttempts = 3;
+            const uint8_t attempts = n < kMaxAttempts ? n : kMaxAttempts;
+            for (uint8_t i = 0; i < attempts; ++i) {
+                char finalPath[160];
+                snprintf(finalPath, sizeof(finalPath), "/music/tracks/jamendo_%s.mp3",
+                         tracks[i].providerTrackId);
+                DownloadStats st{};
+                const DownloadResult r = downloadToFile(tracks[i].audioUrl, finalPath, nullptr, &st);
+                snprintf(s_dlTestResult, sizeof(s_dlTestResult),
+                         "try%u/%u %s %luKB/%luKB %lums http=%d",
+                         i + 1, attempts, downloadResultName(r),
+                         static_cast<unsigned long>(st.bytesWritten / 1024),
+                         static_cast<unsigned long>(st.expectedBytes / 1024),
+                         static_cast<unsigned long>(st.elapsedMs), st.httpCode);
+                printf("[DL][TEST] %s -> %s\n", s_dlTestResult, finalPath);
+                if (r == DownloadResult::Ok) break;
+            }
+        } else if (n > 0) {
+            strlcpy(s_dlTestResult, "skipped (audio playing)", sizeof(s_dlTestResult));
+        } else {
+            // 没候选就没得下。写清楚原因，否则 [DL][STATE] 是空行，
+            // “没结果”和“没运行”分不出来。
+            strlcpy(s_dlTestResult, "no candidates", sizeof(s_dlTestResult));
+        }
+        s_dlTestDone = true;
+
         free(tracks);
     } else {
         strlcpy(s_jamendoProbeErr, "ps_calloc failed", sizeof(s_jamendoProbeErr));
@@ -2501,6 +2548,10 @@ static void localMusicScanTask(void*) {
     libraryCleanerAssess(s_localTracks, s_localTrackCount, 0, s_playingLocalId, &s_cleanerPlan);
 
     // Phase 3：解析器自检（不联网、不需要 client_id），以及读取已配置的 client_id。
+    // 方案 §19：开机清掉上次断电/断网留下的 .part，避免半截文件被误当成歌曲。
+    // 第一版直接删掉重下，不做 HTTP Range 续传。
+    downloadCleanupStalePartFiles();
+
     jamendoSelfTest();
     // client_id 优先取 NVS（将来可以从 UI 配），没有就退回构建期的宏。
     //
@@ -5969,6 +6020,7 @@ static void loopLvglRuntime() {
                    s_jamendoSelfTestParsed,
                    s_jamendo.available() ? "configured" : "MISSING",
                    s_jamendoProbeDone ? 1 : 0, s_jamendoProbeCount, s_jamendoProbeErr);
+            if (s_dlTestDone) printf("[DL][STATE] %s\n", s_dlTestResult);
             if (s_cleanerPlan.sdReadable) {
                 printf("[CLEAN][STATE] free=%lluMB reserve=%lluMB need_clean=%d "
                        "candidates=%u reclaim=%lluMB user_owned=%u\n",
