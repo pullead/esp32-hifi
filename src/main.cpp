@@ -1703,6 +1703,59 @@ static char s_jamendoProbeErr[64] = "";
 static volatile bool s_dlTestDone = false;
 static char s_dlTestResult[96] = "";
 
+// —— R6 验证：下载写 SD 与播放读 SD 的争用 ——
+//
+// 需要一个**客观指标**，"听着好像没卡"不算数。用 audio.inBufferFilled()：
+// 解码输入缓冲的水位。下载期间如果它被抽干趋近 0，就是真的在饿着解码器。
+//
+// 采样挂在 loopLvglRuntime() 的 100ms 节拍里，而不是在下载任务里——
+// 下载是阻塞调用，它自己没法给自己采样。
+static volatile bool     s_r6Sampling = false;
+static volatile uint32_t s_r6MinFilled = 0xFFFFFFFFu;
+static volatile uint64_t s_r6SumFilled = 0;
+static volatile uint32_t s_r6Samples = 0;
+static volatile bool     s_r6Starved = false;   // 水位掉到过 0
+// ⚠️ 只有 min 和 starv 是不够的：下载跑 180 秒，期间歌曲可能播完切下一首，
+// 切歌瞬间缓冲本来就会归零。第一轮实测拿到 min=0/starv=1，但**分不出**那是
+// 下载饿着了解码器还是正常切歌。
+// 区分靠形态：切歌是一小段连续的 0；真争用是反复触底、低水位样本占比高。
+static volatile uint32_t s_r6ZeroCount = 0;        // 水位为 0 的样本数
+static volatile uint32_t s_r6LowCount = 0;         // 水位低于容量 25% 的样本数
+static volatile uint32_t s_r6ConsecZero = 0;       // 当前连续 0 的长度
+static volatile uint32_t s_r6MaxConsecZero = 0;    // 最长的一段连续 0
+static volatile uint32_t s_r6Capacity = 0;         // filled+free，用于算百分比
+static volatile bool     s_r6Done = false;
+static char s_r6Result[192] = "";
+
+static void r6StatsReset() {
+    s_r6MinFilled = 0xFFFFFFFFu;
+    s_r6SumFilled = 0;
+    s_r6Samples = 0;
+    s_r6Starved = false;
+    s_r6ZeroCount = 0;
+    s_r6LowCount = 0;
+    s_r6ConsecZero = 0;
+    s_r6MaxConsecZero = 0;
+    s_r6Sampling = true;
+}
+
+// 返回平均水位；min 通过出参给。样本为 0 时两者都返回 0。
+struct R6Stats {
+    uint32_t avg = 0, min = 0, samples = 0;
+    uint32_t zeroCount = 0, lowCount = 0, maxConsecZero = 0;
+};
+
+static R6Stats r6StatsSnapshot() {
+    R6Stats r;
+    r.samples = s_r6Samples;
+    r.min = r.samples ? s_r6MinFilled : 0;
+    r.avg = r.samples ? static_cast<uint32_t>(s_r6SumFilled / r.samples) : 0;
+    r.zeroCount = s_r6ZeroCount;
+    r.lowCount = s_r6LowCount;
+    r.maxConsecZero = s_r6MaxConsecZero;
+    return r;
+}
+
 // 联网后拉一次真实候选，确认整条链路（HTTPS → JSON → RemoteTrack）通。
 //
 // 单开任务而不是在 loop 里做：HTTPS 握手会阻塞几百毫秒到几秒，放主循环会卡 UI。
@@ -1716,7 +1769,19 @@ static void jamendoProbeTask(void*) {
         req.limit = 5;
         req.offset = 0;
         req.order = "popularity_month";
-        const uint8_t n = s_jamendo.fetchCandidates(req, tracks, 5);
+        // ⚠️ Jamendo 会**间歇性**返回空数组，同一个 URL 有时 5 条有时 0 条。
+        // 已知至少两种形态（响应体分别是 189 和 105 字节，靠 [JAMENDO][RAW] 抓到）。
+        // 这不是可以指望修掉的东西，只能扛：重试几次。
+        // Phase 5 每日同步同理——一次拉空不能当成"今天没歌"。
+        uint8_t n = 0;
+        for (uint8_t attempt = 0; attempt < 3; ++attempt) {
+            if (attempt) {
+                printf("[JAMENDO] retry %u after empty result\n", attempt);
+                vTaskDelay(pdMS_TO_TICKS(5000));
+            }
+            n = s_jamendo.fetchCandidates(req, tracks, 5);
+            if (n) break;
+        }
         s_jamendoProbeCount = n;
         strlcpy(s_jamendoProbeErr, s_jamendo.lastError(), sizeof(s_jamendoProbeErr));
         for (uint8_t i = 0; i < n; ++i) {
@@ -1733,6 +1798,7 @@ static void jamendoProbeTask(void*) {
         //
         // ⚠️ "没在播放才下"是 R6 的第一道防线。Phase 1 已经因为在播放路径里写 SD
         // 把本地和电台都搞挂过一次（见 DEV_LOG §10），这次从一开始就避开。
+        int8_t okIndex = -1;   // 哪一条下成功了，R6 阶段复用它
         if (n > 0 && !audio.isRunning()) {
             // ⚠️ **audiodownload_allowed=true 不保证真的下得下来。**
             // 实测 2026-09-04：同一批候选里 id=2034080 的下载地址恒定返回
@@ -1757,7 +1823,7 @@ static void jamendoProbeTask(void*) {
                          static_cast<unsigned long>(st.expectedBytes / 1024),
                          static_cast<unsigned long>(st.elapsedMs), st.httpCode);
                 printf("[DL][TEST] %s -> %s\n", s_dlTestResult, finalPath);
-                if (r == DownloadResult::Ok) break;
+                if (r == DownloadResult::Ok) { okIndex = static_cast<int8_t>(i); break; }
             }
         } else if (n > 0) {
             strlcpy(s_dlTestResult, "skipped (audio playing)", sizeof(s_dlTestResult));
@@ -1767,6 +1833,77 @@ static void jamendoProbeTask(void*) {
             strlcpy(s_dlTestResult, "no candidates", sizeof(s_dlTestResult));
         }
         s_dlTestDone = true;
+
+        // —— R6 验证：播放中再下同一首 ——
+        //
+        // 为什么复用同一首而不是换一首：**只有同样大小、同一个服务器，
+        // 和空闲时那次的对比才成立。** 换一首的话，时间差可能来自文件大小
+        // 或 CDN 节点，说明不了争用。
+        //
+        // 这一段需要人配合：等用户在板子上开始播放本地音乐。等不到就跳过，
+        // 不阻塞别的东西。
+        //
+        // ⚠️ 这一段**不依赖上面那次空闲下载**。第一版把它挂在 okIndex >= 0 上，
+        // 结果用户按要求提前开始播放，空闲下载被 !audio.isRunning() 跳过，
+        // 连带整个 R6 也跳过了 —— 前置条件互相矛盾。
+        // R6 要回答的是"下载会不会饿着解码器"，只需要"播放中不下载"和
+        // "播放中下载"两组对比，空闲下载与它无关。
+        if (n > 0) {
+            constexpr uint32_t kWaitPlaybackMs = 300000;   // 5 分钟
+            const uint32_t waitUntil = millis() + kWaitPlaybackMs;
+            while (!audio.isRunning() && millis() < waitUntil) vTaskDelay(pdMS_TO_TICKS(500));
+
+            if (!audio.isRunning()) {
+                strlcpy(s_r6Result, "skipped: no playback started within 5min", sizeof(s_r6Result));
+            } else {
+                // 基线：只播放、不下载，15 秒
+                r6StatsReset();
+                vTaskDelay(pdMS_TO_TICKS(15000));
+                const R6Stats base = r6StatsSnapshot();
+
+                // 边播边下。优先用空闲那轮已验证能下的那条；没有的话就现挑，
+                // 同样最多试 3 条（坏曲目是常态，见 download_manager.h）。
+                r6StatsReset();
+                DownloadStats st{};
+                DownloadResult r = DownloadResult::HttpError;
+                const uint8_t first = (okIndex >= 0) ? static_cast<uint8_t>(okIndex) : 0;
+                for (uint8_t k = 0; k < n; ++k) {
+                    const uint8_t i = (first + k) % n;
+                    r = downloadToFile(tracks[i].audioUrl, "/music/tmp/r6_probe.bin", nullptr, &st);
+                    if (r == DownloadResult::Ok) break;
+                    if (k >= 2) break;   // 别把实验拖成无限重试
+                }
+                const R6Stats dl = r6StatsSnapshot();
+                s_r6Sampling = false;
+                SD_MMC.remove("/music/tmp/r6_probe.bin");   // 只是探针，不留
+
+                // 播放中途被用户停掉的话，样本数会很少，结论不可信 —— 说出来，
+                // 而不是让一个基于十几个样本的均值看起来像结论。
+                // 基线 15 秒 @100ms ≈ 150 个样本；下载那段更长，只会更多。
+                const bool trustworthy = (base.samples >= 100 && dl.samples >= 100);
+                const uint32_t cap = s_r6Capacity ? s_r6Capacity : 1;
+                snprintf(s_r6Result, sizeof(s_r6Result),
+                         "%s cap=%luKB base(avg=%lu%% zero=%lu low=%lu n=%lu) "
+                         "dl(avg=%lu%% zero=%lu low=%lu maxrun=%lu n=%lu) %lums%s",
+                         downloadResultName(r),
+                         static_cast<unsigned long>(cap / 1024),
+                         static_cast<unsigned long>(base.avg * 100ull / cap),
+                         static_cast<unsigned long>(base.zeroCount),
+                         static_cast<unsigned long>(base.lowCount),
+                         static_cast<unsigned long>(base.samples),
+                         static_cast<unsigned long>(dl.avg * 100ull / cap),
+                         static_cast<unsigned long>(dl.zeroCount),
+                         static_cast<unsigned long>(dl.lowCount),
+                         static_cast<unsigned long>(dl.maxConsecZero),
+                         static_cast<unsigned long>(dl.samples),
+                         static_cast<unsigned long>(st.elapsedMs),
+                         trustworthy ? "" : " [样本不足,结论不可信]");
+                printf("[R6][TEST] %s\n", s_r6Result);
+            }
+        } else {
+            strlcpy(s_r6Result, "skipped: no candidates from provider", sizeof(s_r6Result));
+        }
+        s_r6Done = true;
 
         free(tracks);
     } else {
@@ -5983,6 +6120,24 @@ static void loopLvglRuntime() {
         s_f_100ms = false;
         if (!s_f_mute && audio.getVolume() != s_volume.cur_volume) audio.setVolume(s_volume.cur_volume);
         if (s_f_mute && audio.getVolume() != 0) audio.setVolume(0);
+
+        // R6 采样。只在播放时取样——没播放的时候水位没有意义。
+        if (s_r6Sampling && audio.isRunning()) {
+            const uint32_t filled = audio.inBufferFilled();
+            if (!s_r6Capacity) s_r6Capacity = filled + audio.inBufferFree();
+            if (filled < s_r6MinFilled) s_r6MinFilled = filled;
+            s_r6SumFilled += filled;
+            ++s_r6Samples;
+
+            if (!filled) {
+                s_r6Starved = true;
+                ++s_r6ZeroCount;
+                if (++s_r6ConsecZero > s_r6MaxConsecZero) s_r6MaxConsecZero = s_r6ConsecZero;
+            } else {
+                s_r6ConsecZero = 0;
+            }
+            if (s_r6Capacity && filled < s_r6Capacity / 4) ++s_r6LowCount;
+        }
     }
 
     if (s_f_1sec) {
@@ -6021,6 +6176,10 @@ static void loopLvglRuntime() {
                    s_jamendo.available() ? "configured" : "MISSING",
                    s_jamendoProbeDone ? 1 : 0, s_jamendoProbeCount, s_jamendoProbeErr);
             if (s_dlTestDone) printf("[DL][STATE] %s\n", s_dlTestResult);
+            if (s_r6Done) printf("[R6][STATE] %s\n", s_r6Result);
+            else if (s_r6Sampling) printf("[R6][STATE] sampling n=%lu min=%lu\n",
+                                          static_cast<unsigned long>(s_r6Samples),
+                                          static_cast<unsigned long>(s_r6Samples ? s_r6MinFilled : 0));
             if (s_cleanerPlan.sdReadable) {
                 printf("[CLEAN][STATE] free=%lluMB reserve=%lluMB need_clean=%d "
                        "candidates=%u reclaim=%lluMB user_owned=%u\n",
