@@ -36,6 +36,7 @@
 // 见 usbDacRebootTask() 里的详细说明。
 #include "soc/usb_pins.h"  // USBPHY_DP_NUM / USBPHY_DM_NUM
 #include "library/library_store.h"  // 本地音乐库 2.0 索引持久化
+#include "library/library_cleaner.h"  // 空间评估与淘汰（第一版只做 dry-run）
 #define MWR_USB_DAC_SUPPORTED 1
 #else
 #define MWR_USB_DAC_SUPPORTED 0
@@ -1658,6 +1659,10 @@ static uint8_t* s_scanSeenBits = nullptr;   // 大小见 libraryStoreSeenBytes()
 // 这是区分"索引真的持久化了"和"每次开机都重扫一遍"的唯一判据——两种情况下
 // 最终的 tracks 数量是一样的，光看总数分不出来。
 static uint16_t s_libLoadedAtBoot = 0;
+// 扫描时算出来的空间评估结果，存下来供周期打印用。
+// **不在周期打印里直接调 SD_MMC.usedBytes()** —— 那个在大容量 FAT32 上要遍历
+// 分配表，几百毫秒起步，每 10 秒来一次会和音频抢 SD。
+static CleanerPlan s_cleanerPlan{};
 
 // —— 播放事件记录（Phase 1）——
 //
@@ -2346,6 +2351,13 @@ static void localMusicScanTask(void*) {
     s_scanSeenBits = nullptr; // seenBits 是栈上的，函数返回后就失效了
 
     libraryStoreSave(s_localTracks, s_localTrackCount);
+
+    // Phase 2：扫描完跑一次 dry-run。**不删除任何东西**，只把"如果空间不够会
+    // 删哪些、能腾多少"打出来，供人工确认算法是否合理（方案 §30）。
+    // incomingBytes 传 0 —— 现在还没有下载功能，只做纯容量评估。
+    libraryCleanerDryRun(s_localTracks, s_localTrackCount, 0, s_scanNowEpoch,
+                         s_playingLocalId, nullptr, 0);
+    libraryCleanerAssess(s_localTracks, s_localTrackCount, 0, s_playingLocalId, &s_cleanerPlan);
     if (nowMissing) printf("[LIB] %u track(s) newly marked missing\n", nowMissing);
     printf("[LIB][PERF] load=%lums\n", static_cast<unsigned long>(loadMs));
 
@@ -5782,6 +5794,18 @@ static void loopLvglRuntime() {
                    static_cast<unsigned>(sizeof(TrackRecord)),
                    static_cast<unsigned>(s_localTrackCapacity * sizeof(TrackRecord) / 1024),
                    static_cast<unsigned long>(ESP.getFreePsram() / 1024));
+            // 空间评估。数字来自扫描时的一次快照，不是实时读 SD——见 s_cleanerPlan
+            // 的注释。所以 free 不会随播放/下载实时变化，够用来确认策略是否合理。
+            if (s_cleanerPlan.sdReadable) {
+                printf("[CLEAN][STATE] free=%lluMB reserve=%lluMB need_clean=%d "
+                       "candidates=%u reclaim=%lluMB user_owned=%u\n",
+                       s_cleanerPlan.freeBytes / (1024 * 1024),
+                       s_cleanerPlan.reserveBytes / (1024 * 1024),
+                       s_cleanerPlan.needsCleaning ? 1 : 0,
+                       s_cleanerPlan.candidateCount,
+                       s_cleanerPlan.reclaimableBytes / (1024 * 1024),
+                       s_cleanerPlan.nonDiscoveryCount);
+            }
         }
 
         if (s_memLogRadioAtSec && s_totalRuntime >= s_memLogRadioAtSec) {

@@ -257,3 +257,84 @@ providerTrackId / reserved），所以索引比原估算大 106KB。余量仍然
 | 退出声卡模式改善为"只需拔插一次" | 同上 §9.6 |
 | 首页「正在播放」重启后进错页面 | `DEV_LOG_2026-09-07_home_nowplaying_route.md` |
 | 本地音乐库 2.0 Phase 0 审计 | `LOCAL_LIBRARY_V2_AUDIT.md` |
+
+---
+
+## 8. Phase 2：Library Cleaner（dry-run）—— 2026-09-03
+
+对应方案 §15/§30。**第一版只做 dry-run，不删除任何文件。**
+
+### 8.1 三条写死的安全规则
+
+```cpp
+bool libraryCleanerIsEvictable(const TrackRecord& r, uint32_t playingLocalId) {
+    if (!(r.flags & kTrackFlagDiscovery)) return false;                 // 1
+    if (r.flags & (kTrackFlagFavorite | kTrackFlagKeep)) return false;  // 2
+    if (playingLocalId && r.localId == playingLocalId) return false;    // 3
+    if (r.flags & kTrackFlagMissing) return false;
+    return true;
+}
+```
+
+**规则 1 是在方案基础上收紧的。** 方案说 Discovery 是"主要淘汰池"，这里改成
+**只有 Discovery 能删**：删掉用户自己拷进 SD 的音乐是不可逆的伤害，
+不值得为几百 MB 冒这个险。
+
+### 8.2 淘汰分数（越高越该删）
+
+| 因素 | 权重 |
+|---|---|
+| 从没播过 | +40 |
+| 播放次数 | −5/次（上限 −30） |
+| 完整播完 | 再 −5/次（上限 −30） |
+| 跳过次数 | +8/次（上限 +40） |
+| 多久没听 | +0.5/天（上限 +30） |
+| 入库多久 | +1/12 天（上限 +15，权重最低） |
+
+权重是初值，**必须靠 dry-run 在真实曲库上看几轮再调** —— 这正是第一版只做
+dry-run 的理由。
+
+⚠️ **RTC 没同步时（`nowEpoch == 0`）整个时间段跳过**，只按播放/跳过次数算。
+用一个错误的"现在"去算天数会让排序完全失去意义。
+
+### 8.3 容量策略
+
+`reserve = max(4GB, 总容量 × 8%)`。**不写死 64GB**（方案 §37 明确禁止，
+换张卡就全错）。
+
+### 8.4 实测（2026-09-03）
+
+```
+[CLEAN][STATE] free=60795MB reserve=4889MB need_clean=0 candidates=0 reclaim=0MB user_owned=54
+```
+
+| 字段 | 值 | 核对 |
+|---|---|---|
+| free | 60795 MB | SD 容量读取正常 |
+| reserve | 4889 MB | = 64GB × 8%，大于 4GB 下限，取大者 ✅ |
+| need_clean | 0 | 空间充裕 |
+| candidates | 0 | 没有 Discovery 曲目，淘汰池为空 |
+| **user_owned** | **54** | **规则 1 生效：用户自己的歌全部被排除** |
+
+`candidates=0` 配 `user_owned=54` 正是安全规则起作用的证据，不是"功能没跑"。
+
+### 8.5 ⚠️ 一个当场发现并修掉的错误：打印了从未被计算的字段
+
+第一版 `libraryCleanerAssess()` **只算容量、不看曲目记录**，但周期打印却输出了
+`candidates` / `reclaim` / `user_owned` 三个字段 —— 打出来的是结构体的默认值 0。
+
+实测第一轮就看到 `user_owned=0`（应为 54）才发现。
+
+**这比不打印更糟**：`candidates=0` 会被下一个人当成"没有候选"这个结论，
+而实际上它根本没被计算过。修法是让 `assess()` 同时统计曲目侧，
+`dryRun()` 复用它的结果而不是各算一遍。
+
+教训：**打印任何字段前先确认它真的被写入过。** 默认值 0 和"算出来是 0"
+在日志里长得一模一样。
+
+### 8.6 Phase 2 剩余
+
+- [ ] 真实删除（等 dry-run 在有 Discovery 曲目的真实场景下看过几轮再开）
+- [ ] 删除时同步维护封面引用（同 album 共享的封面，只有没有其他曲目引用才能删）
+- [ ] 删除后写 `recent_history`，避免 90~180 天内重新下载同一首
+- [ ] 用真实数据校准 §8.2 的权重
