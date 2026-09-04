@@ -39,7 +39,20 @@ struct DownloadStats {
     uint32_t expectedBytes = 0;   // Content-Length；服务器不给就是 0
     uint32_t elapsedMs = 0;
     int      httpCode = 0;
+    // 节流实际生效了多少 —— **必须能测**，否则无从判断这道机制是真在起作用
+    // 还是一行永远走不到的死代码。
+    uint32_t throttleMs = 0;      // 因为音频吃紧而额外让出的时间
+    uint32_t throttleEvents = 0;  // 触发次数
 };
+
+// 音频压力回调：返回解码输入缓冲的水位百分比（0~100）。
+// 没在播放、或拿不到容量时返回 kAudioFillUnknown。
+//
+// 为什么用回调而不是在这里直接读 Audio 对象：下载模块不该依赖播放器实现。
+// 上层注册；不注册就等于永远没有压力，下载全速跑（行为与加节流前一致）。
+constexpr uint8_t kAudioFillUnknown = 0xFF;
+using DownloadAudioFillFn = uint8_t (*)();
+void downloadSetAudioFillFn(DownloadAudioFillFn fn);
 
 const char* downloadResultName(DownloadResult r);
 

@@ -31,6 +31,30 @@ constexpr uint32_t kStallTimeoutMs = 20000;
 // 长得一模一样 —— 这正是这次排查多花一轮的原因。
 constexpr uint32_t kProgressEveryBytes = 512u * 1024;
 
+// —— 自适应节流的阈值 ——
+//
+// 依据是 2026-09-04 的 R6 实测：只播放时水位稳在 99%，边下载时均值掉到 86%，
+// 且 7.1% 的采样掉到 25% 以下（基线是 0%）。没有出现持续饥饿，但那一块余量
+// 是实实在在被吃掉的。Phase 5 每天连下 10 首，累积暴露是单次实验的十几倍，
+// 所以把这个低水位窗口压掉。
+//
+// ⚠️ **绝对水位不能单独作为危险信号。** 第一版按本地播放标定（危险<25%、
+// 偏低<50%），2026-09-04 换电台一测就崩了假设：
+//   - 本地播放稳态水位 99%（从 SD 预读填满）
+//   - 电台稳态水位只有 16~46%（按网络供给即时消费，天生就低）
+// 同一个 25% 的线，对本地是"只在压力下触发"，对电台是"一直触发"——
+// 那一轮 469 次让步里绝大部分是无谓的，电台自始至终 zero=0 没有任何危险。
+//
+// 所以判据改成**低且还在往下掉**：稳定在低位不算危险，正在被抽干才算。
+// 这个判据自适应，不需要针对音源调参。
+// 只有逼近真正饿死（<8%）时才无条件让步，不再要求"还在掉"。
+constexpr uint8_t  kFillCriticalPct = 8;    // 逼近饿死：无条件重让
+constexpr uint8_t  kFillLowPct      = 50;   // 偏低：**且在下降**才轻让
+constexpr uint32_t kBackoffCriticalMs = 20;
+constexpr uint32_t kBackoffLowMs      = 5;
+
+DownloadAudioFillFn s_fillFn = nullptr;
+
 void ensureDir(const char* path) {
     if (!SD_MMC.exists(path)) SD_MMC.mkdir(path);
 }
@@ -41,6 +65,8 @@ const char* baseName(const char* path) {
 }
 
 } // namespace
+
+void downloadSetAudioFillFn(DownloadAudioFillFn fn) { s_fillFn = fn; }
 
 const char* downloadResultName(DownloadResult r) {
     switch (r) {
@@ -141,6 +167,7 @@ DownloadResult downloadToFile(const char* url, const char* finalPath,
     DownloadResult result = DownloadResult::Ok;
     uint32_t lastProgressMs = millis();
     uint32_t nextProgressMark = 0;
+    uint8_t  prevFill = kAudioFillUnknown;   // 上一块时的音频水位，用于判断趋势
 
     // 传输是否"干净地结束了"。区分两种退出方式：
     //   - 服务器主动关闭 / 收满 Content-Length  → cleanEof = true
@@ -194,7 +221,31 @@ DownloadResult downloadToFile(const char* url, const char* finalPath,
                    static_cast<unsigned long>(millis() - startMs));
         }
 
-        // 主动让步，别长时间独占 SD（R6）
+        // —— 自适应节流 ——
+        //
+        // ⚠️ **每块都查，不是每 8 块查一次。** 2KB 一块，实测约 23KB/s，
+        // 8 块才查一次意味着 0.7 秒才看一眼音频水位 —— 缓冲掉得比这快，
+        // 等看到的时候已经晚了。查一次只是一个函数调用，很便宜。
+        uint32_t extraDelayMs = 0;
+        if (s_fillFn) {
+            const uint8_t fill = s_fillFn();
+            if (fill != kAudioFillUnknown) {
+                // 是否正在下降。第一个样本没有前值，按"不在下降"处理。
+                const bool draining = (prevFill != kAudioFillUnknown) && (fill < prevFill);
+                if (fill < kFillCriticalPct)                 extraDelayMs = kBackoffCriticalMs;
+                else if (fill < kFillLowPct && draining)     extraDelayMs = kBackoffLowMs;
+                prevFill = fill;
+            }
+        }
+        if (extraDelayMs) {
+            st.throttleMs += extraDelayMs;
+            ++st.throttleEvents;
+            vTaskDelay(pdMS_TO_TICKS(extraDelayMs));
+            chunkCounter = 0;          // 已经让过了，不必紧接着再让一次
+            continue;
+        }
+
+        // 没有音频压力时的常规让步，别长时间独占 SD（R6）
         if (++chunkCounter >= kYieldEveryChunks) {
             chunkCounter = 0;
             vTaskDelay(1);

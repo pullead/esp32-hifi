@@ -1724,8 +1724,23 @@ static volatile uint32_t s_r6LowCount = 0;         // 水位低于容量 25% 的
 static volatile uint32_t s_r6ConsecZero = 0;       // 当前连续 0 的长度
 static volatile uint32_t s_r6MaxConsecZero = 0;    // 最长的一段连续 0
 static volatile uint32_t s_r6Capacity = 0;         // filled+free，用于算百分比
+// DMA 可用内部 RAM 的最低水位。这是"边播边下会不会因为内存不够而崩"的
+// 直接证据，之前只有一个来路不清的"约 7KB"，且分不清是总量还是最大块。
+// 两个都记：总量说明还剩多少，最大连续块说明还能不能满足一次较大的 DMA 分配。
+static volatile uint32_t s_r6DmaFreeMin = 0xFFFFFFFFu;
+static volatile uint32_t s_r6DmaBlockMin = 0xFFFFFFFFu;
 static volatile bool     s_r6Done = false;
-static char s_r6Result[192] = "";
+static char s_r6Result[320] = "";   // 字段多，短了会被 snprintf 截断
+
+// 供 DownloadManager 做自适应节流。返回解码输入缓冲水位百分比。
+// 没在播放就返回 kAudioFillUnknown —— 此时下载全速跑，没有理由让步。
+static uint8_t audioFillPercentForDownload() {
+    if (!audio.isRunning()) return kAudioFillUnknown;
+    const uint32_t filled = audio.inBufferFilled();
+    const uint32_t cap = filled + audio.inBufferFree();
+    if (!cap) return kAudioFillUnknown;
+    return static_cast<uint8_t>(filled * 100ull / cap);
+}
 
 static void r6StatsReset() {
     s_r6MinFilled = 0xFFFFFFFFu;
@@ -1736,6 +1751,8 @@ static void r6StatsReset() {
     s_r6LowCount = 0;
     s_r6ConsecZero = 0;
     s_r6MaxConsecZero = 0;
+    s_r6DmaFreeMin = 0xFFFFFFFFu;
+    s_r6DmaBlockMin = 0xFFFFFFFFu;
     s_r6Sampling = true;
 }
 
@@ -1743,6 +1760,7 @@ static void r6StatsReset() {
 struct R6Stats {
     uint32_t avg = 0, min = 0, samples = 0;
     uint32_t zeroCount = 0, lowCount = 0, maxConsecZero = 0;
+    uint32_t dmaFreeMin = 0, dmaBlockMin = 0;
 };
 
 static R6Stats r6StatsSnapshot() {
@@ -1753,6 +1771,8 @@ static R6Stats r6StatsSnapshot() {
     r.zeroCount = s_r6ZeroCount;
     r.lowCount = s_r6LowCount;
     r.maxConsecZero = s_r6MaxConsecZero;
+    r.dmaFreeMin = r.samples ? s_r6DmaFreeMin : 0;
+    r.dmaBlockMin = r.samples ? s_r6DmaBlockMin : 0;
     return r;
 }
 
@@ -1817,11 +1837,12 @@ static void jamendoProbeTask(void*) {
                 DownloadStats st{};
                 const DownloadResult r = downloadToFile(tracks[i].audioUrl, finalPath, nullptr, &st);
                 snprintf(s_dlTestResult, sizeof(s_dlTestResult),
-                         "try%u/%u %s %luKB/%luKB %lums http=%d",
+                         "try%u/%u %s %luKB/%luKB %lums http=%d thr=%lux",
                          i + 1, attempts, downloadResultName(r),
                          static_cast<unsigned long>(st.bytesWritten / 1024),
                          static_cast<unsigned long>(st.expectedBytes / 1024),
-                         static_cast<unsigned long>(st.elapsedMs), st.httpCode);
+                         static_cast<unsigned long>(st.elapsedMs), st.httpCode,
+                         static_cast<unsigned long>(st.throttleEvents));
                 printf("[DL][TEST] %s -> %s\n", s_dlTestResult, finalPath);
                 if (r == DownloadResult::Ok) { okIndex = static_cast<int8_t>(i); break; }
             }
@@ -1856,6 +1877,13 @@ static void jamendoProbeTask(void*) {
             if (!audio.isRunning()) {
                 strlcpy(s_r6Result, "skipped: no playback started within 5min", sizeof(s_r6Result));
             } else {
+                // ⚠️ 先等 20 秒再开始测基线。
+                // 上一轮电台实测踩到的坑：起播后缓冲还在往上填，15 秒基线量到
+                // avg=16%，而后面 190 秒的下载窗口量到的是稳态 avg=46%，
+                // 于是出现"下载期间水位反而更高"的假象 —— 那不是下载改善了
+                // 缓冲，是基线取早了。两段必须都在稳态才有可比性。
+                vTaskDelay(pdMS_TO_TICKS(20000));
+
                 // 基线：只播放、不下载，15 秒
                 r6StatsReset();
                 vTaskDelay(pdMS_TO_TICKS(15000));
@@ -1883,20 +1911,31 @@ static void jamendoProbeTask(void*) {
                 const bool trustworthy = (base.samples >= 100 && dl.samples >= 100);
                 const uint32_t cap = s_r6Capacity ? s_r6Capacity : 1;
                 snprintf(s_r6Result, sizeof(s_r6Result),
-                         "%s cap=%luKB base(avg=%lu%% zero=%lu low=%lu n=%lu) "
-                         "dl(avg=%lu%% zero=%lu low=%lu maxrun=%lu n=%lu) %lums%s",
+                         "%s cap=%luKB base(avg=%lu%% min=%lu%% zero=%lu low=%lu n=%lu) "
+                         "dl(avg=%lu%% min=%lu%% zero=%lu low=%lu maxrun=%lu n=%lu) "
+                         "dma_base=%luB/%luB dma_dl=%luB/%luB %lums thr=%lux/%lums%s",
                          downloadResultName(r),
                          static_cast<unsigned long>(cap / 1024),
                          static_cast<unsigned long>(base.avg * 100ull / cap),
+                         static_cast<unsigned long>(base.min * 100ull / cap),
                          static_cast<unsigned long>(base.zeroCount),
                          static_cast<unsigned long>(base.lowCount),
                          static_cast<unsigned long>(base.samples),
                          static_cast<unsigned long>(dl.avg * 100ull / cap),
+                         static_cast<unsigned long>(dl.min * 100ull / cap),
                          static_cast<unsigned long>(dl.zeroCount),
                          static_cast<unsigned long>(dl.lowCount),
                          static_cast<unsigned long>(dl.maxConsecZero),
                          static_cast<unsigned long>(dl.samples),
+                         // 基线也要打 —— 只打下载期的话，分不出"系统本来就这么紧"
+                         // 和"下载吃掉了一大块"，而这两者对应完全相反的处置。
+                         static_cast<unsigned long>(base.dmaFreeMin),
+                         static_cast<unsigned long>(base.dmaBlockMin),
+                         static_cast<unsigned long>(dl.dmaFreeMin),
+                         static_cast<unsigned long>(dl.dmaBlockMin),
                          static_cast<unsigned long>(st.elapsedMs),
+                         static_cast<unsigned long>(st.throttleEvents),
+                         static_cast<unsigned long>(st.throttleMs),
                          trustworthy ? "" : " [样本不足,结论不可信]");
                 printf("[R6][TEST] %s\n", s_r6Result);
             }
@@ -5732,6 +5771,7 @@ static void onWifiNetworkReady() {
     if (xTaskCreatePinnedToCore(weatherTask, "weather", 10240, nullptr, 1, nullptr, 0) != pdPASS) MWR_LOG_ERROR("Failed to create weather task");
     // Phase 3 验收：联网后拉一次真实候选。**只发现，不下载任何文件。**
     if (s_jamendo.available() && !s_jamendoProbeDone) {
+        downloadSetAudioFillFn(audioFillPercentForDownload);   // 自适应节流
         if (xTaskCreatePinnedToCore(jamendoProbeTask, "jamendoProbe", 10240, nullptr, 1, nullptr, 0) != pdPASS)
             MWR_LOG_ERROR("Failed to create jamendo probe task");
     }
@@ -6137,6 +6177,11 @@ static void loopLvglRuntime() {
                 s_r6ConsecZero = 0;
             }
             if (s_r6Capacity && filled < s_r6Capacity / 4) ++s_r6LowCount;
+
+            const uint32_t dmaFree = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+            const uint32_t dmaBlock = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+            if (dmaFree < s_r6DmaFreeMin) s_r6DmaFreeMin = dmaFree;
+            if (dmaBlock < s_r6DmaBlockMin) s_r6DmaBlockMin = dmaBlock;
         }
     }
 
