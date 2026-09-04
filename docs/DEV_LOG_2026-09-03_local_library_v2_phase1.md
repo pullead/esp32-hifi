@@ -1,7 +1,8 @@
 # Dev Log — 2026-09-03：本地音乐库 2.0 Phase 1（索引与持久化）
 
-> **状态：核心功能已在硬件上验证通过。** 索引建立、持久化、重启后读回都实测确认。
-> 播放事件记录（play_history）尚未实现，见 §6。
+> **状态：Phase 1 核心链路已全部在硬件上验证通过。**
+> 索引建立 → 持久化 → 播放事件写入 → 跨重启保留，四环闭合。
+> 剩余项（favorite UI 触发、missing 场景、启动耗时）见 §6。
 >
 > 分支：`codex/local-library-v2-20260903`
 > 上游：`codex/usb-dac-no-sound-fix-20260906`
@@ -173,7 +174,9 @@ esptool 触发复位后立刻开口、显式拉 DTR/RTS）——大多数时候�
 | missing 标记 | ✅ 逻辑就位（`missing=0`，尚未构造删歌场景验证） |
 | 分配失败退让路径 | ⬜ 未触发过 |
 | USB MSC 删歌后标 missing | ⬜ 未构造场景验证 |
-| 播放事件写入 | ❌ **还没做**（§6） |
+| **播放事件写入** | ✅ **实测** `played` 0 → 2 |
+| **事件跨重启保留** | ✅ **实测** 重启后仍为 2（走的是 events.log 回放） |
+| favorite / keep API | 🟡 已实现，**无 UI 可触发**，未验证 |
 
 ### 5.0 实测数据（2026-09-03）
 
@@ -199,6 +202,27 @@ providerTrackId / reserved），所以索引比原估算大 106KB。余量仍然
 ⚠️ 观察到 `psram_free` 在 1057~1862 KB 之间波动，说明有大块 PSRAM 在被反复
 申请释放（大概率是封面解码）。目前不构成问题，但 Phase 4 加下载缓冲时要留意。
 
+### 5.0b 播放事件实测（2026-09-03）
+
+播一首本地音乐（播完后自动续播了下一首）：
+
+```
+播放前： played=0
+播放后： played=2
+重启后： played=2      <- 关键
+```
+
+**"重启后仍是 2"证明的是追加日志的回放路径**，不是内存状态：
+
+1. 上次扫描存盘时索引里写的是 `played=0`，同时 `events.log` 被清空（compact）
+2. 播放产生的 2 条事件追加进 `events.log`
+3. 重启时 `libraryStoreLoad()` 先读索引（`played=0`），再回放 `events.log` → 变成 2
+
+如果回放没生效，重启后会掉回 0。所以这一个数同时验证了写入和回放两侧。
+
+⚠️ 注意 `evt_eof` **对网络电台也会触发**。这里没有误记，是因为
+`s_playingLocalId` 只在 `playerCorePlaySdFile()` 里被设置，电台播放时它是 0。
+
 ### 5.1 验证方法（已跑通，留作后续参考）
 
 关键在于**周期性打印**而不是抓开机日志：`[LIB][STATE]` 每 10 秒一行，
@@ -213,10 +237,11 @@ providerTrackId / reserved），所以索引比原估算大 106KB。余量仍然
 
 ## 6. Phase 1 剩余项
 
-- [ ] `play_history`：挂播放开始（`playerCorePlaySdFile`）、完成（`s_eofCount`）、
-      跳过（transport next/prev），写 `events.log`
-- [ ] 查询接口：`all` / `favorites` / `recent` / `discovery`
-- [ ] `favorite` / `keep` 的读写 API（UI 留到 Phase 6）
+- [x] ~~`play_history`：挂播放开始 / 完成 / 跳过，写 `events.log`~~ ✅ 已实测
+- [x] ~~查询接口~~ `playerCoreLibraryCount(kind)` / `playerCoreLibraryIndexOf(kind, nth)`，
+      kind: 0=全部 1=收藏 2=最近播放 3=自动发现 4=可播放（非 missing）
+- [x] ~~`favorite` / `keep` 读写 API~~ 已实现，但**没有 UI 能触发，因此未验证**
+      （UI 按计划留到 Phase 6）
 - [ ] 实测 300 / 1000 / 2000 三档的启动耗时（本机 SD 只有 54 首，
       2000 首只能靠 `per_track` 外推）
 - [ ] `[MUSIC][PERF]` 那行的实测数据（同样因为抓不到日志，一直没拿到）

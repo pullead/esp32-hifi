@@ -1375,16 +1375,34 @@ bool playerCorePlayRadioStation(uint16_t index) { return playerCorePlayStationNu
 // that original position was after this function, which doesn't compile.
 static volatile UsbStorageState s_usbStorageState = MWR_USB_MSC_SUPPORTED ? UsbStorageState::Idle : UsbStorageState::Unsupported;
 
+// —— 播放事件记录（Phase 1）的状态与前置声明 ——
+//
+// 变量定义在这里、函数实现在下面靠近曲库那批静态变量的地方（实现要用到
+// s_localTracks，那个还没声明）。playerCorePlaySdFile() 就在下面几行，
+// 所以两者都得先声明。
+static uint32_t s_playingLocalId = 0;    // 当前正在播放的本地曲目；0 = 没有
+static bool     s_playCompleted = false; // 当前这首是否已播到结尾
+static void libraryLogEvent(uint32_t localId, uint8_t type);
+static void libraryFinishCurrentTrack();
+
 bool playerCorePlaySdFile(const char* path, uint32_t positionSeconds) {
     if (s_usbStorageState != UsbStorageState::Idle) return false;
     if (!path || !path[0]) return false;
+    // 换歌前先结算上一首：没播完就算跳过。
+    libraryFinishCurrentTrack();
     connecttoFS("SD_MMC", path, positionSeconds);
-    if (s_f_isFSConnected) s_memLogLocalAtSec = s_totalRuntime + 5; // see loopLvglRuntime()'s s_f_1sec block
+    if (s_f_isFSConnected) {
+        s_memLogLocalAtSec = s_totalRuntime + 5; // see loopLvglRuntime()'s s_f_1sec block
+        s_playingLocalId = libraryHashPath(path);
+        s_playCompleted = false;
+        libraryLogEvent(s_playingLocalId, kEventPlayStarted);
+    }
     return s_f_isFSConnected;
 }
 
 void playerCoreStop() {
     rememberCurrentLocalPlayback(true);
+    libraryFinishCurrentTrack();
     stopSong();
 }
 
@@ -1640,6 +1658,35 @@ static uint8_t* s_scanSeenBits = nullptr;   // 大小见 libraryStoreSeenBytes()
 // 这是区分"索引真的持久化了"和"每次开机都重扫一遍"的唯一判据——两种情况下
 // 最终的 tracks 数量是一样的，光看总数分不出来。
 static uint16_t s_libLoadedAtBoot = 0;
+
+// —— 播放事件记录（Phase 1）——
+//
+// 放在 main.cpp 而不是审计 §8 建议的 src/library/play_history.cpp：这几个函数
+// 本质上只是 libraryStoreAppendEvent() 的薄包装，而它们需要的状态
+//（当前在放哪首、放到哪了）全都在 main.cpp 里。独立成模块反而要把这些状态
+// 反向暴露出去，得不偿失。真正的存储逻辑仍然在 library_store 里。
+// 记录一条事件：既写盘（追加，不重写索引）也立刻更新内存，两边始终一致。
+static void libraryLogEvent(uint32_t localId, uint8_t type) {
+    if (!localId) return;
+    // RTC 没同步时传 0：libraryStoreApplyEvent() 会只累加计数、不写时间戳，
+    // 避免把 1970 年写进 lastPlayedAt 让淘汰算法判反（见 library_store.cpp）。
+    const uint32_t ts = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
+    libraryStoreAppendEvent(localId, type, ts);
+    if (s_localTracks) {
+        LibraryEvent e{};
+        e.localId = localId;
+        e.timestamp = ts;
+        e.type = type;
+        libraryStoreApplyEvent(s_localTracks, s_localTrackCount, e);
+    }
+}
+
+// 上一首还没播完就换歌 / 停止 —— 记为跳过。
+static void libraryFinishCurrentTrack() {
+    if (s_playingLocalId && !s_playCompleted) libraryLogEvent(s_playingLocalId, kEventSkipped);
+    s_playingLocalId = 0;
+    s_playCompleted = false;
+}
 static uint32_t s_scanNowEpoch = 0;
 // s_usbStorageState itself is declared earlier now (see playerCorePlaySdFile()'s comment) -- the rest of the USB-storage statics stay here.
 static volatile bool s_usbStorageBusy = false;
@@ -2330,6 +2377,78 @@ static bool startLocalMusicScan() {
         return false;
     }
     return true;
+}
+
+// —— 曲库查询与状态 API（Phase 1）——
+//
+// 只按下标暴露，不返回指针：s_localTracks 在重扫时会被 free/realloc，
+// 把内部指针交出去迟早会用到已释放的内存。
+
+// 用下标读一条完整记录（含 2.0 的统计字段）。UI 侧的 LocalTrackItem 版本
+// 见 playerCoreLocalTrack()。
+bool playerCoreLocalTrackRecord(uint16_t index, TrackRecord* out) {
+    if (!s_localTracks || index >= s_localTrackCount || !out) return false;
+    *out = s_localTracks[index];
+    return true;
+}
+
+// 按类别统计条数。UI 做"今日新歌 / 收藏 / 全部"筛选时先拿总数再逐条取。
+// kind: 0=全部（含 missing）1=收藏 2=最近播放过 3=自动发现下载 4=可播放（非 missing）
+uint16_t playerCoreLibraryCount(uint8_t kind) {
+    if (!s_localTracks) return 0;
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < s_localTrackCount; ++i) {
+        const TrackRecord& r = s_localTracks[i];
+        switch (kind) {
+            case 1: if (r.flags & kTrackFlagFavorite) ++n; break;
+            case 2: if (r.playCount) ++n; break;
+            case 3: if (r.flags & kTrackFlagDiscovery) ++n; break;
+            case 4: if (!(r.flags & kTrackFlagMissing)) ++n; break;
+            default: ++n; break;
+        }
+    }
+    return n;
+}
+
+// 取某一类里的第 n 条，返回它在主数组中的下标；越界返回 -1。
+int32_t playerCoreLibraryIndexOf(uint8_t kind, uint16_t nth) {
+    if (!s_localTracks) return -1;
+    uint16_t n = 0;
+    for (uint16_t i = 0; i < s_localTrackCount; ++i) {
+        const TrackRecord& r = s_localTracks[i];
+        bool match = false;
+        switch (kind) {
+            case 1: match = r.flags & kTrackFlagFavorite; break;
+            case 2: match = r.playCount != 0; break;
+            case 3: match = r.flags & kTrackFlagDiscovery; break;
+            case 4: match = !(r.flags & kTrackFlagMissing); break;
+            default: match = true; break;
+        }
+        if (match && n++ == nth) return static_cast<int32_t>(i);
+    }
+    return -1;
+}
+
+bool playerCoreTrackFavorite(uint16_t index) {
+    return s_localTracks && index < s_localTrackCount && (s_localTracks[index].flags & kTrackFlagFavorite);
+}
+
+bool playerCoreTrackKeep(uint16_t index) {
+    return s_localTracks && index < s_localTrackCount && (s_localTracks[index].flags & kTrackFlagKeep);
+}
+
+// 设置收藏 / 保留。走事件日志而不是直接改内存 + 全量存盘：
+// 800KB 的索引为了翻一个 bit 全量重写既慢又磨损 SD（见 library_store.h）。
+void playerCoreSetTrackFavorite(uint16_t index, bool on) {
+    if (!s_localTracks || index >= s_localTrackCount) return;
+    if (playerCoreTrackFavorite(index) == on) return;
+    libraryLogEvent(s_localTracks[index].localId, on ? kEventFavoriteOn : kEventFavoriteOff);
+}
+
+void playerCoreSetTrackKeep(uint16_t index, bool on) {
+    if (!s_localTracks || index >= s_localTrackCount) return;
+    if (playerCoreTrackKeep(index) == on) return;
+    libraryLogEvent(s_localTracks[index].localId, on ? kEventKeepOn : kEventKeepOff);
 }
 
 bool playerCoreLocalLibraryScanning() { return s_localLibraryScanning; }
@@ -7438,6 +7557,14 @@ void my_audio_info(Audio::msg_t m) {
         case Audio::evt_eof:
             playerService.onEndOfFile();
             ++s_eofCount; // see PlayerSnapshot::eofCount
+            // 播到结尾 = 完整播放。先记完成、再清状态，否则下面的
+            // libraryFinishCurrentTrack() 会把它误判成跳过。
+            // 注意 evt_eof 对网络电台也会触发，但那时 s_playingLocalId 是 0
+            //（只有 playerCorePlaySdFile 会设它），所以不会误记。
+            if (s_playingLocalId) {
+                libraryLogEvent(s_playingLocalId, kEventPlayCompleted);
+                s_playCompleted = true;
+            }
             s_f_isWebConnected = false;
             s_f_eof = true;
             s_f_isFSConnected = false;
