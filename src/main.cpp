@@ -39,6 +39,7 @@
 #include "library/library_cleaner.h"  // 空间评估与淘汰（第一版只做 dry-run）
 #include "discovery/jamendo_provider.h"  // Phase 3：候选发现（不下载）
 #include "discovery/download_manager.h"  // Phase 4：流式下载 .part + rename
+#include "discovery/daily_sync.h"        // Phase 5：每日发现同步
 #define MWR_USB_DAC_SUPPORTED 1
 #else
 #define MWR_USB_DAC_SUPPORTED 0
@@ -1776,6 +1777,75 @@ static R6Stats r6StatsSnapshot() {
     return r;
 }
 
+// —— Phase 5：每日发现同步 ——
+//
+// 状态存 NVS。daily_sync 模块本身不碰 NVS —— pref 的加锁在本文件里，
+// 让下层模块去拿这个锁会把分层搞乱，所以状态通过结构体进出。
+static constexpr const char* kSyncDayPrefKey = "sync_day";
+static constexpr const char* kSyncOffPrefKey = "sync_off";   // 四个 offset 打包成一个 u64
+
+// 每轮下载几首。见 dailySyncTask 里的说明。
+constexpr uint8_t kDailySyncTracksPerDay = 3;
+
+static DailySyncState s_syncState;
+static DailySyncStats s_syncStats;
+static volatile bool s_syncRunning = false;
+static volatile bool s_syncDone = false;
+
+static void dailySyncLoadState() {
+    if (!lockPreferences()) return;
+    s_syncState.lastRunDay = pref.getUInt(kSyncDayPrefKey, 0);
+    const uint64_t packed = pref.getULong64(kSyncOffPrefKey, 0);
+    s_syncState.offsetZh  = static_cast<uint16_t>(packed & 0xFFFF);
+    s_syncState.offsetJa  = static_cast<uint16_t>((packed >> 16) & 0xFFFF);
+    s_syncState.offsetEn  = static_cast<uint16_t>((packed >> 32) & 0xFFFF);
+    s_syncState.offsetAny = static_cast<uint16_t>((packed >> 48) & 0xFFFF);
+    unlockPreferences();
+}
+
+static void dailySyncSaveState() {
+    if (!lockPreferences()) return;
+    pref.putUInt(kSyncDayPrefKey, s_syncState.lastRunDay);
+    const uint64_t packed = static_cast<uint64_t>(s_syncState.offsetZh)
+                          | (static_cast<uint64_t>(s_syncState.offsetJa) << 16)
+                          | (static_cast<uint64_t>(s_syncState.offsetEn) << 32)
+                          | (static_cast<uint64_t>(s_syncState.offsetAny) << 48);
+    pref.putULong64(kSyncOffPrefKey, packed);
+    unlockPreferences();
+}
+
+// 一轮同步要跑几十分钟（实测单首 150~210 秒 × 10 首）。
+// 必须独立任务：放主循环会把 UI 卡死几十分钟。
+static void dailySyncTask(void*) {
+    s_syncRunning = true;
+    const uint32_t nowEpoch = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
+
+    DailySyncConfig cfg;
+    // ⚠️ **首轮端到端验证用的值，验证通过后改回 10。**
+    // 实测单首下载 150~210 秒，10 首要跑 30 分钟以上；验证"闭环通不通"
+    // 不需要等那么久，3 首就足够覆盖 拉候选→去重→空间检查→下载→并入索引
+    // →存盘 的每一步。
+    cfg.tracksPerDay = kDailySyncTracksPerDay;
+    dailySyncRun(s_jamendo, s_localTracks, &s_localTrackCount, kMaxLocalTracks,
+                 nowEpoch, 0, cfg, &s_syncState, &s_syncStats);
+
+    dailySyncSaveState();
+
+    // 索引存盘放在整轮结束后**一次性**做，不是每下一首存一次：
+    // 2000 条 × 384B ≈ 750KB，每首存一次会把这次同步变成 10 次大写盘。
+    if (s_syncStats.indexDirty) {
+        if (libraryStoreSave(s_localTracks, s_localTrackCount)) {
+            printf("[SYNC] index saved (%u tracks)\n", s_localTrackCount);
+        } else {
+            printf("[SYNC] index save FAILED\n");
+        }
+    }
+
+    s_syncRunning = false;
+    s_syncDone = true;
+    vTaskDelete(nullptr);
+}
+
 // 联网后拉一次真实候选，确认整条链路（HTTPS → JSON → RemoteTrack）通。
 //
 // 单开任务而不是在 loop 里做：HTTPS 握手会阻塞几百毫秒到几秒，放主循环会卡 UI。
@@ -2742,6 +2812,9 @@ static void localMusicScanTask(void*) {
         }
         if (id.isEmpty()) id = JAMENDO_CLIENT_ID;
         s_jamendo.setClientId(id.c_str());
+        // ⚠️ 必须在这里把同步状态读回来。不读的话 lastRunDay 恒为 0，
+        // **每次重启都会被当成"今天还没同步过"**，反复下载。
+        dailySyncLoadState();
     }
     if (nowMissing) printf("[LIB] %u track(s) newly marked missing\n", nowMissing);
     printf("[LIB][PERF] load=%lums\n", static_cast<unsigned long>(loadMs));
@@ -6222,6 +6295,36 @@ static void loopLvglRuntime() {
                    s_jamendoProbeDone ? 1 : 0, s_jamendoProbeCount, s_jamendoProbeErr);
             if (s_dlTestDone) printf("[DL][STATE] %s\n", s_dlTestResult);
             if (s_r6Done) printf("[R6][STATE] %s\n", s_r6Result);
+
+            // —— Phase 5 触发 ——
+            // 条件：联网、provider 可用、RTC 已同步（dailySyncDue 内部判）、
+            // 今天没跑过、当前没在跑。探测任务跑完再启动，避免两个任务
+            // 同时抢 TLS 握手所需的内部 RAM。
+            if (s_lvglNetworkReady && s_jamendo.available() && s_jamendoProbeDone &&
+                !s_syncRunning && !s_syncDone &&
+                dailySyncDue(s_syncState, s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0)) {
+                if (xTaskCreatePinnedToCore(dailySyncTask, "dailySync", 10240, nullptr, 1, nullptr, 0) == pdPASS) {
+                    s_syncRunning = true;   // 立刻置位，别等任务调度起来才置，否则会重复创建
+                    printf("[SYNC][STATE] started\n");
+                } else {
+                    MWR_LOG_ERROR("Failed to create daily sync task");
+                }
+            }
+            if (s_syncRunning) {
+                printf("[SYNC][STATE] running got=%u attempts=%u owned=%u failed=%u\n",
+                       s_syncStats.downloaded, s_syncStats.attempts,
+                       s_syncStats.skippedOwned, s_syncStats.failedDownload);
+            } else if (s_syncDone) {
+                printf("[SYNC][STATE] done got=%u/%u attempts=%u owned=%u failed=%u "
+                       "empty=%u nospace=%d %luKB %lums err=\"%s\"\n",
+                       s_syncStats.downloaded, kDailySyncTracksPerDay,
+                       s_syncStats.attempts, s_syncStats.skippedOwned,
+                       s_syncStats.failedDownload, s_syncStats.emptyFetches,
+                       s_syncStats.stoppedNoSpace ? 1 : 0,
+                       static_cast<unsigned long>(s_syncStats.bytes / 1024),
+                       static_cast<unsigned long>(s_syncStats.elapsedMs),
+                       s_syncStats.lastError);
+            }
             else if (s_r6Sampling) printf("[R6][STATE] sampling n=%lu min=%lu\n",
                                           static_cast<unsigned long>(s_r6Samples),
                                           static_cast<unsigned long>(s_r6Samples ? s_r6MinFilled : 0));
