@@ -98,7 +98,12 @@ struct LibraryEvent {
 // 文件头
 // ---------------------------------------------------------------------------
 constexpr uint32_t kLibraryMagic = 0x4257524Cu;  // 'LRWB'
-constexpr uint16_t kLibraryFormatVersion = 1;
+// v2（2026-09-05）：libraryHashPath 改为不区分大小写，所有 localId 都变了。
+// 必须升版本 —— 否则旧索引里那些按旧哈希算的 id 会和新算法算出的对不上，
+// 表现为"全部曲目都 missing 且全部重新导入"，而且**现有的重复记录会留在里面**。
+// 升版本让加载器整个重建，顺带把重复清掉。代价是播放统计清零（当时 fav=0、
+// played=13，可接受）。
+constexpr uint16_t kLibraryFormatVersion = 2;
 
 struct LibraryFileHeader {
     uint32_t magic = kLibraryMagic;
@@ -110,11 +115,24 @@ struct LibraryFileHeader {
 
 // FNV-1a 32 位。用它从路径算稳定 id：同一个文件在多次重启之间 id 不变，
 // 而重命名会得到新 id（第一版接受这个行为——改名等同于换了一首歌）。
+//
+// ⚠️ **必须不区分大小写。** 2026-09-05 实测踩到：
+//   daily_sync 按 "/music/tracks/..." 写入并入库
+//   扫描器的 entry.path() 返回 "/Music/tracks/..."（磁盘上真实是大写 M）
+// FAT 查找时不区分大小写，所以下载和播放都正常；但两个字符串的哈希不同，
+// 于是**同一个文件在索引里存了两份**：一份被判 missing，另一份被当新曲追加。
+// 后者 provider=local 且没有 Discovery 标记 —— Cleaner 会当成用户自己的歌
+// 永不淘汰，整个曲库轮换的前提就废了。
+//
+// 修的是哈希而不是"把 /music 改成 /Music"：后者只是把硬编码换个方向，
+// 换张卡或换个写法就复发。
 inline uint32_t libraryHashPath(const char* path) {
     uint32_t h = 2166136261u;
     if (!path) return h;
     for (const char* p = path; *p; ++p) {
-        h ^= static_cast<uint8_t>(*p);
+        uint8_t c = static_cast<uint8_t>(*p);
+        if (c >= 'A' && c <= 'Z') c = static_cast<uint8_t>(c - 'A' + 'a');
+        h ^= c;
         h *= 16777619u;
     }
     return h;

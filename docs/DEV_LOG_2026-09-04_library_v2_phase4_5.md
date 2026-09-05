@@ -446,3 +446,147 @@ WiFi 接收路径需要 DMA 可用的内部 RAM —— 而这正是**电台依�
 - 🟡 DMA 最大连续块在下载时低到 160B。有了让路策略后不会和电台重叠，
   但**下载本身仍会把余量压到这么低**。§4.3 曾建议不动 LVGL 那 20KB 刷新缓冲
   （理由"薄但稳定"），有了 160B 这个数，该建议值得重新评估 —— 但不急。
+
+
+---
+
+## 11. 2026-09-05（续）：Phase 5 端到端跑通 + 三个根因
+
+### 11.1 `rtc=0` —— `hasValidTime()` 恒为 false
+
+`RTIME::hasValidTime()` 读的是**成员** `timeinfo.tm_year`，而本工程每秒调用的
+`RTIME::gettime_s()` 内部把 `now` / `timeinfo` 声明成了**局部变量**，遮蔽了同名成员：
+
+```cpp
+const char* RTIME::gettime_s(){
+    time_t now;            // ← 局部，遮蔽成员
+    struct tm timeinfo;    // ← 局部，遮蔽成员
+```
+
+于是成员 `timeinfo` 永远停在构造时的全零 ⇒ `hasValidTime()` **恒 false**。
+
+影响远不止同步：
+
+| 位置 | 后果 |
+|---|---|
+| `dailySyncDue()` | 恒 false ⇒ **生产状态下每日同步一次都不会跑** |
+| 播放事件时间戳 | 恒 0 ⇒ `lastPlayedAt` 永远不写 |
+| 扫描时间戳 | 恒 0 ⇒ 所有 `importedAt` 都是 0 |
+| 闹钟 | 条件带 `&& s_f_rtc` |
+
+后两条会让 Cleaner 的淘汰评分（按"多久没听""何时导入"）完全退化。
+
+**修法**：改用仓库里早就为时钟显示采用过的判据 —— 直接看真实 epoch
+（`time(nullptr) > 1700000000`）。当时那次只修了显示，没修 `s_f_rtc`。
+验证：`rtc=1 epoch=1788570134 day=20701 due=1`。
+
+⚠️ **排查中我先否定了代码里已有的那条注释**（"RTIME 缓存不刷新"），理由是
+"`gettime_s()` 每秒都在调用"。**那个反驳是错的** —— 我确认了"有 getter 被调用"，
+却没确认"那个 getter 会不会更新成员"。注释是对的，我查错了层次。
+
+### 11.2 测试脚手架挡住了主功能（同一类问题的第二个实例）
+
+`probe_done` 要等 `jamendoProbeTask` 整个跑完才置位，而任务末尾挂着：
+- R6 实验（§2）—— 已在上一轮关闭
+- **Phase 4 下载自测 —— 上一轮漏了**，它每次开机下一首 3.4MB（约 100 秒），
+  实测把每日同步的启动推迟了 2 分钟，且同样直接调 `downloadToFile`
+  绕过电台让路策略
+
+两个都加了常量开关关闭（`kRunR6Experiment` / `kRunDownloadSelfTest`）。
+
+**教训**：脚手架"跑完就忘"是不够的 —— 它会以"拖慢启动"和"绕过新策略"两种
+方式继续起作用。功能验证完就该关掉，而不是留着。
+
+### 11.3 索引重复 + 假 missing —— 路径大小写
+
+现象：重启后 `tracks=62 loaded_at_boot=59 missing=3`，同一首歌存了两份。
+
+诊断打印出两份记录的路径，一眼看清：
+
+```
+MISSING path="/music/tracks/jamendo_1932670.mp3" id=3746452960 prov=1 flags=0x0C
+present path="/Music/tracks/jamendo_1932670.mp3" id=1692487488 prov=0 flags=0x00
+```
+
+`daily_sync` 硬编码写 `/music`（小写），而 SD 上目录真名是 **`/Music`**。
+FAT **查找不区分大小写**，所以下载和播放都正常；但 `entry.path()` 返回磁盘上
+真实的大小写，两个字符串的 FNV-1a 哈希不同 ⇒ `localId` 不同 ⇒
+一份判 missing、一份当新曲追加。
+
+**后果比"多 3 条"严重**：扫描新增的那份 `provider=local` 且**没有 Discovery
+标记**，Cleaner 会当成用户自己的歌**永不淘汰** —— 整个曲库轮换的前提就废了。
+
+**修法**：让 `libraryHashPath()` **不区分大小写**，并把
+`kLibraryFormatVersion` 升到 2 强制重建索引（清掉已有的重复）。
+
+不改成"把 `/music` 写成 `/Music`"：那只是把硬编码换个方向，换张卡或换个写法
+就复发。
+
+验证：`tracks=59 loaded_at_boot=0 missing=0`（62 − 3 重复 = 59）。
+代价：播放统计清零（当时 fav=0、played=13，可接受）；
+那 3 首已入库的曲目失去 Discovery 标记（今后新下载的不受影响 —— 扫描时
+哈希能对上，upsert 会保留 flags）。
+
+### 11.4 Phase 5 端到端验证通过
+
+```
+[SYNC] en try#1 ok 4547KB 160212ms thr=0x rate=0ms net=0 "RED LIGHT"
+[SYNC] en try#2 ok 4989KB 159640ms thr=0x rate=0ms net=0 "Julius Marx - Vices"
+[SYNC] en try#3 ok 6536KB 221138ms thr=0x rate=0ms net=0 "Skydiving (feat. Jasmine Kara)"
+[SYNC] done: got=3/3 attempts=3 owned=0 failed=0 empty=0 nospace=0 deferred=0
+       16073KB 548325ms
+[SYNC] index saved (59 tracks)
+```
+
+每日闸门 + NVS 持久化也验证了：重启后 `day=20701 last=20701 due=0 force=0`，
+今天不再重跑。
+
+⚠️ **语言配额路径当时没被走到**：`tracksPerDay=3` 时
+`quotaZh = 3*3/10 = 0`、`quotaJa = 0`、`quotaEn = 3`，中日两档配额为 0，
+循环直接跳过。改回 10 首后才会走（中3/日3/英4），**尚未验证**。
+
+### 11.5 Jamendo 内容假设的修正
+
+PC 侧直接验证（不浪费烧录）：
+
+```
+不带 lang 连打 6 次: 3,3,3,0,3,3
+lang=ja  连打 3 次:  0,0,3
+lang=zh  连打 3 次:  3,3,0
+```
+
+**① 间歇性空返回是全 API 范围的**，约 15~30% 的请求返回
+`results_count=0`、`status=success`、无警告，**与参数无关**。
+去掉 `audiodownload_allowed`（§1.1①）只是减轻，没有根除。
+现有的重试（3 次、间隔 5 秒）正好对症 —— 连续 3 次都空约 2.7%。
+**这是碰巧设计对了，不是预见到了这个分布。**
+
+**② 原先记的"中日可下载曲目非常少"不准确。** `lang` 是合法参数且能返回结果，
+真正的问题是**过滤很松**：
+
+```
+lang=zh 的 6 条里只有 1 条真是中文（"凌晨三点的便利店 - 小风啊哈"），
+其余是 "Inna - ProleteR"、"Ženci - Prorock"、"comics troling 2"……
+```
+
+结果上接近"中日歌很少"，但机制完全不同 —— 不是拿不到，是拿到的名不副实。
+中3/日3 这两档会下进一堆被标成中日、实际不是的曲目。
+
+⚠️ 我第一次只打了一发就下结论（`lang=zh` → 0 条 ⇒ "果然没有中文歌"），
+**又是 n=1 当结论**，和 §2.3 同一个错误。连打几次才看清是间歇性空返回。
+
+### 11.6 本轮最终状态
+
+| 项 | 状态 |
+|---|---|
+| Phase 5 端到端（3 首） | ✅ 跑通，索引存盘，曲目数 +3 |
+| 每日闸门 + NVS 持久化 | ✅ 重启后 `due=0` 不重跑 |
+| 电台让路策略 | ✅ 200 秒 `attempts` 冻结 |
+| 6KB/s 限速 | ✅ 实测 6.0KB/s |
+| `rtc=0` | ✅ 已修 |
+| 索引重复 / 假 missing | ✅ 已修（哈希不区分大小写 + 版本升 2） |
+| 生产配置 | ✅ `force=false`、`tracksPerDay=10` |
+| **语言配额 + 回填路径** | ⚠️ **未验证**（3 首时配额为 0，走不到） |
+| 停滞超时触发路径 | ⚠️ 仍未实测触发过 |
+| Cleaner 真实删除 | ⬜ 未做 |
+| macOS/Android 声音连续性、iPhone 音量、96k/24bit | ⚠️ 未验证 |

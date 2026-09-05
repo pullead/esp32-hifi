@@ -144,6 +144,29 @@ ps_ptr<char> s_timeSpeechLang = "en";
 ps_ptr<char> s_lyrics = "";
 
 bool s_f_rtc = false; // true if time from ntp is received
+
+// ⚠️ **不要用 rtc.hasValidTime() 来判断时间是否已同步 —— 它恒为 false。**
+//
+// RTIME::hasValidTime() 读的是**成员** timeinfo 的 tm_year，而本工程每秒调用的
+// RTIME::gettime_s() 内部把 now / timeinfo 声明成了**局部变量**，遮蔽了同名成员：
+//
+//     const char* RTIME::gettime_s(){
+//         time_t now;            // ← 局部，遮蔽成员
+//         struct tm timeinfo;    // ← 局部，遮蔽成员
+//
+// 于是成员 timeinfo 永远停在构造时的全零，tm_year = 0 < (2016-1900)，
+// hasValidTime() 恒返回 false。
+//
+// 2026-09-05 实测后果（s_f_rtc 恒 false）：
+//   - dailySyncDue() 恒 false → **每日同步一次都不会跑**
+//   - 播放事件时间戳恒 0 → lastPlayedAt 永远不写
+//   - 扫描时间戳恒 0 → 所有 importedAt 都是 0
+//   后两条会让 Cleaner 的淘汰评分（按"多久没听""何时导入"）完全退化。
+//
+// 直接看真实 epoch：早于 ~2023 就是 SNTP 还没同步。
+// UI 时钟那条路径早就这么绕过了（见 buildPlayerSnapshot），
+// 但当时只修了显示，没修 s_f_rtc。
+static inline bool systemTimeSynced() { return time(nullptr) > 1700000000; }
 bool s_f_100ms = false;
 bool s_f_1sec = false;
 bool s_f_10sec = false;
@@ -1791,13 +1814,14 @@ static constexpr const char* kSyncDayPrefKey = "sync_day";
 static constexpr const char* kSyncOffPrefKey = "sync_off";   // 四个 offset 打包成一个 u64
 
 // 每轮下载几首。见 dailySyncTask 里的说明。
-constexpr uint8_t kDailySyncTracksPerDay = 3;
+constexpr uint8_t kDailySyncTracksPerDay = 10;
 
-// ⚠️ **仅用于验证，验证完必须改回 false。**
-// 每日那道闸（今天跑过就不再跑）会让每一轮真机验证都白跑 —— 2026-09-05
-// 就因为它，一轮 12 分钟的抓取里一行 SYNC 都没有。
-// 置 true 时忽略 lastRunDay，每次开机跑一轮。
-constexpr bool kDailySyncForceOnBoot = true;
+// 调试开关：置 true 时忽略 lastRunDay，每次开机跑一轮。
+//
+// ⚠️ **生产状态必须是 false。** 它存在的理由是：每日那道闸会让每一轮真机
+// 验证都白跑 —— 2026-09-05 就因为它，一轮 12 分钟的抓取里一行 SYNC 都没有。
+// 2026-09-05 端到端验证通过后已改回 false。
+constexpr bool kDailySyncForceOnBoot = false;
 
 static DailySyncState s_syncState;
 static DailySyncStats s_syncStats;
@@ -1838,10 +1862,8 @@ static void dailySyncTask(void*) {
     const uint32_t nowEpoch = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
 
     DailySyncConfig cfg;
-    // ⚠️ **首轮端到端验证用的值，验证通过后改回 10。**
-    // 实测单首下载 150~210 秒，10 首要跑 30 分钟以上；验证"闭环通不通"
-    // 不需要等那么久，3 首就足够覆盖 拉候选→去重→空间检查→下载→并入索引
-    // →存盘 的每一步。
+    // 实测（2026-09-05）：单首 160~220 秒，3 首共 548 秒。
+    // 10 首约 30 分钟 —— 后台任务，可以接受。
     cfg.tracksPerDay = kDailySyncTracksPerDay;
     dailySyncRun(s_jamendo, s_localTracks, &s_localTrackCount, kMaxLocalTracks,
                  nowEpoch, 0, cfg, &s_syncState, &s_syncStats);
@@ -1913,7 +1935,15 @@ static void jamendoProbeTask(void*) {
         // ⚠️ "没在播放才下"是 R6 的第一道防线。Phase 1 已经因为在播放路径里写 SD
         // 把本地和电台都搞挂过一次（见 DEV_LOG §10），这次从一开始就避开。
         int8_t okIndex = -1;   // 哪一条下成功了，R6 阶段复用它
-        if (n > 0 && !audio.isRunning()) {
+
+        // ⚠️ **Phase 4 自测已完成，默认关闭** —— 和 kRunR6Experiment 同一个理由，
+        // 上一轮只关了 R6，漏了这个：
+        //   1. 它每次开机下一首 3.4MB（约 100 秒），probe_done 要等它跑完才置位，
+        //      **实测把每日同步的启动推迟了 2 分钟**；
+        //   2. 它直接调 downloadToFile，同样绕过 daily_sync 的电台让路策略。
+        // 需要重新验证单首下载闭环时再打开。
+        constexpr bool kRunDownloadSelfTest = false;
+        if (kRunDownloadSelfTest && n > 0 && !audio.isRunning()) {
             // ⚠️ **audiodownload_allowed=true 不保证真的下得下来。**
             // 实测 2026-09-04：同一批候选里 id=2034080 的下载地址恒定返回
             // HTTP 500（PC 直连 curl 同样 500，排除了板子和 TLS 的嫌疑），
@@ -1940,6 +1970,8 @@ static void jamendoProbeTask(void*) {
                 printf("[DL][TEST] %s -> %s\n", s_dlTestResult, finalPath);
                 if (r == DownloadResult::Ok) { okIndex = static_cast<int8_t>(i); break; }
             }
+        } else if (!kRunDownloadSelfTest) {
+            strlcpy(s_dlTestResult, "disabled (self-test done)", sizeof(s_dlTestResult));
         } else if (n > 0) {
             strlcpy(s_dlTestResult, "skipped (audio playing)", sizeof(s_dlTestResult));
         } else {
@@ -2751,8 +2783,17 @@ static void scanMusicDir(const char* path, uint8_t depth) {
             // 并入索引而不是直接追加：已存在的曲目要保留播放统计和 favorite，
             // 重扫一次 SD 不该把用户行为的产物清零
             //（见 library_store.h 里 libraryStoreUpsert 的说明）。
+            // ⚠️ 诊断：新追加 vs 已存在。2026-09-05 实测发现下载入库的 3 首
+            // 在下次扫描时被判成"不存在"（标 missing）同时又被当新曲追加，
+            // 说明 daily_sync 写的路径和 entry.path() 对不上 —— 但对不上在哪
+            // 靠猜没结果，得把两边的路径原样打出来。
+            const uint16_t beforeCount = s_localTrackCount;
             libraryStoreUpsert(s_localTracks, &s_localTrackCount, s_localTrackCapacity,
                                item, s_scanSeenBits, s_scanNowEpoch);
+            if (s_localTrackCount > beforeCount) {
+                printf("[MUSIC][NEW] path=\"%s\" id=%lu\n", item.path,
+                       static_cast<unsigned long>(libraryHashPath(item.path)));
+            }
         }
         entry.close();
     }
@@ -2815,6 +2856,24 @@ static void localMusicScanTask(void*) {
     // 索引里有、这次没扫到的 → 标 missing（不删除，留住 favorite 与播放历史）。
     // 最典型的成因是用户在 U 盘模式下用电脑删了歌，见审计 §10。
     const uint16_t nowMissing = libraryStoreFinishScan(s_localTracks, s_localTrackCount, seenBits);
+    // ⚠️ 无条件打印，不能只在 nowMissing != 0 时打 —— finishScan 只统计**本次
+    // 新标记**的，已经标过的会跳过。第一版写成 if (nowMissing) 结果重启后
+    // 一行都不打，白跑一轮。
+    // 同时把所有 provider 曲目打出来：下载入库的和扫描新增的会各存一份，
+    // 两份对照才看得出路径差在哪。
+    {
+        uint16_t shown = 0;
+        for (uint16_t i = 0; i < s_localTrackCount && shown < 12; ++i) {
+            const TrackRecord& r = s_localTracks[i];
+            const bool isMissing = (r.flags & kTrackFlagMissing) != 0;
+            if (!isMissing && r.provider != kProviderJamendo) continue;
+            printf("[MUSIC][CHK] %s path=\"%s\" id=%lu prov=%u flags=0x%02X\n",
+                   isMissing ? "MISSING" : "present",
+                   r.path, static_cast<unsigned long>(r.localId),
+                   r.provider, r.flags);
+            ++shown;
+        }
+    }
     s_scanSeenBits = nullptr; // seenBits 是栈上的，函数返回后就失效了
 
     libraryStoreSave(s_localTracks, s_localTrackCount);
@@ -6356,10 +6415,14 @@ static void loopLvglRuntime() {
                 // ⚠️ 不触发时也要说明原因。否则"没跑"和"跑了但没输出"完全同形 ——
                 // 2026-09-05 为此浪费了一轮 12 分钟的抓取。
                 const uint32_t nowEp = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
-                printf("[SYNC][STATE] idle rtc=%d probe=%d net=%d day=%lu last=%lu "
+                // ⚠️ epoch 用 time(nullptr) 直接取，**不要经过 s_f_rtc** ——
+                // 否则"SNTP 没同步"和"标志位没置上"在日志里完全同形，
+                // 2026-09-05 就是因为这个多绕了一圈。
+                printf("[SYNC][STATE] idle rtc=%d probe=%d net=%d epoch=%lu day=%lu last=%lu "
                        "due=%d force=%d cooldown=%ld\n",
                        s_f_rtc ? 1 : 0, s_jamendoProbeDone ? 1 : 0,
                        s_lvglNetworkReady ? 1 : 0,
+                       static_cast<unsigned long>(time(nullptr)),
                        static_cast<unsigned long>(nowEp / 86400u),
                        static_cast<unsigned long>(s_syncState.lastRunDay),
                        dailySyncDue(s_syncState, nowEp) ? 1 : 0,
@@ -6400,7 +6463,7 @@ static void loopLvglRuntime() {
             logMemoryState("local_music_playing_stable");
             s_memLogLocalAtSec = 0;
         }
-        if (!s_f_rtc) s_f_rtc = rtc.hasValidTime();
+        if (!s_f_rtc) s_f_rtc = systemTimeSynced();
         if (WiFi.isConnected()) {
             s_f_WiFi_lost = false;
             // Covers the case setupLvglRuntime()'s initial connectToWiFi()
@@ -7653,7 +7716,7 @@ void loop() {
             } // all other, do nothing
         }
 
-        if (!s_f_rtc) { s_f_rtc = rtc.hasValidTime(); }
+        if (!s_f_rtc) { s_f_rtc = systemTimeSynced(); }
         // ------------------------------------------- volume / mute --------------------------------------------------------------------------------
         if (!s_f_mute) {
             if (audio.getVolume() != s_volume.cur_volume) { audio.setVolume(s_volume.cur_volume); }

@@ -21,9 +21,16 @@ constexpr uint32_t kNetAudioWaitMaxMs = 10u * 60 * 1000;
 // 由调用方注入，判断是否有网络供给的音频在播。
 DownloadNetAudioFn s_netAudioFn = nullptr;
 
-// 语言配额。中文和日文在 Jamendo 上可下载曲目**非常少**（2026-09-03 与用户
-// 确认后接受），所以这两档基本填不满，回填是常态而不是异常路径 ——
-// 见 jamendo_provider.h 顶部的说明。
+// 语言配额。
+//
+// ⚠️ **2026-09-05 实测修正了这里原本的前提。** 原先写的是"中日可下载曲目非常
+// 少，所以这两档填不满"—— 不准确。实测 lang=zh / lang=ja 都能正常返回结果，
+// 真正的问题是**Jamendo 的 lang 过滤很松**：它按元数据/标签筛，返回的大多数
+// 并不是该语言的歌。lang=zh 的 6 条里只有 1 条真是中文
+// （"凌晨三点的便利店 - 小风啊哈"），其余是 ProleteR、Prorock 之类。
+//
+// 所以这两档不会填不满，而是会填进一堆**名不副实**的曲目。
+// 结果上接近"中日歌很少"，但机制完全不同，排查时别被原来的说法误导。
 struct LangSlot {
     const char* lang;      // nullptr = 不限语言
     uint8_t     quota;
