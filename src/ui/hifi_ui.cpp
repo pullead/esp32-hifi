@@ -23,6 +23,7 @@ extern bool playerCoreUsbDacActive();
 // 但列表构建（buildMusicPage）在文件更前面就要用到。
 static void rowScrollGuardArm(lv_event_t* e);
 static bool rowClickWasScroll(lv_event_t* e);
+static void listScrollStamp(lv_event_t* e);
 
 // Palette v2 (2026-07-23): switched from the dark graphite/copper spec to a
 // light lavender/purple identity per explicit product direction -- see
@@ -435,6 +436,19 @@ void addPressFx(lv_obj_t* obj) {
     lv_obj_set_style_border_color(obj, kAccent, LV_STATE_PRESSED);
     lv_obj_set_style_border_opa(obj, LV_OPA_COVER, LV_STATE_PRESSED);
 }
+
+// 列表行的点按反馈：**只在确认是点击之后才高亮**，见 rowMarkSelected()。
+//
+// ⚠️ 走过两次弯路，都记在这里免得再试：
+//   1. addPressFx（按下即高亮）—— 滑动时手指经过的每一行都闪一下再消失。
+//      那是 LVGL 的正确行为：按下进 PRESSED，滚动一开始又清掉，所以闪。
+//   2. 给 PRESSED 加 90ms 过渡延迟 —— 想用"停留时间"区分点按和滑动。
+//      **判据本身就错了**：滑动的开始往往是"按住→停顿→再移动"，
+//      停顿超过 90ms 高亮照样出来。时间分不出意图。
+//
+// 真正可靠的意图信号是滚动守卫（按下到松手之间列表有没有真的滚动过），
+// 它已经在用来挡误触发了。既然那里能判定"这是点击"，高亮就挂在那一刻，
+// 滑动时永远不会亮。
 
 lv_obj_t* addFontPreviewLabel(lv_obj_t* parent, const char* text, const lv_font_t* font,
                               lv_color_t color, int16_t x, int16_t y, int16_t width,
@@ -1813,6 +1827,8 @@ void HifiUi::buildLocalMusic() {
     lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF); // replaced by the draggable slider
+    // 记录最后一次滚动时刻，供"点停滑行"判据使用（见 rowScrollGuardArm）。
+    lv_obj_add_event_cb(list, listScrollStamp, LV_EVENT_SCROLL, nullptr);
 
     m_musicGroupCount = 0;
     int32_t contentHeight = 0; // populated below, used to size the draggable scroll slider
@@ -1881,9 +1897,6 @@ void HifiUi::buildLocalMusic() {
             lv_obj_set_style_shadow_width(row, 0, 0);
             lv_obj_set_style_pad_all(row, 0, 0);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            // ⚠️ 列表行**不加 addPressFx**：手指一碰就高亮，滑动时每经过一行都
-            // 闪一下"被选中"，是纯噪音（用户反馈"好像没啥必要"）。
-            // 按钮那种明确的点击目标才需要按下反馈，列表行不需要。
             lv_obj_add_event_cb(row, rowScrollGuardArm, LV_EVENT_PRESSED, nullptr);
             lv_obj_add_event_cb(row, onMusicTrackAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
 
@@ -2981,11 +2994,21 @@ void HifiUi::refreshRadioNowPlaying(const PlayerSnapshot& rawState) {
 }
 
 void HifiUi::playLocalTrackByIndex(uint16_t index, uint32_t positionSeconds) {
-    // ⚠️ 这三步**全都跑在 UI 线程上**，而且每一步都可能碰 SD。
-    // 2026-09-05 实测抓到开始播放时单次 lv_timer_handler 阻塞 1.58 秒
-    // （busy 甚至报到 167.8%，说明统计窗口被整个盖过）。
-    // 封面已单独计时是 162ms，剩下 1.4 秒来源不明 —— 分步计时才能定位，
-    // 靠猜只会多烧一轮。
+    // ⚠️ 这三步**全都跑在 UI 线程上**，实测
+    // [PLAY][T] open=1298ms cover=140ms lyrics=18ms —— audio.connecttoFS()
+    // 独占 1.3 秒，期间 LVGL 完全不刷新。
+    // onMusicTrackAction 里用"先刷一帧再阻塞"（方案 A）把它变成"正在载入"的
+    // 观感，卡顿本身仍在。
+    //
+    // 真正消除需要把打开挪到独立任务（方案 B）。**2026-09-05 写到一半按用户
+    // 要求撤回**，要点记在这里免得重新推一遍：
+    //   - 不能用互斥锁保护 audio：audio.loop() 在 UI 线程调用，worker 持锁
+    //     1.3 秒会让 UI 卡在锁上，等于没修。正确做法是打开期间**跳过**
+    //     audio.loop()（那段时间本来就没有音频输出）。
+    //   - worker 绝不能碰 LVGL：封面解码/歌词加载会创建 LVGL 对象，
+    //     必须留在 UI 线程收尾。
+    //   - 残留风险：打开期间 playerService.tick() 仍会读 audio 状态。
+    //     判断是安全的（只读成员、不推进状态机），但那是推断不是实测。
     const uint32_t t0 = millis();
     if (!playerService.playLocalTrack(index, positionSeconds)) return;
     const uint32_t t1 = millis();
@@ -7539,18 +7562,45 @@ void HifiUi::onMusicTabAction(lv_event_t* event) {
 // 也不受惯性/抛掷的影响。
 static int32_t s_rowPressScrollY = 0;
 static lv_obj_t* s_rowPressList = nullptr;
+static uint32_t s_lastScrollMs = 0;    // 列表最后一次滚动的时刻
+static bool s_pressStoppedScroll = false;
+
+// 按下前多久内滚动过，就认为这次按下是"点一下停住滑行"，不是选歌。
+// 300ms：够覆盖滑行减速到停的尾段，又不会把"停下来之后重新点一首"误伤。
+constexpr uint32_t kStopTapWindowMs = 300;
 
 static void rowScrollGuardArm(lv_event_t* e) {
     lv_obj_t* row = lv_event_get_target(e);
     lv_obj_t* list = row ? lv_obj_get_parent(row) : nullptr;
     s_rowPressList = list;
     s_rowPressScrollY = list ? lv_obj_get_scroll_y(list) : 0;
+    // ⚠️ **第二条判据：这次按下是不是在"点停滑行"。**
+    // 只比较按下/松手的滚动位置是不够的 —— 用手指点一下停住惯性滑行时，
+    // 这两个位置几乎相同，于是被判成点击并播放。
+    // 惯性调大之后这个漏洞被放大了（滑行更久 => 点停的次数更多）。
+    s_pressStoppedScroll = (millis() - s_lastScrollMs) < kStopTapWindowMs;
+}
+
+// 挂在列表上，记录最后一次滚动时刻。
+static void listScrollStamp(lv_event_t*) { s_lastScrollMs = millis(); }
+
+// 确认是点击之后，立刻把该行画成选中态并强制刷新一帧。
+// 强制刷新是必要的：紧接着往往是耗时操作（曲目行那边是 1.4 秒的
+// audio.connecttoFS()），不先画出来用户会以为没点上。
+// 不必恢复原色 —— 后面马上切页重建。
+static void rowMarkSelected(lv_event_t* e) {
+    lv_obj_t* row = lv_event_get_target(e);
+    if (!row) return;
+    lv_obj_set_style_bg_color(row, kAccent, 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_30, 0);
+    lv_refr_now(nullptr);
 }
 
 static bool rowClickWasScroll(lv_event_t* e) {
     lv_obj_t* row = lv_event_get_target(e);
     lv_obj_t* list = row ? lv_obj_get_parent(row) : nullptr;
     if (!list || list != s_rowPressList) return false;
+    if (s_pressStoppedScroll) return true;   // 点停滑行，不是选歌
     // 2px 容差：手指抖动引起的亚像素滚动不该算滑动。
     const int32_t moved = lv_obj_get_scroll_y(list) - s_rowPressScrollY;
     return moved > 2 || moved < -2;
@@ -7561,6 +7611,17 @@ void HifiUi::onMusicTrackAction(lv_event_t* event) {
     if (rowClickWasScroll(event)) return;   // 这是一次滑动，不是点击
     const uint16_t trackIndex1 = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
     if (!trackIndex1) return;
+
+    // ⚠️ 下面这一步会**阻塞 UI 线程约 1.4 秒**（实测
+    // [PLAY][T] open=1298ms cover=140ms lyrics=18ms），因为 audio.connecttoFS()
+    // 要读过 ID3 里内嵌的几十 KB 封面。期间 LVGL 完全不刷新，看起来像死机。
+    //
+    // 所以先把这一行的高亮直接画上并**强制刷新一帧**，让用户看到"点击已被接受"，
+    // 再去做那件慢事。这不缩短等待，只是把"死机"变成"正在载入"。
+    // （真正消除阻塞需要把打开文件挪到独立任务 —— 那会动到播放启动路径，
+    //   正是 Phase 1 翻过车的地方，留作单独一轮做。）
+    //
+    rowMarkSelected(event);
     s_instance->playLocalTrackByIndex(trackIndex1 - 1);
     s_instance->show(Page::LocalNowPlaying);
 }
@@ -7739,6 +7800,11 @@ void HifiUi::onWifiSavedRowAction(lv_event_t* event) {
 
 void HifiUi::onMusicGroupAction(lv_event_t* event) {
     if (!s_instance) return;
+    // ⚠️ 这里原来**漏了滚动守卫** —— 分组行挂了 rowScrollGuardArm，
+    // 处理函数却没检查，所以滑动歌手/专辑列表时照样会误触发跳转。
+    // 曲目行修好的时候没顺手看这一处。
+    if (rowClickWasScroll(event)) return;
+    rowMarkSelected(event);
     const uint8_t groupIndex = static_cast<uint8_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
     if (groupIndex >= s_instance->m_musicGroupCount) return;
     const char* name = s_instance->m_musicGroupNames[groupIndex];

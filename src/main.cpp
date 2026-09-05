@@ -2176,6 +2176,9 @@ static void libraryLogEvent(uint32_t localId, uint8_t type) {
 //
 // 时机选择：**正在播放时默认不写**，避免和音频抢 SD 总线——除非队列快满了，
 // 那时宁可短暂争用也不能丢事件。
+// 定义在 src/ui/waveshare_lvgl_port.cpp。最近 withinMs 内有没有手指在屏上。
+bool uiRecentlyTouched(uint32_t withinMs);
+
 static void libraryFlushEvents(bool audioBusy) {
     const uint8_t n = s_libEventQueueCount;
     if (!n) return;
@@ -6449,7 +6452,16 @@ static void loopLvglRuntime() {
         s_totalRuntime++;
 
         // 事件落盘。放在这里而不是播放路径里——见 libraryLogEvent() 的说明。
-        libraryFlushEvents(audio.isRunning());
+        // ⚠️ **别在用户操作屏幕时写 SD。**
+        // 这一步会把事件队列追加到 SD（开文件/写/关 + FAT 元数据），实测在
+        // UI 线程上造成 181~413ms 的阻塞 —— 落在滑动过程中就是可感知的"卡一下"。
+        //
+        // 这是同一个坑的第三次变形：Phase 1 因为在播放启动路径里写 SD 把播放
+        // 搞挂，于是改成队列缓冲；但**队列的落盘本身一直还在 UI 线程上**。
+        //
+        // 不改 SD 访问模型（多线程访问 SD_MMC 有风险），只是把落盘推迟到用户
+        // 松手之后。事件在队列里多等几百毫秒没有任何代价 —— 队列满了会强制落盘。
+        libraryFlushEvents(audio.isRunning() || uiRecentlyTouched(600));
 
         // 曲库状态：每 10 秒打一次。
         //
@@ -6457,6 +6469,10 @@ static void loopLvglRuntime() {
         // 上**基本抓不到**——app 启动时 USB 会重新枚举，带复位抓取会断线、不带复位
         // 抓取又错过开头。这条教训在 esp_lcd 迁移那轮就总结过（见
         // DEV_LOG_2026-09-04 §5），这次做曲库索引又踩了一遍，所以补上。
+        // （2026-09-05：曾怀疑这批 10 秒诊断是滚动卡顿的来源，关掉做过对照
+        //   实验 —— 尖峰照旧，**排除**。真正的原因是上面那句事件落盘。
+        //   在此之前我还错判过一次 libraryCleanerAssess 实时读 SD，
+        //   查调用点才发现那是扫描时的快照。两次都记在这里，别再重猜。）
         if (s_localTrackCapacity && (s_totalRuntime % 10) == 0) {
             uint16_t missing = 0, favorite = 0, played = 0;
             for (uint16_t i = 0; i < s_localTrackCount; ++i) {

@@ -8,6 +8,11 @@ enum class TouchGesture : uint8_t { None, EdgeBack, EdgeTopOpen, EdgeBottomClose
 // Sole LCD/touch owner once MWR_LVGL_UI is enabled.
 class WaveshareLvglPort {
   public:
+    // 最近 withinMs 毫秒内有没有手指在屏上。
+    // ⚠️ 给"别在用户操作时做慢活"用的：SD 写入等阻塞操作若落在滑动过程中，
+    // 会造成几百毫秒的可感知卡顿（2026-09-05 实测 181~413ms）。
+    static bool recentlyTouched(uint32_t withinMs);
+
     bool begin();
     void tick();
     bool consumeGesture(TouchGesture* gesture);
@@ -47,6 +52,7 @@ class WaveshareLvglPort {
     uint8_t m_touchMisses = 0;
     uint32_t m_lastTick = 0;
     uint32_t m_touchStartMs = 0;
+    uint32_t m_touchLastActiveMs = 0;   // 最近一次有手指在屏上的时刻
     uint32_t m_touchSuppressUntilMs = 0;
     uint32_t m_lastImuPoll = 0;
     uint32_t m_lastGyroMs = 0;

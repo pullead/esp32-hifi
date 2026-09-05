@@ -376,7 +376,10 @@ bool WaveshareLvglPort::begin() {
     // stopping the instant the finger lifts.
     // 抛掷后的减速百分比，**越大停得越快**（10 是 LVGL 默认）。
     // 调小 => 惯性更明显、滑得更远。用户要求增加惯性感。
-    m_touchDriver.scroll_throw = 4;
+    // 4 -> 6：4 的滑行时间明显变长，用户反馈滑动卡卡的 —— 怀疑不是新增
+    // 卡顿，而是滑行拉长让原本 ~30ms/帧的掉帧暴露得更久（滑行越久越看得出）。
+    // 先退回中间值验证这个推测。
+    m_touchDriver.scroll_throw = 6;
     m_touchDriver.gesture_limit = 56;
     m_touchDriver.long_press_time = 450;
     m_touchIndev = lv_indev_drv_register(&m_touchDriver);
@@ -617,9 +620,23 @@ bool WaveshareLvglPort::readTouchPoint(uint16_t* x, uint16_t* y) {
     return true;
 }
 
+// 自由函数版本，供 main.cpp 使用（那边不包含本端口的头文件，
+// 为一个布尔查询去引入整个头得不偿失）。
+bool uiRecentlyTouched(uint32_t withinMs) {
+    return WaveshareLvglPort::recentlyTouched(withinMs);
+}
+
+bool WaveshareLvglPort::recentlyTouched(uint32_t withinMs) {
+    auto* self = s_instance;
+    if (!self) return false;
+    if (self->m_touchWasPressed) return true;          // 手指还在屏上
+    return (millis() - self->m_touchLastActiveMs) < withinMs;
+}
+
 void WaveshareLvglPort::updateGesture(bool pressed, uint16_t x, uint16_t y) {
     const uint32_t now = millis();
     if (pressed) {
+        m_touchLastActiveMs = now;
         m_touchCurrentX = x;
         m_touchCurrentY = y;
         if (!m_touchWasPressed) {
