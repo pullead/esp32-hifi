@@ -26,6 +26,8 @@ static bool rowClickWasScroll(lv_event_t* e);
 static void listScrollStamp(lv_event_t* e);
 // 定义在 src/ui/waveshare_lvgl_port.cpp
 uint16_t uiTouchTravelPx();
+// 定义在 src/main.cpp。0=不可用 1=空闲 2=下载中 3=推迟 4=空间不足
+uint8_t uiDailySyncState();
 
 // Palette v2 (2026-07-23): switched from the dark graphite/copper spec to a
 // light lavender/purple identity per explicit product direction -- see
@@ -757,6 +759,47 @@ void HifiUi::tick() {
 // dropping that reference's verbose Chinese word labels in favor of icons
 // and short numeric/latin tags (there just isn't room for e.g. "耳放 ON" as
 // full text at a legible size here).
+// —— 每日同步状态图标：云 + 下载箭头（16x16）——
+//
+// ⚠️ 用 **ALPHA_8BIT（只存形状，不存颜色）**，不是彩色位图。理由：
+//   1. 颜色要用来表达状态（下载中/推迟/空间不足…）。彩色图做 recolor 会被整体
+//      混成一团单色块，**原本的双色设计反而丢了**；alpha 掩码天生就是
+//      "形状 + 外部着色"，换色干净。
+//   2. 16x16 只要 256 字节。当前 Flash 已用 82.7%，这个量可忽略。
+//
+// ⚠️ 内联在本文件而不是新建 .c：src/CMakeLists.txt 用 GLOB_RECURSE，
+// 新增任何文件都会触发 CMake 重配 + **约 16 分钟全量重编**。
+//
+// 形状按用户给的参考画（青云 + 橙圈白箭头），这里只取轮廓：
+// 去掉了外圈 —— 16px 下圆圈里的箭头只有 5px，读不出来，实测预览确认过。
+// 竖杆**止于**三角底边而不是穿过去，否则两者重叠会叠成菱形而不是箭头
+// （这一版之前的三次尝试都栽在这上面）。
+// 4x 超采样生成，边缘带抗锯齿。
+static const uint8_t kSyncCloudMap[16 * 16] = {
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0xCF, 0xFF, 0xCF, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0xEF, 0xFF, 0xFF, 0xFF, 0xEF, 0x20, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x30, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x8F, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xCF, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x40, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x20, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0xBF, 0xCF, 0xFF, 0xCF, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF, 0x70, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x40, 0x40, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0xFF, 0xFF, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0xFF, 0xFF, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x50, 0x80, 0x9F, 0xFF, 0xFF, 0x9F, 0x80, 0x50, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x10, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xCF, 0x10, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0xCF, 0xFF, 0xFF, 0xCF, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0xCF, 0xCF, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+static const lv_img_dsc_t kSyncCloudImg = {
+    {LV_IMG_CF_ALPHA_8BIT, 0, 0, 16, 16},
+    sizeof(kSyncCloudMap),
+    kSyncCloudMap,
+};
+
 void HifiUi::buildStatusBar(lv_obj_t* screen) {
     lv_obj_t* bar = lv_obj_create(screen);
     lv_obj_set_pos(bar, 0, 0);
@@ -841,6 +884,18 @@ void HifiUi::buildStatusBar(lv_obj_t* screen) {
     // setting in the audio backend to show instead, and the actual format
     // is genuinely more informative.
     m_statusCodec = makeText(bar, "", &lv_font_montserrat_10, kInkDim, LV_ALIGN_LEFT_MID, 196, 0);
+
+    // 6b: 每日同步状态。**颜色即状态**，沿用状态栏已有的语言 ——
+    // WiFi 图标就是靠颜色表达强弱（灰=断开/橙=弱/绿=强），不是新概念。
+    //
+    // 图标是自绘的云 + 下载箭头（见本文件顶部 kSyncCloudImg 的说明）。
+    m_statusSync = lv_img_create(bar);
+    lv_img_set_src(m_statusSync, &kSyncCloudImg);
+    lv_obj_align(m_statusSync, LV_ALIGN_LEFT_MID, 222, 0);   // 232 -> 222，用户反馈偏右
+    lv_obj_clear_flag(m_statusSync, LV_OBJ_FLAG_CLICKABLE);
+    // ALPHA_8BIT 的颜色来自 img_recolor，两项都要设（opa 不给就不着色）。
+    lv_obj_set_style_img_recolor_opa(m_statusSync, LV_OPA_COVER, 0);
+    lv_obj_set_style_img_recolor(m_statusSync, kInkFaint, 0);
 
     // 7: volume, packed from the right edge: percentage, then the 5-bar
     // graph, then a speaker icon -- reads "28% ▁▂▃▄▅ 🔊" right-to-left.
@@ -1041,7 +1096,7 @@ void HifiUi::show(Page page) {
     m_playRing = nullptr;
     for (auto& bar : m_ringBars) bar = nullptr;
     m_coverSpinning = false;
-    m_statusAmp = m_statusCodec = m_statusVolPct = nullptr;
+    m_statusAmp = m_statusCodec = m_statusVolPct = m_statusSync = nullptr;
     m_homeNowTitle = m_homeNowDetail = m_homeNowLyric = m_homeProgress = nullptr;
     m_homeCoverWrap = m_homeCoverImg = m_homeCoverPlaceholder = nullptr;
     m_homeSpecCanvas = nullptr; // widget only -- m_homeSpecCanvasBuf survives the rebuild, same as the spectrum canvas
@@ -1870,7 +1925,8 @@ void HifiUi::buildLocalMusic() {
                 lv_obj_add_event_cb(row, onMusicGroupAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(g)));
                 lv_obj_t* label = makeText(row, m_musicGroupNames[g], &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 10, 0);
                 lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
-                lv_obj_set_width(label, 232);
+                // 同上：不锁高度的话长名字会换行而不是打点。
+                lv_obj_set_size(label, 232, lv_font_get_line_height(&lv_font_cjk_13));
                 lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
             }
             contentHeight = static_cast<int32_t>(m_musicGroupCount) * 40;
@@ -1917,10 +1973,15 @@ void HifiUi::buildLocalMusic() {
             // 不拼成 "标题 · 歌手" 一个字符串 —— CJK 里那个分隔点容易糊在一起，
             // 左右分置层次更清楚，字形总量一样。
             // 附带收益：每行少一个文本标签，滚动时字形渲染量减半。
+            // ⚠️ **LV_LABEL_LONG_DOT 不是"单行截断"。**
+            // 它按标签宽度**自动换行**，只有文字超出标签**高度**时才在末尾打点。
+            // 这些标签原本没设高度（按内容自适应），于是长标题**永远不会打点，
+            // 只会换成两行**，在 28px 的行里挤成一团 —— 用户反馈的"杂乱"就是这个。
+            // 必须把高度锁成一行，LONG_DOT 才会在一行内截断。
             const char* titleText = item.title[0] ? item.title : "未知曲目";
             lv_obj_t* title = makeText(row, titleText, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 10, 0);
             lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(title, 170);
+            lv_obj_set_size(title, 170, lv_font_get_line_height(&lv_font_cjk_13));
             // ⚠️ **伪粗体的副本已删除。**
             // 原来这里再画一份完全相同的标题、右移 1px 叠上去来假装粗体
             // （没有粗体字重的常见土办法）。代价是**每行的标题每帧渲染两遍**，
@@ -1933,7 +1994,7 @@ void HifiUi::buildLocalMusic() {
                                 : (item.album[0] ? item.album : "未知艺术家");
             lv_obj_t* detail = makeText(row, subText, &lv_font_cjk_13, kInkFaint, LV_ALIGN_RIGHT_MID, -10, 0);
             lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(detail, 84);
+            lv_obj_set_size(detail, 84, lv_font_get_line_height(&lv_font_cjk_13));
             lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_RIGHT, 0);
             // ⚠️ 这里原来放 LV_SYMBOL_IMAGE 表示"内嵌封面"，2026-09-05 删除：
             // 信息价值很低（进播放页一眼就看到有没有封面），却让每行多一个标签、
@@ -7150,6 +7211,37 @@ void HifiUi::refresh() {
         uiSetBorderColor(m_statusAmpBox, ampColor, 0);
     }
     if (m_statusCodec) uiSetText(m_statusCodec, state.codec[0] ? state.codec : "");
+
+    // 每日同步：颜色即状态。用 uiStyleColorSame 守卫，颜色没变就不触发重绘 ——
+    // 状态栏每 60ms 刷一次，这里每次都写样式的话是白白的失效重绘。
+    if (m_statusSync) {
+        const uint8_t syncState = uiDailySyncState();
+
+        // ⚠️ 不可用时**直接隐藏**，不要用一个更暗的灰。
+        // 第一版把"空闲"设成 kInkDim、"不可用"设成 kInkFaint —— 两种深浅相近的
+        // 灰在 16px 图标上**根本分不出来**。当时是按"有几个状态就配几个颜色"
+        // 分配的，没考虑相邻深度在小尺寸下不可辨。
+        // 隐藏本身就传达了"这功能现在用不了"，比再加一档灰清楚得多。
+        const bool hidden = (syncState == 0);
+        // 用 has_flag 挡一道：状态栏每 60ms 刷一次，无条件设标志会反复触发失效重绘。
+        if (hidden != lv_obj_has_flag(m_statusSync, LV_OBJ_FLAG_HIDDEN)) {
+            if (hidden) lv_obj_add_flag(m_statusSync, LV_OBJ_FLAG_HIDDEN);
+            else        lv_obj_clear_flag(m_statusSync, LV_OBJ_FLAG_HIDDEN);
+        }
+
+        if (!hidden) {
+            lv_color_t c;
+            switch (syncState) {
+                case 2:  c = kAccentBright; break;   // 下载中 —— 唯一的亮色
+                case 3:  c = kAccent;       break;   // 因电台在播推迟
+                case 4:  c = kMagenta;      break;   // 空间不足停下
+                default: c = kInkDim;       break;   // 空闲/今天已完成
+            }
+            if (!uiStyleColorSame(m_statusSync, LV_STYLE_IMG_RECOLOR, c, 0)) {
+                lv_obj_set_style_img_recolor(m_statusSync, c, 0);
+            }
+        }
+    }
     const uint8_t volumeLevel = state.volumeSteps ? static_cast<uint8_t>((state.muted ? 0 : state.volume) * 5 / state.volumeSteps) : 0;
     for (uint8_t i = 0; i < 5; ++i) {
         if (!m_volumeBars[i]) continue;

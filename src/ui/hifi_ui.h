@@ -241,7 +241,8 @@ class HifiUi {
     lv_obj_t* m_weatherIconDrop2 = nullptr;
     lv_obj_t* m_cover = nullptr;
     lv_obj_t* m_coverLabel = nullptr;
-    lv_obj_t* m_favIcon = nullptr;   // ★ 收藏标记，颜色表示状态
+    lv_obj_t* m_favIcon = nullptr;    // ★ 收藏标记，颜色表示状态
+    lv_obj_t* m_statusSync = nullptr; // 每日同步状态，颜色表示阶段
     lv_obj_t* m_playIcon = nullptr;
     lv_obj_t* m_playRing = nullptr;
     lv_obj_t* m_ringBars[10]{};

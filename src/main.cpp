@@ -2179,6 +2179,26 @@ static void libraryLogEvent(uint32_t localId, uint8_t type) {
 // 定义在 src/ui/waveshare_lvgl_port.cpp。最近 withinMs 内有没有手指在屏上。
 bool uiRecentlyTouched(uint32_t withinMs);
 
+// 每日同步的状态，给状态栏那个图标用颜色表达。
+//   0 = 不可用（未联网 / provider 未配置）
+//   1 = 空闲（今天已跑过，或还没到触发条件）
+//   2 = 正在下载
+//   3 = 因电台在播而推迟（不是失败，稍后会重试）
+//   4 = 空间不足停下
+//
+// ⚠️ 后台同步此前**完全不可见** —— 只能从串口看。用户提出加个图标，
+// 这是对的：一个每天跑 30 分钟、会写 SD、会占网络的后台任务，
+// 用户应该能一眼知道它在干什么。
+uint8_t uiDailySyncState() {
+    // 用 WiFi.isConnected() 而不是 s_lvglNetworkReady —— 后者定义在本函数之后
+    // （main.cpp 是单个大 TU，顺序有讲究），而且这里要表达的就是"有没有网"。
+    if (!s_jamendo.available() || !WiFi.isConnected()) return 0;
+    if (s_syncRunning) return 2;
+    if (s_syncStats.deferredNetAudio) return 3;
+    if (s_syncStats.stoppedNoSpace) return 4;
+    return 1;
+}
+
 static void libraryFlushEvents(bool audioBusy) {
     const uint8_t n = s_libEventQueueCount;
     if (!n) return;
@@ -5943,7 +5963,17 @@ void playerCoreReadSnapshot(PlayerSnapshot* snapshot) {
     }
     if (s_f_webFailed) strlcpy(snapshot->error, s_streamTitle.c_get(), sizeof(snapshot->error));
 
-    strlcpy(snapshot->codec, audio.getCodecname(), sizeof(snapshot->codec));
+    // ⚠️ audio.getCodecname() 在**没有播放时返回 "unknown"**，直接抄进快照会让
+    // 状态栏常驻显示 "unknown" 这么长一串（用户反馈：开机后那里是一圈字母，
+    // 还和右边的同步图标叠在一起，只有开始播放才正常变成 MP3）。
+    // 没在播就给空串 —— 状态栏那一格本来就该是"当前在放什么格式"，
+    // 不放东西时不该有内容。
+    // 再防一手字面量 "unknown"：库在某些边界状态下即使 isRunning() 为真也会返回它。
+    {
+        const char* cn = audio.isRunning() ? audio.getCodecname() : "";
+        if (!cn || strcasecmp(cn, "unknown") == 0) cn = "";
+        strlcpy(snapshot->codec, cn, sizeof(snapshot->codec));
+    }
     snapshot->sampleRate = audio.getSampleRate();
     snapshot->bitsPerSample = audio.getBitsPerSample();
     snapshot->bitRate = audio.getBitRate();
