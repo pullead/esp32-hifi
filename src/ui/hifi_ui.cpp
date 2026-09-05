@@ -1823,14 +1823,21 @@ void HifiUi::buildLocalMusic() {
     // Tabs: Songs / Artists / Albums, per the "分类,比如歌曲/歌手/专辑" ask.
     // Tapping Artists/Albums lists unique names; tapping a name filters
     // Songs down to just that group (onMusicGroupAction).
-    static const char* kTabLabels[3] = {"歌曲", "歌手", "专辑"};
-    for (uint8_t i = 0; i < 3; ++i) {
+    // 5 个视图。前三个是**浏览维度**（同一份曲库的三种看法），
+    // 后两个是**筛选出的子集** —— 概念不同但共用一排，因为屏幕放不下两层导航。
+    // "今日"用文字不用图标：LVGL 内置符号里没有合适的图案，
+    // 而认不出来的图标比短文字更糟。★ 用 CJK 字体子集里的字形。
+    constexpr uint8_t kMusicTabCount = 5;
+    static const char* kTabLabels[kMusicTabCount] = {"歌曲", "歌手", "专辑", "今日", "★"};
+    for (uint8_t i = 0; i < kMusicTabCount; ++i) {
         lv_obj_t* tab = lv_btn_create(screen);
         // 收紧（2026-09-05）：60/54/24 -> 44/40/20，y 6 -> 4。
         // 标签栏原本占 y=6..30 共 30px（屏高的 18%），列表只剩 128px ≈ 2.9 行。
         // ⚠️ 但主要空间不是被它吃掉的，是行高 —— 见下面 row_y 那里的说明。
-        lv_obj_set_pos(tab, 8 + i * 44, 4);
-        lv_obj_set_size(tab, 40, 20);
+        // 5 个标签：间距 40、宽 36，占到 x=8..204。
+        // 右上角"共 N 首"约从 x=257 起，不冲突。
+        lv_obj_set_pos(tab, 8 + i * 40, 4);
+        lv_obj_set_size(tab, 36, 20);
         lv_obj_set_style_radius(tab, 10, 0);
         lv_obj_set_style_bg_color(tab, m_musicTab == i ? kAccentDeep : kPanel, 0);
         lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
@@ -1894,7 +1901,8 @@ void HifiUi::buildLocalMusic() {
     m_musicGroupCount = 0;
     int32_t contentHeight = 0; // populated below, used to size the draggable scroll slider
 
-    if (m_musicTab != 0) {
+    // 1/2 是分组视图（歌手/专辑），0/3/4 都是曲目列表，只是过滤条件不同。
+    if (m_musicTab == 1 || m_musicTab == 2) {
         // Artists / Albums: unique names collected from the scanned tracks.
         for (uint16_t i = 0; i < trackCount && m_musicGroupCount < kMaxMusicGroups; ++i) {
             LocalTrackItem item{};
@@ -1929,18 +1937,31 @@ void HifiUi::buildLocalMusic() {
                 lv_obj_set_size(label, 232, lv_font_get_line_height(&lv_font_cjk_13));
                 lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);
             }
-            contentHeight = static_cast<int32_t>(m_musicGroupCount) * 40;
+            // ⚠️ 必须和上面的行距 g * 32 一致。之前把行距从 40 改成 32 时漏了
+            // 这里，滚动条范围会按错误的总高算 —— 拖到底时列表并没有到底。
+            contentHeight = static_cast<int32_t>(m_musicGroupCount) * 32;
         }
     } else if (!trackCount) {
         makeText(list, scanning ? "正在扫描SD卡…" : "未找到音乐文件", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
     } else {
         uint16_t row_y = 0;
         uint16_t shown = 0;
+        // 循环外取一次 —— 每行调一次 time() 是没必要的系统调用。
+        const uint32_t todayEpoch = static_cast<uint32_t>(time(nullptr));
         for (uint16_t i = 0; i < trackCount; ++i) {
             LocalTrackItem item{};
             if (!playerService.localTrack(i, &item)) continue;
             if (m_musicFilterArtist[0] && strcmp(item.artist, m_musicFilterArtist) != 0) continue;
             if (m_musicFilterAlbum[0] && strcmp(item.album, m_musicFilterAlbum) != 0) continue;
+            // 视图筛选。3=今日新增，4=收藏。
+            // ⚠️ importedAt 为 0 表示"不知道什么时候导入的"（写入时 RTC 没同步），
+            // **不是 1970 年** —— 所以 0 一律不算今天，否则老曲目会全涌进来。
+            if (m_musicTab == 3) {
+                const uint32_t imported = playerService.localTrackImportedAt(i);
+                if (!imported || !todayEpoch || imported / 86400u != todayEpoch / 86400u) continue;
+            } else if (m_musicTab == 4) {
+                if (!playerService.localTrackFavorite(i)) continue;
+            }
 
             lv_obj_t* row = lv_btn_create(list);
             lv_obj_set_pos(row, 0, row_y);
@@ -1992,10 +2013,19 @@ void HifiUi::buildLocalMusic() {
             // 单行放不下"歌手 · 专辑"两项，取歌手 —— 找歌时歌手比专辑更常用。
             const char* subText = item.artist[0] ? item.artist
                                 : (item.album[0] ? item.album : "未知艺术家");
-            lv_obj_t* detail = makeText(row, subText, &lv_font_cjk_13, kInkFaint, LV_ALIGN_RIGHT_MID, -10, 0);
+            // 歌手右对齐，但**固定让出最右侧 14px 给 ★**（无论这首有没有收藏）。
+            // 让位是固定的而不是按有没有 ★ 变化 —— 否则每行右边界会参差不齐。
+            lv_obj_t* detail = makeText(row, subText, &lv_font_cjk_13, kInkFaint, LV_ALIGN_RIGHT_MID, -24, 0);
             lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
-            lv_obj_set_size(detail, 84, lv_font_get_line_height(&lv_font_cjk_13));
+            lv_obj_set_size(detail, 76, lv_font_get_line_height(&lv_font_cjk_13));
             lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_RIGHT, 0);
+            // ★ 收藏标记：**纯显示，不可点击** —— 设置收藏在正在播放页那个大按钮上。
+            // 放在这里是为了能一眼扫出哪些曲目受保护（收藏 = 不被 Cleaner 淘汰），
+            // 而不可点击就不会把刚修好的列表误触问题带回来。
+            if (playerService.localTrackFavorite(i)) {
+                lv_obj_t* star = makeText(row, "★", &lv_font_cjk_13, kAccentBright, LV_ALIGN_RIGHT_MID, -6, 0);
+                lv_obj_clear_flag(star, LV_OBJ_FLAG_CLICKABLE);
+            }
             // ⚠️ 这里原来放 LV_SYMBOL_IMAGE 表示"内嵌封面"，2026-09-05 删除：
             // 信息价值很低（进播放页一眼就看到有没有封面），却让每行多一个标签、
             // 每帧多渲染一次 —— 滚动时 CPU 已经 74~79%。

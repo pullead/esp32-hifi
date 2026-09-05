@@ -273,6 +273,8 @@ class PlayerService {
     // 收藏的作用是**保护曲目不被 Cleaner 淘汰**，所以在真实删除开启前必须先有
     // 设置入口，否则用户没有任何办法保住想留的歌。
     bool localTrackFavorite(uint16_t index) const;
+    // 进入索引的时间（epoch）。0 = 不知道（RTC 当时没同步），不是 1970。
+    uint32_t localTrackImportedAt(uint16_t index) const;
     void setLocalTrackFavorite(uint16_t index, bool on);
     // 上一次真正播放过的音源（跨重启保留）。什么都没播时首页"正在播放"
     // 用它决定进哪个播放页；从未播放过则返回 None。

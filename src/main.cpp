@@ -3093,6 +3093,14 @@ int32_t playerCoreLibraryIndexOf(uint8_t kind, uint16_t nth) {
     return -1;
 }
 
+// 曲目进入索引的时间（epoch）。"今日新增"视图靠它筛。
+// ⚠️ RTC 未同步时写入的是 0 —— 见 s_scanNowEpoch 的说明。所以 0 不代表
+// "1970 年"，代表"不知道什么时候导入的"，筛选时要当成"不是今天"。
+uint32_t playerCoreTrackImportedAt(uint16_t index) {
+    if (!s_localTracks || index >= s_localTrackCount) return 0;
+    return s_localTracks[index].importedAt;
+}
+
 bool playerCoreTrackFavorite(uint16_t index) {
     return s_localTracks && index < s_localTrackCount && (s_localTracks[index].flags & kTrackFlagFavorite);
 }
