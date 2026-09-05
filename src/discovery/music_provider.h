@@ -29,10 +29,22 @@ struct RemoteTrack {
 };
 
 struct DiscoveryRequest {
-    // 语言。nullptr / "" = 不限。
-    // ⚠️ 这是**目标**不是硬条件：Jamendo 的中日文可下载曲目很少，
-    // 请求 zh/ja 经常返回不足甚至为空，调用方必须准备好回填（方案 §4）。
-    const char* lang = nullptr;
+    // 风格标签，如 "pop" / "rock" / "hiphop"。nullptr / "" = 不限。
+    //
+    // ⚠️ **2026-09-05 用风格取代了原来的语言维度。** 实测语言过滤名不副实：
+    // lang=zh 返回的 6 条里只有 1 条真是中文，其余是 ProleteR、Prorock 之类。
+    // 而风格标签实测干净：tags=pop/rock/hiphop 各返回 5/5 全部可下载、无警告。
+    const char* tags = nullptr;
+
+    // 发行日期窗口，格式 "YYYY-MM-DD"。两者都给才会下发 datebetween。
+    //
+    // ⚠️ **"近期热门"必须靠日期窗口 + 热度排序两个参数一起表达。**
+    // 实测只用 order=popularity_week 会捞到 2010/2014/2015 年的歌 ——
+    // Jamendo 的"热门"默认是累积热度，和"近期"完全是两回事：
+    //   order=popularity_week           -> 2025,2014,2015,2021,2010
+    //   +datebetween=2025-09-01_2026-09-05 -> 2025-11,2026-06,2026-04,2026-03
+    const char* dateFrom = nullptr;
+    const char* dateTo = nullptr;
 
     // 单次请求条数。**硬上限 kMaxTracksPerRequest**。
     // 理由见审计 §5：现有 JSON 解析是把整个响应装进内存再扫，条数一多就会
@@ -65,4 +77,14 @@ class MusicProvider {
     // 下游"成为结构上的保证，而不是依赖每个调用方都记得检查。
     virtual uint8_t fetchCandidates(const DiscoveryRequest& request,
                                     RemoteTrack* out, uint8_t maxOut) = 0;
+
+    // 上次响应里**过滤前**的条目数。
+    //
+    // ⚠️ 存在的理由：fetchCandidates() 的返回值是**过滤后**的（只留
+    // audiodownload_allowed 的），用它判断"翻到候选池尽头了吗"会错 ——
+    // 2026-09-05 实测：请求 20 条、API 给 20 条、其中 1 条不可下载 → 返回 19，
+    // 于是 "n < limit ⇒ 到底了" 恒成立，offset 永远停在 0，
+    // 每个风格的候选池被锁死在第一页。
+    // 判断分页到底必须看这个数。
+    virtual uint16_t lastRawCount() const { return 0; }
 };

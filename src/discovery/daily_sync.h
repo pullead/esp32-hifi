@@ -17,8 +17,9 @@
 //      10 首就是 25~35 分钟。所以这一轮必须是长时间后台任务，
 //      而且要能被随时中断而不留下半截状态。
 //
-//   4. **边播边下是安全的**（本地和电台都实测过零饥饿，节流已生效），
-//      所以**不做**"只在没播放时才下载"这种保守设计。
+//   4. **电台在播时要让路。** 实测后台下载会让电台明显卡顿（本地音乐不卡），
+//      机制指向 DMA 内部 RAM 被压到 836B/最大块 160B，而 WiFi 接收依赖它。
+//      所以电台在播就推迟这一轮，不是限速了事。
 //
 //   5. **不删除任何文件。** 空间不够就停下并记账。真实删除属于
 //      library_cleaner 的后续工作，需要单独的验证和用户确认，
@@ -41,6 +42,17 @@ struct DailySyncConfig {
     uint8_t  candidatesPerFetch = 20;  // 受 kMaxTracksPerRequest 限制
     uint8_t  fetchRetries = 3;         // 拉到空数组时重试几次
     uint16_t fetchRetryDelayMs = 5000;
+
+    // "近期"窗口：只要最近这么多天内发行的曲目。
+    //
+    // ⚠️ **必须和热度排序一起用才是"近期热门"。** 实测只用
+    // order=popularity_week 会捞到 2010/2014/2015 年的歌 —— Jamendo 的"热门"
+    // 默认是累积热度：
+    //   order=popularity_week                -> 2025,2014,2015,2021,2010
+    //   + datebetween=2025-09-01_2026-09-05  -> 2025-11,2026-06,2026-04,2026-03
+    //
+    // 365 天是个折中：窗口太窄候选池会小到几十首，offset 翻两轮就到底了。
+    uint16_t recentDays = 365;
 };
 
 // 跨轮次要记住的东西。由调用方存 NVS 并在下一轮传回来。
@@ -50,10 +62,13 @@ struct DailySyncConfig {
 // 全部命中"已拥有"然后空跑一轮。
 struct DailySyncState {
     uint32_t lastRunDay = 0;   // nowEpoch / 86400，判断今天跑没跑过
-    uint16_t offsetZh = 0;
-    uint16_t offsetJa = 0;
-    uint16_t offsetEn = 0;
-    uint16_t offsetAny = 0;
+    // 每档一个 offset。2026-09-05 从"语言"改成"风格"：
+    // 实测语言过滤名不副实（lang=zh 的 6 条里只有 1 条真是中文），
+    // 而风格标签干净（tags=pop/rock/hiphop 各 5/5 全可下载）。
+    uint16_t offsetPop = 0;
+    uint16_t offsetRock = 0;
+    uint16_t offsetHiphop = 0;
+    uint16_t offsetAny = 0;    // 回填档
 };
 
 struct DailySyncStats {

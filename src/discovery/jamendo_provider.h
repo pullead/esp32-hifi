@@ -32,12 +32,15 @@ class JamendoProvider : public MusicProvider {
     uint8_t fetchCandidates(const DiscoveryRequest& request,
                             RemoteTrack* out, uint8_t maxOut) override;
 
+    uint16_t lastRawCount() const override { return m_lastRawCount; }
+
     // 最近一次失败的原因，用于 UI/日志。没失败过返回空串。
     const char* lastError() const { return m_lastError; }
 
   private:
     char m_clientId[40]{};
     char m_lastError[64]{};
+    uint16_t m_lastRawCount = 0;
 };
 
 // 解析 Jamendo 的 tracks 响应体。**独立出来是为了能不联网就测**：
@@ -45,4 +48,7 @@ class JamendoProvider : public MusicProvider {
 // 也不用受网络波动影响。fetchCandidates() 内部就是调它。
 //
 // 返回填入的条数。只填 audiodownload_allowed == true 的曲目。
-uint8_t jamendoParseTracks(const char* body, RemoteTrack* out, uint8_t maxOut);
+// rawOut（可选）回填**过滤前**扫到的条目数，用于判断分页是否到底 ——
+// 返回值本身是过滤后的，不能拿来判断（见 music_provider.h 的说明）。
+uint8_t jamendoParseTracks(const char* body, RemoteTrack* out, uint8_t maxOut,
+                           uint16_t* rawOut = nullptr);

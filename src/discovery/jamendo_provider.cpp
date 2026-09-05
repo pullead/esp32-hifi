@@ -120,7 +120,9 @@ bool getBool(const char* begin, const char* end, const char* key) {
 
 // ---------------------------------------------------------------------------
 
-uint8_t jamendoParseTracks(const char* body, RemoteTrack* out, uint8_t maxOut) {
+uint8_t jamendoParseTracks(const char* body, RemoteTrack* out, uint8_t maxOut,
+                           uint16_t* rawOut) {
+    if (rawOut) *rawOut = 0;
     if (!body || !out || !maxOut) return 0;
     const char* end = body + strlen(body);
 
@@ -129,11 +131,15 @@ uint8_t jamendoParseTracks(const char* body, RemoteTrack* out, uint8_t maxOut) {
     const char* p = results + 1;
 
     uint8_t n = 0;
+    uint16_t raw = 0;      // 过滤前扫到的条目数
     while (p < end && n < maxOut) {
         while (p < end && (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) ++p;
         if (p >= end || *p != '{') break;   // ']' 或格式异常，结束
         const char* objEnd = skipObject(p, end);
         if (!objEnd) break;
+
+        ++raw;
+        if (rawOut) *rawOut = raw;
 
         RemoteTrack t{};
         // ⚠️ 只收允许下载的。过滤放在这里，让"不允许下载的东西根本不会流入下游"
@@ -196,8 +202,15 @@ uint8_t JamendoProvider::fetchCandidates(const DiscoveryRequest& request,
                        "&limit=%u&offset=%u"
                        "&audiodlformat=mp32&imagesize=200&include=musicinfo",
                        m_clientId, limit, request.offset);
-    if (request.lang && request.lang[0] && len > 0 && len < static_cast<int>(sizeof(url))) {
-        len += snprintf(url + len, sizeof(url) - len, "&lang=%s", request.lang);
+    if (request.tags && request.tags[0] && len > 0 && len < static_cast<int>(sizeof(url))) {
+        len += snprintf(url + len, sizeof(url) - len, "&tags=%s", request.tags);
+    }
+    // ⚠️ 只有 from 和 to 都给了才下发 —— Jamendo 的 datebetween 需要成对，
+    // 只给一半会变成一个形状不对的参数值。
+    if (request.dateFrom && request.dateFrom[0] && request.dateTo && request.dateTo[0] &&
+        len > 0 && len < static_cast<int>(sizeof(url))) {
+        len += snprintf(url + len, sizeof(url) - len, "&datebetween=%s_%s",
+                        request.dateFrom, request.dateTo);
     }
     if (request.order && request.order[0] && len > 0 && len < static_cast<int>(sizeof(url))) {
         snprintf(url + len, sizeof(url) - len, "&order=%s", request.order);
@@ -223,7 +236,8 @@ uint8_t JamendoProvider::fetchCandidates(const DiscoveryRequest& request,
     const String body = http.getString();
     http.end();
 
-    const uint8_t n = jamendoParseTracks(body.c_str(), out, limit);
+    m_lastRawCount = 0;
+    const uint8_t n = jamendoParseTracks(body.c_str(), out, limit, &m_lastRawCount);
     if (!n) {
         snprintf(m_lastError, sizeof(m_lastError), "0 tracks from %u bytes", body.length());
         // ⚠️ 解析不出东西时**必须把响应本身打出来**，否则只能靠猜。
@@ -234,7 +248,11 @@ uint8_t JamendoProvider::fetchCandidates(const DiscoveryRequest& request,
         strlcpy(head, body.c_str(), sizeof(head));
         printf("[JAMENDO][RAW] %s\n", head);
     }
-    printf("[JAMENDO] lang=%s offset=%u -> %u tracks (%u bytes)\n",
-           request.lang ? request.lang : "any", request.offset, n, body.length());
+    printf("[JAMENDO] tags=%s offset=%u -> %u tracks (%u bytes)\n",
+           request.tags ? request.tags : "any", request.offset, n, body.length());
+    if (m_lastRawCount != n) {
+        printf("[JAMENDO]   (raw=%u, %u filtered out as not downloadable)\n",
+               m_lastRawCount, m_lastRawCount - n);
+    }
     return n;
 }

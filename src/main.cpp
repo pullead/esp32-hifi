@@ -1811,7 +1811,10 @@ static R6Stats r6StatsSnapshot() {
 // 状态存 NVS。daily_sync 模块本身不碰 NVS —— pref 的加锁在本文件里，
 // 让下层模块去拿这个锁会把分层搞乱，所以状态通过结构体进出。
 static constexpr const char* kSyncDayPrefKey = "sync_day";
-static constexpr const char* kSyncOffPrefKey = "sync_off";   // 四个 offset 打包成一个 u64
+// ⚠️ key 从 "sync_off" 换成 "sync_off2"：2026-09-05 把配额维度从语言改成
+// 风格，四个 offset 的**含义变了**。沿用旧 key 会把"英文档的 offset"当成
+// "hiphop 档的 offset"接着用 —— 不会崩，但会静默地从一个毫无关系的位置开始翻。
+static constexpr const char* kSyncOffPrefKey = "sync_off2";  // 四个 offset 打包成一个 u64
 
 // 每轮下载几首。见 dailySyncTask 里的说明。
 constexpr uint8_t kDailySyncTracksPerDay = 10;
@@ -1837,9 +1840,9 @@ static void dailySyncLoadState() {
     if (!lockPreferences()) return;
     s_syncState.lastRunDay = pref.getUInt(kSyncDayPrefKey, 0);
     const uint64_t packed = pref.getULong64(kSyncOffPrefKey, 0);
-    s_syncState.offsetZh  = static_cast<uint16_t>(packed & 0xFFFF);
-    s_syncState.offsetJa  = static_cast<uint16_t>((packed >> 16) & 0xFFFF);
-    s_syncState.offsetEn  = static_cast<uint16_t>((packed >> 32) & 0xFFFF);
+    s_syncState.offsetPop  = static_cast<uint16_t>(packed & 0xFFFF);
+    s_syncState.offsetRock  = static_cast<uint16_t>((packed >> 16) & 0xFFFF);
+    s_syncState.offsetHiphop  = static_cast<uint16_t>((packed >> 32) & 0xFFFF);
     s_syncState.offsetAny = static_cast<uint16_t>((packed >> 48) & 0xFFFF);
     unlockPreferences();
 }
@@ -1847,9 +1850,9 @@ static void dailySyncLoadState() {
 static void dailySyncSaveState() {
     if (!lockPreferences()) return;
     pref.putUInt(kSyncDayPrefKey, s_syncState.lastRunDay);
-    const uint64_t packed = static_cast<uint64_t>(s_syncState.offsetZh)
-                          | (static_cast<uint64_t>(s_syncState.offsetJa) << 16)
-                          | (static_cast<uint64_t>(s_syncState.offsetEn) << 32)
+    const uint64_t packed = static_cast<uint64_t>(s_syncState.offsetPop)
+                          | (static_cast<uint64_t>(s_syncState.offsetRock) << 16)
+                          | (static_cast<uint64_t>(s_syncState.offsetHiphop) << 32)
                           | (static_cast<uint64_t>(s_syncState.offsetAny) << 48);
     pref.putULong64(kSyncOffPrefKey, packed);
     unlockPreferences();
@@ -1901,7 +1904,7 @@ static void jamendoProbeTask(void*) {
     RemoteTrack* tracks = static_cast<RemoteTrack*>(ps_calloc(5, sizeof(RemoteTrack)));
     if (tracks) {
         DiscoveryRequest req;
-        req.lang = nullptr;              // 先不限语言，只验链路通不通
+        req.tags = nullptr;              // 不限风格，只验链路通不通
         req.limit = 5;
         req.offset = 0;
         req.order = "popularity_month";
@@ -2748,6 +2751,62 @@ static bool extractId3Picture(const char* path, uint8_t** outData, size_t* outLe
     return ok;
 }
 
+// 从文件名反推 provider 元数据。
+//
+// ⚠️ **为什么需要这个**：索引只在整轮同步结束时存盘一次（750KB，每首存一次
+// 太重）。一旦中途重启/断电，已下好的文件还在 SD 上，索引里却没有记录 ——
+// 下次开机扫描会把它们当成普通本地文件收进去：provider=local、没有
+// providerTrackId、没有 Discovery 标记。后果有两个，都不轻：
+//   1. 去重靠 provider+providerTrackId，认不出来 ⇒ **重复下载**
+//      （2026-09-05 实测：中断后重跑，第一首又下了一遍 "Vlog Journey"）
+//   2. 丢了 Discovery 标记 ⇒ Cleaner 当成用户自己的歌，**永不淘汰**
+//
+// 让文件名可还原元数据，索引就退化成缓存而不是唯一真相 —— 这比"更频繁地
+// 存盘"稳健得多，也不用多写一次盘。
+// 命名规则见 dailySyncBuildPath()：/music/tracks/<provider>_<id>.mp3
+static void deriveProviderFromFilename(TrackRecord* item) {
+    if (!item || !item->path[0]) return;
+
+    // 只认 tracks 目录下的文件，避免用户自己拷进来的同名文件被误判。
+    // 大小写不敏感 —— SD 上真实目录是 /Music（见 libraryHashPath 的说明）。
+    bool inTracksDir = false;
+    for (const char* p = item->path; *p; ++p) {
+        if ((p[0] == '/') &&
+            (p[1] == 't' || p[1] == 'T') && (p[2] == 'r' || p[2] == 'R') &&
+            (p[3] == 'a' || p[3] == 'A') && (p[4] == 'c' || p[4] == 'C') &&
+            (p[5] == 'k' || p[5] == 'K') && (p[6] == 's' || p[6] == 'S') &&
+            p[7] == '/') {
+            inTracksDir = true;
+            break;
+        }
+    }
+    if (!inTracksDir) return;
+
+    const char* slash = strrchr(item->path, '/');
+    const char* base = slash ? slash + 1 : item->path;
+
+    static const char kPrefix[] = "jamendo_";
+    const size_t plen = sizeof(kPrefix) - 1;
+    for (size_t i = 0; i < plen; ++i) {
+        char c = base[i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != kPrefix[i]) return;
+    }
+
+    // 前缀之后到 '.' 之前必须全是数字，否则不是我们下的文件
+    const char* idStart = base + plen;
+    const char* q = idStart;
+    while (*q >= '0' && *q <= '9') ++q;
+    if (q == idStart || *q != '.') return;
+
+    const size_t idLen = static_cast<size_t>(q - idStart);
+    if (idLen >= sizeof(item->providerTrackId)) return;
+    memcpy(item->providerTrackId, idStart, idLen);
+    item->providerTrackId[idLen] = '\0';
+    item->provider = kProviderJamendo;
+    item->flags |= kTrackFlagDiscovery;
+}
+
 static void scanMusicDir(const char* path, uint8_t depth) {
     if (usbStorageBlocksSdAppAccess()) return;
     if (!s_localTracks || s_localTrackCount >= s_localTrackCapacity || depth > 6) return;
@@ -2787,9 +2846,29 @@ static void scanMusicDir(const char* path, uint8_t depth) {
             // 在下次扫描时被判成"不存在"（标 missing）同时又被当新曲追加，
             // 说明 daily_sync 写的路径和 entry.path() 对不上 —— 但对不上在哪
             // 靠猜没结果，得把两边的路径原样打出来。
+            deriveProviderFromFilename(&item);
             const uint16_t beforeCount = s_localTrackCount;
-            libraryStoreUpsert(s_localTracks, &s_localTrackCount, s_localTrackCapacity,
-                               item, s_scanSeenBits, s_scanNowEpoch);
+            const int32_t upIdx = libraryStoreUpsert(s_localTracks, &s_localTrackCount,
+                                                     s_localTrackCapacity, item,
+                                                     s_scanSeenBits, s_scanNowEpoch);
+
+            // ⚠️ 补救已经被误收成 local 的记录。
+            // libraryStoreUpsert 命中已有记录时**刻意不覆盖 provider/flags**
+            // （防止重扫清掉用户行为的产物），所以上面那个反推只对新记录生效。
+            // 而中断过的同步恰恰会留下一批"文件在、记录是 local"的旧条目 ——
+            // 不补的话它们永远不会被 Cleaner 淘汰。
+            //
+            // **只在现有记录压根没有 providerTrackId 时才填**，绝不覆盖已有值：
+            // 有值说明它本来就是 provider 曲目，轮不到从文件名猜。
+            if (upIdx >= 0 && item.provider != kProviderLocal &&
+                s_localTracks[upIdx].providerTrackId[0] == '\0') {
+                s_localTracks[upIdx].provider = item.provider;
+                strlcpy(s_localTracks[upIdx].providerTrackId, item.providerTrackId,
+                        sizeof(s_localTracks[upIdx].providerTrackId));
+                s_localTracks[upIdx].flags |= kTrackFlagDiscovery;
+                printf("[MUSIC][ADOPT] %s -> provider=%u id=%s\n",
+                       item.path, item.provider, item.providerTrackId);
+            }
             if (s_localTrackCount > beforeCount) {
                 printf("[MUSIC][NEW] path=\"%s\" id=%lu\n", item.path,
                        static_cast<unsigned long>(libraryHashPath(item.path)));

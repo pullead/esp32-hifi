@@ -21,21 +21,28 @@ constexpr uint32_t kNetAudioWaitMaxMs = 10u * 60 * 1000;
 // 由调用方注入，判断是否有网络供给的音频在播。
 DownloadNetAudioFn s_netAudioFn = nullptr;
 
-// 语言配额。
+// 风格配额（2026-09-05 从"语言"改过来）。
 //
-// ⚠️ **2026-09-05 实测修正了这里原本的前提。** 原先写的是"中日可下载曲目非常
-// 少，所以这两档填不满"—— 不准确。实测 lang=zh / lang=ja 都能正常返回结果，
-// 真正的问题是**Jamendo 的 lang 过滤很松**：它按元数据/标签筛，返回的大多数
-// 并不是该语言的歌。lang=zh 的 6 条里只有 1 条真是中文
+// 为什么弃用语言维度：实测 Jamendo 的 lang 过滤很松，按元数据/标签筛，
+// 返回的大多数并不是该语言的歌 —— lang=zh 的 6 条里只有 1 条真是中文
 // （"凌晨三点的便利店 - 小风啊哈"），其余是 ProleteR、Prorock 之类。
 //
-// 所以这两档不会填不满，而是会填进一堆**名不副实**的曲目。
-// 结果上接近"中日歌很少"，但机制完全不同，排查时别被原来的说法误导。
-struct LangSlot {
-    const char* lang;      // nullptr = 不限语言
+// 风格标签则很干净：实测 tags=pop / rock / hiphop 各返回 5/5 全部可下载、
+// 无警告。这是 Jamendo 真正擅长的维度。
+struct GenreSlot {
+    const char* tags;      // nullptr = 不限（回填档）
     uint8_t     quota;
     uint16_t*   offset;    // 指向 DailySyncState 里对应的 offset
 };
+
+// 把 epoch 格式化成 Jamendo 要的 "YYYY-MM-DD"
+void formatDay(uint32_t epoch, char* out, size_t outSize) {
+    if (!out || outSize < 11) return;
+    const time_t t = static_cast<time_t>(epoch);
+    struct tm ti;
+    gmtime_r(&t, &ti);
+    snprintf(out, outSize, "%04d-%02d-%02d", ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday);
+}
 
 // 一条候选是否值得尝试
 bool candidateUsable(const RemoteTrack& t) {
@@ -101,16 +108,32 @@ void dailySyncRun(MusicProvider& provider,
 
     const uint32_t startMs = millis();
 
-    // 配额切分。tracksPerDay=10 时是 中3 / 日3 / 英4，剩下的靠回填。
-    const uint8_t quotaZh = cfg.tracksPerDay * 3 / 10;
-    const uint8_t quotaJa = cfg.tracksPerDay * 3 / 10;
-    const uint8_t quotaEn = cfg.tracksPerDay - quotaZh - quotaJa;
-    LangSlot slots[] = {
-        {"zh", quotaZh, &state->offsetZh},
-        {"ja", quotaJa, &state->offsetJa},
-        {"en", quotaEn, &state->offsetEn},
-        {nullptr, cfg.tracksPerDay, &state->offsetAny},   // 回填档：能填多少填多少
+    // 配额切分。tracksPerDay=10 时是 pop4 / rock4 / hiphop4（受总数封顶），
+    // 实际会在拿满 10 首时停下，剩余靠回填。
+    //
+    // ⚠️ 用 (n + 2) / 3 而不是 n * 3 / 10：后者在 tracksPerDay 较小时会算出 0，
+    // 整档被静默跳过 —— 2026-09-05 的 3 首验证就是这么把配额路径整个漏掉的
+    // （3 * 3 / 10 = 0），跑完才发现那条路根本没走到。
+    const uint8_t per = (cfg.tracksPerDay + 2) / 3;
+    GenreSlot slots[] = {
+        {"pop",    per, &state->offsetPop},
+        {"rock",   per, &state->offsetRock},
+        {"hiphop", per, &state->offsetHiphop},
+        // 回填档：不带风格。留着它是因为**间歇性空返回是常态**（约 15~30%），
+        // 某一档撞上就会少歌，靠这档补齐。
+        {nullptr, cfg.tracksPerDay, &state->offsetAny},
     };
+
+    // 滚动的"近期"窗口。用 RTC 算 —— 这依赖 s_f_rtc 真的可用，而它在
+    // 2026-09-05 之前因为 RTIME::hasValidTime() 的成员遮蔽 bug 恒为 false。
+    char dateFrom[12] = {0};
+    char dateTo[12] = {0};
+    if (nowEpoch && cfg.recentDays) {
+        formatDay(nowEpoch, dateTo, sizeof(dateTo));
+        const uint32_t span = static_cast<uint32_t>(cfg.recentDays) * 86400u;
+        formatDay(nowEpoch > span ? nowEpoch - span : 0, dateFrom, sizeof(dateFrom));
+        printf("[SYNC] recent window %s .. %s\n", dateFrom, dateTo);
+    }
 
     uint8_t limit = cfg.candidatesPerFetch;
     if (limit > kMaxTracksPerRequest) limit = kMaxTracksPerRequest;
@@ -134,7 +157,7 @@ void dailySyncRun(MusicProvider& provider,
     }
 
     for (uint8_t s = 0; s < sizeof(slots) / sizeof(slots[0]); ++s) {
-        const LangSlot& slot = slots[s];
+        const GenreSlot& slot = slots[s];
         uint8_t gotForSlot = 0;
 
         while (gotForSlot < slot.quota &&
@@ -146,10 +169,13 @@ void dailySyncRun(MusicProvider& provider,
             uint8_t n = 0;
             for (uint8_t attempt = 0; attempt < cfg.fetchRetries; ++attempt) {
                 DiscoveryRequest req;
-                req.lang = slot.lang;
+                req.tags = slot.tags;
                 req.limit = limit;
                 req.offset = *slot.offset;
-                req.order = "popularity_month";
+                // 周热度 + 日期窗口 = "近期热门"。单用排序会捞到十几年前的歌。
+                req.order = "popularity_week";
+                req.dateFrom = dateFrom[0] ? dateFrom : nullptr;
+                req.dateTo = dateTo[0] ? dateTo : nullptr;
                 n = provider.fetchCandidates(req, cands, limit);
                 if (n) break;
                 ++st.emptyFetches;
@@ -157,13 +183,32 @@ void dailySyncRun(MusicProvider& provider,
             }
             if (!n) {
                 // 这一档拉不到东西，换下一档，别死磕。
-                printf("[SYNC] lang=%s offset=%u -> empty, moving on\n",
-                       slot.lang ? slot.lang : "any", *slot.offset);
+                printf("[SYNC] tags=%s offset=%u -> empty, moving on\n",
+                       slot.tags ? slot.tags : "any", *slot.offset);
                 break;
             }
 
             // offset 推进：**不管这批用没用上都要推**，否则下一轮还是这批。
-            *slot.offset = static_cast<uint16_t>(*slot.offset + n);
+            //
+            // ⚠️ **用 lastRawCount() 判断分页到底，不能用 n。**
+            // n 是**过滤后**的数量（只留可下载的）。2026-09-05 实测：请求 20 条、
+            // API 给 20 条、其中 1 条不可下载 → n = 19，于是 "n < limit ⇒ 到底了"
+            // 恒成立，offset 永远停在 0，每个风格的候选池被锁死在第一页 19 首，
+            // offset 推进等于完全失效。
+            //
+            // 加了 datebetween 之后池子小很多（一年内 + 某个风格），
+            // 不回绕的话 offset 会一路涨到池外，之后每次都拉空 —— 所以回绕要有，
+            // 只是判据得对。
+            const uint16_t raw = provider.lastRawCount();
+            if (raw < limit) {
+                printf("[SYNC] tags=%s pool end at offset=%u (raw=%u), wrap to 0\n",
+                       slot.tags ? slot.tags : "any", *slot.offset, raw);
+                *slot.offset = 0;
+            } else {
+                // 按**请求条数**推进，不是按过滤后的 n —— 否则被过滤掉的那些
+                // 会在下一页重新出现，越翻越慢。
+                *slot.offset = static_cast<uint16_t>(*slot.offset + limit);
+            }
 
             bool progressed = false;
             for (uint8_t i = 0; i < n; ++i) {
@@ -231,7 +276,7 @@ void dailySyncRun(MusicProvider& provider,
                 DownloadStats ds{};
                 const DownloadResult r = downloadToFile(t.audioUrl, path, nullptr, &ds);
                 printf("[SYNC] %s try#%u %s %luKB %lums thr=%lux rate=%lums net=%d \"%s\"\n",
-                       slot.lang ? slot.lang : "any", st.attempts,
+                       slot.tags ? slot.tags : "any", st.attempts,
                        downloadResultName(r),
                        static_cast<unsigned long>(ds.bytesWritten / 1024),
                        static_cast<unsigned long>(ds.elapsedMs),
@@ -293,8 +338,8 @@ void dailySyncRun(MusicProvider& provider,
                 if (st.attempts >= cfg.maxAttempts) break;
                 if (st.skippedOwned > cfg.maxAttempts * 4) {
                     // 大面积重复，说明这一档已经被下完了，别再空转。
-                    printf("[SYNC] lang=%s exhausted (owned=%u)\n",
-                           slot.lang ? slot.lang : "any", st.skippedOwned);
+                    printf("[SYNC] tags=%s exhausted (owned=%u)\n",
+                           slot.tags ? slot.tags : "any", st.skippedOwned);
                     break;
                 }
             }
