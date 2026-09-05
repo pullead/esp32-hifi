@@ -374,7 +374,9 @@ bool WaveshareLvglPort::begin() {
     // slow-down"). Was 18; dropped toward LVGL's own ~10 default so a flick
     // on the local-music list actually glides and decelerates instead of
     // stopping the instant the finger lifts.
-    m_touchDriver.scroll_throw = 10;
+    // 抛掷后的减速百分比，**越大停得越快**（10 是 LVGL 默认）。
+    // 调小 => 惯性更明显、滑得更远。用户要求增加惯性感。
+    m_touchDriver.scroll_throw = 4;
     m_touchDriver.gesture_limit = 56;
     m_touchDriver.long_press_time = 450;
     m_touchIndev = lv_indev_drv_register(&m_touchDriver);

@@ -3124,12 +3124,24 @@ bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16
     }
     uint8_t* jpegData = nullptr;
     size_t jpegLen = 0;
+    const uint32_t coverExtractStart = millis();
     if (!extractId3Picture(s_localTracks[index].path, &jpegData, &jpegLen)) {
         printf("[COVER] idx=%u extractId3Picture failed (path=%s)\n", index, s_localTracks[index].path);
         return false;
     }
-    printf("[COVER] idx=%u extracted %u JPEG bytes, decoding...\n", index, static_cast<unsigned>(jpegLen));
+    // ⚠️ 这两步都是**阻塞的，而且跑在 UI 线程上**：extractId3Picture 要在 MP3
+    // 文件里 seek 找图片，decodeJpgFromMemory 是纯 CPU 解码。
+    // 2026-09-05 滚动测量里抓到过单次 lv_timer_handler 阻塞 904ms 的尖峰，
+    // 形态是"刷屏很少却占满 CPU"，高度怀疑就是这里。分别计时才能定性。
+    const uint32_t coverDecodeStart = millis();
+    printf("[COVER] idx=%u extracted %u JPEG bytes (%lums), decoding...\n",
+           index, static_cast<unsigned>(jpegLen),
+           static_cast<unsigned long>(coverDecodeStart - coverExtractStart));
     const bool ok = getTFT().decodeJpgFromMemory(jpegData, jpegLen, scaleFactor, outPixels, outWidth, outHeight);
+    printf("[COVER] idx=%u decode %lums (extract %lums, total %lums)\n", index,
+           static_cast<unsigned long>(millis() - coverDecodeStart),
+           static_cast<unsigned long>(coverDecodeStart - coverExtractStart),
+           static_cast<unsigned long>(millis() - coverExtractStart));
     if (!ok) printf("[COVER] idx=%u decodeJpgFromMemory failed\n", index);
     free(jpegData);
     return ok;

@@ -19,6 +19,11 @@ extern bool playerCoreUsbDacActive();
 #include <cstdio>
 #include <cstring>
 
+// 滚动误触保护的前置声明 —— 定义在 onMusicTrackAction 附近，
+// 但列表构建（buildMusicPage）在文件更前面就要用到。
+static void rowScrollGuardArm(lv_event_t* e);
+static bool rowClickWasScroll(lv_event_t* e);
+
 // Palette v2 (2026-07-23): switched from the dark graphite/copper spec to a
 // light lavender/purple identity per explicit product direction -- see
 // docs/UI_DESIGN_SPEC.md's v2 addendum. Layout grid (status bar/control bar/
@@ -1839,7 +1844,7 @@ void HifiUi::buildLocalMusic() {
                 lv_obj_set_style_shadow_width(row, 0, 0);
                 lv_obj_set_style_pad_all(row, 0, 0);
                 lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-                addPressFx(row);
+                lv_obj_add_event_cb(row, rowScrollGuardArm, LV_EVENT_PRESSED, nullptr);
                 lv_obj_add_event_cb(row, onMusicGroupAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(g)));
                 lv_obj_t* label = makeText(row, m_musicGroupNames[g], &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 10, 0);
                 lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
@@ -1862,27 +1867,37 @@ void HifiUi::buildLocalMusic() {
             lv_obj_t* row = lv_btn_create(list);
             lv_obj_set_pos(row, 0, row_y);
             lv_obj_set_size(row, 278, 40);
-            lv_obj_set_style_radius(row, 10, 0);
+            // ⚠️ 圆角半径直接决定滚动时的渲染开销 —— LVGL 8 的圆角要逐像素
+            // 做遮罩，成本大致正比于半径的平方（角落面积）。
+            // 2026-09-05 滚动实测（同样负载）：
+            //   radius=10 -> 单次 handler 最长阻塞 42~47ms，busy 60~89%
+            //   radius=0  -> 21~30ms，busy 45~77%，flush/s 反而更高
+            // 47ms 的阻塞意味着那段时间既不出帧也不采样触摸，正是不跟手的
+            // 直接原因。取 4 是折中：角落面积只有 10 的约 16%，观感仍圆润。
+            lv_obj_set_style_radius(row, 4, 0);
             lv_obj_set_style_bg_color(row, kPanel, 0);
             lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
             lv_obj_set_style_border_width(row, 0, 0);
             lv_obj_set_style_shadow_width(row, 0, 0);
             lv_obj_set_style_pad_all(row, 0, 0);
             lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-            addPressFx(row);
+            // ⚠️ 列表行**不加 addPressFx**：手指一碰就高亮，滑动时每经过一行都
+            // 闪一下"被选中"，是纯噪音（用户反馈"好像没啥必要"）。
+            // 按钮那种明确的点击目标才需要按下反馈，列表行不需要。
+            lv_obj_add_event_cb(row, rowScrollGuardArm, LV_EVENT_PRESSED, nullptr);
             lv_obj_add_event_cb(row, onMusicTrackAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
 
             const char* titleText = item.title[0] ? item.title : "未知曲目";
             lv_obj_t* title = makeText(row, titleText, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 10, -10);
             lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
             lv_obj_set_width(title, 178);
-            // No bold variant of this baked CJK font exists (would need a
-            // full font-asset regen), so a second copy of the same label
-            // 1px to the right, redrawn on top, fakes heavier strokes --
-            // a common cheap trick for embedded UIs without a bold font.
-            lv_obj_t* titleBold = makeText(row, titleText, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 11, -10);
-            lv_label_set_long_mode(titleBold, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(titleBold, 178);
+            // ⚠️ **伪粗体的副本已删除。**
+            // 原来这里再画一份完全相同的标题、右移 1px 叠上去来假装粗体
+            // （没有粗体字重的常见土办法）。代价是**每行的标题每帧渲染两遍**，
+            // 而 CJK 字形的 4bpp 抗锯齿混合正是滚动时最贵的操作。
+            // 2026-09-05 实测滚动时单帧阻塞已达 42~47ms，这份副本是纯浪费：
+            // 去掉零信息损失，直接省掉一次完整文本渲染。
+            // 需要强调标题的话，用颜色对比（kInk vs kInkFaint）已经足够。
             char sub[96];
             snprintf(sub, sizeof(sub), "%s%s%s", item.artist[0] ? item.artist : "未知艺术家", item.album[0] ? " · " : "", item.album);
             lv_obj_t* detail = makeText(row, sub, &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 10, 10);
@@ -1914,11 +1929,19 @@ void HifiUi::buildLocalMusic() {
         // 结果是列表往下滚、滑块往上走 —— 2026-09-05 用户报告的正是这个。
         // 所以两个方向都要取反：value = max - scroll_y。
         lv_slider_set_range(scrollSlider, 0, contentHeight - kListHeight);
+        // ⚠️ **必须显式初始化。** slider 默认值是 0，而反转映射后
+        // value=0 对应 scroll_y=max（列表底部）—— 页面刚进来明明在顶部，
+        // 滑块却画在底部，第一次滚动才被事件回调纠正成正确位置，
+        // 表现为"一滑动就瞬间跳到顶部"。这是我上一版只改映射没改初值留下的。
+        lv_slider_set_value(scrollSlider, contentHeight - kListHeight, LV_ANIM_OFF);
         lv_obj_set_style_radius(scrollSlider, 6, LV_PART_MAIN);
         lv_obj_set_style_radius(scrollSlider, 6, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(scrollSlider, kPanel, LV_PART_MAIN);
         lv_obj_set_style_bg_opa(scrollSlider, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(scrollSlider, kAccentDeep, LV_PART_INDICATOR);
+        // ⚠️ 不画填充条。slider 的 indicator 从底部填到当前值，在反转映射下
+        // 那段颜色表示的是"还剩多少没滚"，语义拧着，用户反馈"颜色表示也反了"。
+        // 位置由滑块本身表达就够了，去掉填充反而更清楚。
+        lv_obj_set_style_bg_opa(scrollSlider, LV_OPA_TRANSP, LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(scrollSlider, kAccentBright, LV_PART_KNOB);
         // Oversized knob (touch target, not just a thin handle) -- the
         // whole point is this needs to be easy to grab and drag on a small
@@ -2958,11 +2981,25 @@ void HifiUi::refreshRadioNowPlaying(const PlayerSnapshot& rawState) {
 }
 
 void HifiUi::playLocalTrackByIndex(uint16_t index, uint32_t positionSeconds) {
+    // ⚠️ 这三步**全都跑在 UI 线程上**，而且每一步都可能碰 SD。
+    // 2026-09-05 实测抓到开始播放时单次 lv_timer_handler 阻塞 1.58 秒
+    // （busy 甚至报到 167.8%，说明统计窗口被整个盖过）。
+    // 封面已单独计时是 162ms，剩下 1.4 秒来源不明 —— 分步计时才能定位，
+    // 靠猜只会多烧一轮。
+    const uint32_t t0 = millis();
     if (!playerService.playLocalTrack(index, positionSeconds)) return;
+    const uint32_t t1 = millis();
     m_currentLocalTrackIndex = index;
     m_currentRadioIconIndex = 0;
     loadCoverArt(index);
+    const uint32_t t2 = millis();
     m_hasLyrics = playerService.loadLyrics(index);
+    const uint32_t t3 = millis();
+    printf("[PLAY][T] open=%lums cover=%lums lyrics=%lums total=%lums\n",
+           static_cast<unsigned long>(t1 - t0),
+           static_cast<unsigned long>(t2 - t1),
+           static_cast<unsigned long>(t3 - t2),
+           static_cast<unsigned long>(t3 - t0));
 }
 
 int32_t HifiUi::findLocalTrackByPath(const char* path) const {
@@ -7490,8 +7527,38 @@ void HifiUi::onMusicTabAction(lv_event_t* event) {
     s_instance->show(Page::Sd);
 }
 
+// —— 滚动误触保护 ——
+//
+// 用户报告：滑动列表时经常"不小心点到某首歌就播了"。
+// 行绑的已经是 LV_EVENT_CLICKED（不是按下即触发），但 LVGL 判定"点击"只看
+// 按下与松手之间的位移是否小于 scroll_limit —— 拖动过程中任何一次
+// 短促的停顿+抬手都可能满足。
+//
+// 更可靠的判据：**按下到松手之间，列表实际滚动过没有。**
+// 滚过就说明用户的意图是滑动，不是点这一行。这个判据不依赖像素阈值，
+// 也不受惯性/抛掷的影响。
+static int32_t s_rowPressScrollY = 0;
+static lv_obj_t* s_rowPressList = nullptr;
+
+static void rowScrollGuardArm(lv_event_t* e) {
+    lv_obj_t* row = lv_event_get_target(e);
+    lv_obj_t* list = row ? lv_obj_get_parent(row) : nullptr;
+    s_rowPressList = list;
+    s_rowPressScrollY = list ? lv_obj_get_scroll_y(list) : 0;
+}
+
+static bool rowClickWasScroll(lv_event_t* e) {
+    lv_obj_t* row = lv_event_get_target(e);
+    lv_obj_t* list = row ? lv_obj_get_parent(row) : nullptr;
+    if (!list || list != s_rowPressList) return false;
+    // 2px 容差：手指抖动引起的亚像素滚动不该算滑动。
+    const int32_t moved = lv_obj_get_scroll_y(list) - s_rowPressScrollY;
+    return moved > 2 || moved < -2;
+}
+
 void HifiUi::onMusicTrackAction(lv_event_t* event) {
     if (!s_instance) return;
+    if (rowClickWasScroll(event)) return;   // 这是一次滑动，不是点击
     const uint16_t trackIndex1 = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
     if (!trackIndex1) return;
     s_instance->playLocalTrackByIndex(trackIndex1 - 1);
