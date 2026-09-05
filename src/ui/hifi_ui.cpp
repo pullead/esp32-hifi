@@ -1769,9 +1769,12 @@ void HifiUi::buildLocalMusic() {
     static const char* kTabLabels[3] = {"歌曲", "歌手", "专辑"};
     for (uint8_t i = 0; i < 3; ++i) {
         lv_obj_t* tab = lv_btn_create(screen);
-        lv_obj_set_pos(tab, 8 + i * 60, 6);
-        lv_obj_set_size(tab, 54, 24);
-        lv_obj_set_style_radius(tab, 12, 0);
+        // 收紧（2026-09-05）：60/54/24 -> 44/40/20，y 6 -> 4。
+        // 标签栏原本占 y=6..30 共 30px（屏高的 18%），列表只剩 128px ≈ 2.9 行。
+        // ⚠️ 但主要空间不是被它吃掉的，是行高 —— 见下面 row_y 那里的说明。
+        lv_obj_set_pos(tab, 8 + i * 44, 4);
+        lv_obj_set_size(tab, 40, 20);
+        lv_obj_set_style_radius(tab, 10, 0);
         lv_obj_set_style_bg_color(tab, m_musicTab == i ? kAccentDeep : kPanel, 0);
         lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(tab, 0, 0);
@@ -1789,9 +1792,9 @@ void HifiUi::buildLocalMusic() {
     const bool filtered = m_musicTab == 0 && (m_musicFilterArtist[0] || m_musicFilterAlbum[0]);
     if (filtered) {
         lv_obj_t* clear = lv_btn_create(screen);
-        lv_obj_set_pos(clear, 192, 6);
-        lv_obj_set_size(clear, 120, 24);
-        lv_obj_set_style_radius(clear, 12, 0);
+        lv_obj_set_pos(clear, 150, 4);      // 跟随收紧后的标签栏
+        lv_obj_set_size(clear, 162, 20);
+        lv_obj_set_style_radius(clear, 10, 0);
         lv_obj_set_style_bg_color(clear, kPanel, 0);
         lv_obj_set_style_bg_opa(clear, LV_OPA_COVER, 0);
         lv_obj_set_style_border_width(clear, 0, 0);
@@ -1810,7 +1813,7 @@ void HifiUi::buildLocalMusic() {
         char header[32];
         if (scanning) snprintf(header, sizeof(header), "扫描中… %u", trackCount);
         else snprintf(header, sizeof(header), "共 %u 首", trackCount);
-        makeText(screen, header, &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_RIGHT, -10, 10);
+        makeText(screen, header, &lv_font_cjk_13, kInkDim, LV_ALIGN_TOP_RIGHT, -10, 6);
     }
 
     // Narrower than before (304->286px) to make room for the draggable
@@ -1818,8 +1821,9 @@ void HifiUi::buildLocalMusic() {
     // scrollbar is a visual indicator only, not touch-draggable, so a real
     // lv_slider stands in for "designed for touch scrubbing".
     lv_obj_t* list = lv_obj_create(screen);
-    lv_obj_set_pos(list, 8, 36);
-    lv_obj_set_size(list, 286, 128);
+    // 标签栏收紧后上移 8px、加高 8px：128 -> 136。
+    lv_obj_set_pos(list, 8, 28);
+    lv_obj_set_size(list, 286, 136);
     lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(list, 0, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
@@ -1851,8 +1855,8 @@ void HifiUi::buildLocalMusic() {
         } else {
             for (uint8_t g = 0; g < m_musicGroupCount; ++g) {
                 lv_obj_t* row = lv_btn_create(list);
-                lv_obj_set_pos(row, 0, g * 40);
-                lv_obj_set_size(row, 278, 36);
+                lv_obj_set_pos(row, 0, g * 32);
+                lv_obj_set_size(row, 278, 28);
                 lv_obj_set_style_radius(row, 10, 0);
                 lv_obj_set_style_bg_color(row, kPanel, 0);
                 lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
@@ -1882,7 +1886,7 @@ void HifiUi::buildLocalMusic() {
 
             lv_obj_t* row = lv_btn_create(list);
             lv_obj_set_pos(row, 0, row_y);
-            lv_obj_set_size(row, 278, 40);
+            lv_obj_set_size(row, 278, 28);   // 单行，28 就够
             // ⚠️ 圆角半径直接决定滚动时的渲染开销 —— LVGL 8 的圆角要逐像素
             // 做遮罩，成本大致正比于半径的平方（角落面积）。
             // 2026-09-05 滚动实测（同样负载）：
@@ -1900,10 +1904,21 @@ void HifiUi::buildLocalMusic() {
             lv_obj_add_event_cb(row, rowScrollGuardArm, LV_EVENT_PRESSED, nullptr);
             lv_obj_add_event_cb(row, onMusicTrackAction, LV_EVENT_CLICKED, reinterpret_cast<void*>(static_cast<uintptr_t>(i + 1)));
 
+            // —— 单行排版（2026-09-05）——
+            //
+            // ⚠️ 上一版把行高从 40 压到 32、偏移按比例改成 ±8 是**错的**：
+            // 13px 字的行高约 16~18px，两行分别占 -1~17 和 15~33 ——
+            // **中间重叠，副标题下沿还超出 32px 被切**。
+            // 我只按行高等比缩了偏移，没算字体的实际行高。
+            //
+            // 改成单行：标题左对齐、歌手右对齐且更淡。
+            // 不拼成 "标题 · 歌手" 一个字符串 —— CJK 里那个分隔点容易糊在一起，
+            // 左右分置层次更清楚，字形总量一样。
+            // 附带收益：每行少一个文本标签，滚动时字形渲染量减半。
             const char* titleText = item.title[0] ? item.title : "未知曲目";
-            lv_obj_t* title = makeText(row, titleText, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 10, -10);
+            lv_obj_t* title = makeText(row, titleText, &lv_font_cjk_13, kInk, LV_ALIGN_LEFT_MID, 10, 0);
             lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(title, 178);
+            lv_obj_set_width(title, 170);
             // ⚠️ **伪粗体的副本已删除。**
             // 原来这里再画一份完全相同的标题、右移 1px 叠上去来假装粗体
             // （没有粗体字重的常见土办法）。代价是**每行的标题每帧渲染两遍**，
@@ -1911,14 +1926,26 @@ void HifiUi::buildLocalMusic() {
             // 2026-09-05 实测滚动时单帧阻塞已达 42~47ms，这份副本是纯浪费：
             // 去掉零信息损失，直接省掉一次完整文本渲染。
             // 需要强调标题的话，用颜色对比（kInk vs kInkFaint）已经足够。
-            char sub[96];
-            snprintf(sub, sizeof(sub), "%s%s%s", item.artist[0] ? item.artist : "未知艺术家", item.album[0] ? " · " : "", item.album);
-            lv_obj_t* detail = makeText(row, sub, &lv_font_cjk_13, kInkFaint, LV_ALIGN_LEFT_MID, 10, 10);
+            // 单行放不下"歌手 · 专辑"两项，取歌手 —— 找歌时歌手比专辑更常用。
+            const char* subText = item.artist[0] ? item.artist
+                                : (item.album[0] ? item.album : "未知艺术家");
+            lv_obj_t* detail = makeText(row, subText, &lv_font_cjk_13, kInkFaint, LV_ALIGN_RIGHT_MID, -10, 0);
             lv_label_set_long_mode(detail, LV_LABEL_LONG_DOT);
-            lv_obj_set_width(detail, 178);
-            if (item.hasArt) makeText(row, LV_SYMBOL_IMAGE, &lv_font_montserrat_12, kAccentBright, LV_ALIGN_RIGHT_MID, -10, 0);
+            lv_obj_set_width(detail, 84);
+            lv_obj_set_style_text_align(detail, LV_TEXT_ALIGN_RIGHT, 0);
+            // ⚠️ 这里原来放 LV_SYMBOL_IMAGE 表示"内嵌封面"，2026-09-05 删除：
+            // 信息价值很低（进播放页一眼就看到有没有封面），却让每行多一个标签、
+            // 每帧多渲染一次 —— 滚动时 CPU 已经 74~79%。
+            //
+            // 这个位置**留给 Phase 6 的 ★ 收藏标记**：收藏的作用是保护曲目不被
+            // Cleaner 淘汰，需要能在列表里一眼扫出哪些受保护。
+            // 且它是纯显示、不可点击，不会带回刚修好的误触问题
+            //（收藏动作放在正在播放页的大按钮上）。
 
-            row_y += 44;
+            // 行距 44 -> 32（行高 28 + 间隔 4）。
+            // ⚠️ **行距才是可见行数的大头**：标签栏全砍掉也只值 0.7 行，
+            // 而 44 -> 32 让同样的列表区从 2.9 行变成 **4.25 行**。
+            row_y += 32;
             ++shown;
         }
         if (!shown) makeText(list, "该分类下没有曲目", &lv_font_cjk_13, kInkDim, LV_ALIGN_CENTER, 0, 0);
@@ -1931,10 +1958,10 @@ void HifiUi::buildLocalMusic() {
     // for touch scrubbing" almost for free. Only shown when there's
     // actually more content than fits, matching the old AUTO scrollbar's
     // own behavior of hiding when nothing needs scrolling.
-    constexpr int32_t kListHeight = 128;
+    constexpr int32_t kListHeight = 136;   // 跟随上面列表区的加高
     if (contentHeight > kListHeight) {
         lv_obj_t* scrollSlider = lv_slider_create(screen);
-        lv_obj_set_pos(scrollSlider, 300, 36);
+        lv_obj_set_pos(scrollSlider, 300, 28);
         lv_obj_set_size(scrollSlider, 12, kListHeight);
         // ⚠️ **值和 scroll_y 是反向的，不能 1:1 映射。**
         // LVGL 的垂直 slider 以**底部为 0、向上增长**，而 scroll_y 以顶部为 0、
