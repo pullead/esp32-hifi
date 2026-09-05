@@ -78,6 +78,7 @@ class HifiUi {
     static void onMusicClearFilterAction(lv_event_t* event);
     static void onLocalTransportAction(lv_event_t* event);
     static void onLocalViewToggleAction(lv_event_t* event);
+    static void onLocalFavoriteAction(lv_event_t* event);
     static void onRadioViewToggleAction(lv_event_t* event);
     static void onLocalSeekAction(lv_event_t* event);
     static void onLocalPlayModeToggleAction(lv_event_t* event);
@@ -240,6 +241,7 @@ class HifiUi {
     lv_obj_t* m_weatherIconDrop2 = nullptr;
     lv_obj_t* m_cover = nullptr;
     lv_obj_t* m_coverLabel = nullptr;
+    lv_obj_t* m_favIcon = nullptr;   // ★ 收藏标记，颜色表示状态
     lv_obj_t* m_playIcon = nullptr;
     lv_obj_t* m_playRing = nullptr;
     lv_obj_t* m_ringBars[10]{};

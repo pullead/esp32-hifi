@@ -622,6 +622,25 @@ bool WaveshareLvglPort::readTouchPoint(uint16_t* x, uint16_t* y) {
 
 // 自由函数版本，供 main.cpp 使用（那边不包含本端口的头文件，
 // 为一个布尔查询去引入整个头得不偿失）。
+// 本次按下以来手指移动的距离（取 |dx| 和 |dy| 的较大者，够用且不用开方）。
+//
+// ⚠️ **这是判断"点击还是滑动"最直接的信号。**
+// 之前的守卫用"列表滚动了多少"来推断，有两种情况会脱节：
+//   1. 在列表顶/底边缘拖动 —— 已经到头，手指在动但 scroll_y 不变；
+//   2. 横向拖动 —— 列表只允许竖直滚动，横向位移不产生滚动。
+// 两种都会被误判成点击并触发播放。看手指位移一次覆盖两种。
+uint16_t uiTouchTravelPx() { return WaveshareLvglPort::touchTravelPx(); }
+
+uint16_t WaveshareLvglPort::touchTravelPx() {
+    auto* self = s_instance;
+    if (!self) return 0;
+    const int32_t dx = static_cast<int32_t>(self->m_touchCurrentX) - static_cast<int32_t>(self->m_touchStartX);
+    const int32_t dy = static_cast<int32_t>(self->m_touchCurrentY) - static_cast<int32_t>(self->m_touchStartY);
+    const int32_t adx = dx < 0 ? -dx : dx;
+    const int32_t ady = dy < 0 ? -dy : dy;
+    return static_cast<uint16_t>(adx > ady ? adx : ady);
+}
+
 bool uiRecentlyTouched(uint32_t withinMs) {
     return WaveshareLvglPort::recentlyTouched(withinMs);
 }

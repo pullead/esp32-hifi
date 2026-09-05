@@ -7,6 +7,11 @@ The firmware currently ships two generated LVGL 8 fonts:
 - `lv_font_cjk_16.c`: small fixed-glyph subset for stable UI titles. Do not
   regenerate this with the full `cjk_symbols.txt` set unless
   `LV_FONT_FMT_TXT_LARGE` is intentionally enabled and tested.
+  **2026-09-05: added `★☆`** to the symbol set (now
+  `台后理管置设选择网络★☆`) for the local-player favourite button —
+  LVGL has no star/heart in its built-in symbol font, and the 13px CJK
+  star looked a size too small next to the montserrat_16 transport icons.
+  Two glyphs only; still well inside the small-subset constraint above.
 
 Both fonts are generated as **4bpp, uncompressed** bitmaps. This costs more
 flash than 2bpp, but gives sharper antialiasing on the 320x170 ST7789 panel.

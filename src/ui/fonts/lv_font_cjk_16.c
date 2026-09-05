@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 16 px
  * Bpp: 4
- * Opts: --font /tmp/NotoSansSC-Medium500.ttf --size 16 --bpp 4 --format lvgl --lv-include lvgl.h --no-compress -o lv_font_cjk_16.c --range 0x20-0x7F --symbols 台后理管置设选择网络
+ * Opts: --font tools/fonts/NotoSansSC-Medium500.ttf --size 16 --bpp 4 --format lvgl --lv-include lvgl.h --no-compress -o src/ui/fonts/lv_font_cjk_16.c --range 0x20-0x7F --symbols 台后理管置设选择网络★☆
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE
@@ -807,6 +807,41 @@ static LV_ATTRIBUTE_LARGE_CONST const uint8_t glyph_bitmap[] = {
     0x92, 0x19, 0x11, 0xaf, 0xfc, 0x10, 0x0, 0x0,
     0x23, 0x0,
 
+    /* U+2605 "★" */
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x3, 0x30, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x9, 0x90, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0xe, 0xe0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x3f, 0xf3, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x8f, 0xf8, 0x0, 0x0, 0x0,
+    0x1a, 0xcc, 0xcc, 0xff, 0xff, 0xcc, 0xcc, 0xa1,
+    0x1, 0xaf, 0xff, 0xff, 0xff, 0xff, 0xfa, 0x10,
+    0x0, 0x6, 0xff, 0xff, 0xff, 0xff, 0x60, 0x0,
+    0x0, 0x0, 0x2f, 0xff, 0xff, 0xf2, 0x0, 0x0,
+    0x0, 0x0, 0x2f, 0xff, 0xff, 0xf2, 0x0, 0x0,
+    0x0, 0x0, 0x8f, 0xfe, 0xef, 0xf8, 0x0, 0x0,
+    0x0, 0x0, 0xdf, 0xc1, 0x1c, 0xfd, 0x0, 0x0,
+    0x0, 0x2, 0xf8, 0x0, 0x0, 0x8f, 0x20, 0x0,
+    0x0, 0x6, 0x30, 0x0, 0x0, 0x4, 0x60, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+
+    /* U+2606 "☆" */
+    0x0, 0x0, 0x0, 0x3, 0x30, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x8, 0x80, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0xa, 0xa0, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x37, 0x73, 0x0, 0x0, 0x0,
+    0x0, 0x0, 0x0, 0x81, 0x28, 0x0, 0x0, 0x0,
+    0x1b, 0xa9, 0xaa, 0xa0, 0xa, 0xaa, 0x9a, 0xb1,
+    0x1, 0xa5, 0x0, 0x0, 0x0, 0x0, 0x5a, 0x10,
+    0x0, 0x7, 0x90, 0x0, 0x0, 0x9, 0x70, 0x0,
+    0x0, 0x0, 0x2b, 0x0, 0x0, 0xb2, 0x0, 0x0,
+    0x0, 0x0, 0x28, 0x0, 0x0, 0x82, 0x0, 0x0,
+    0x0, 0x0, 0x82, 0x1a, 0xa1, 0x28, 0x0, 0x0,
+    0x0, 0x0, 0xa4, 0xa1, 0x1a, 0x4a, 0x0, 0x0,
+    0x0, 0x3, 0xc8, 0x0, 0x0, 0x8c, 0x30, 0x0,
+    0x0, 0x7, 0x40, 0x0, 0x0, 0x4, 0x70, 0x0,
+    0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+
     /* U+53F0 "台" */
     0x0, 0x0, 0x2a, 0x30, 0x0, 0x0, 0x0, 0x0,
     0x0, 0xcf, 0x20, 0x0, 0x0, 0x0, 0x0, 0x8,
@@ -1081,16 +1116,18 @@ static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
     {.bitmap_index = 4338, .adv_w = 72, .box_w = 2, .box_h = 18, .ofs_x = 1, .ofs_y = -4},
     {.bitmap_index = 4356, .adv_w = 91, .box_w = 6, .box_h = 16, .ofs_x = 0, .ofs_y = -3},
     {.bitmap_index = 4404, .adv_w = 146, .box_w = 9, .box_h = 4, .ofs_x = 0, .ofs_y = 4},
-    {.bitmap_index = 4422, .adv_w = 256, .box_w = 14, .box_h = 16, .ofs_x = 1, .ofs_y = -2},
-    {.bitmap_index = 4534, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
-    {.bitmap_index = 4662, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
-    {.bitmap_index = 4790, .adv_w = 256, .box_w = 16, .box_h = 14, .ofs_x = 0, .ofs_y = -1},
-    {.bitmap_index = 4902, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
-    {.bitmap_index = 5030, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
-    {.bitmap_index = 5158, .adv_w = 256, .box_w = 14, .box_h = 14, .ofs_x = 1, .ofs_y = -1},
-    {.bitmap_index = 5256, .adv_w = 256, .box_w = 16, .box_h = 14, .ofs_x = 0, .ofs_y = -1},
-    {.bitmap_index = 5368, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
-    {.bitmap_index = 5496, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2}
+    {.bitmap_index = 4422, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 4550, .adv_w = 256, .box_w = 16, .box_h = 15, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 4670, .adv_w = 256, .box_w = 14, .box_h = 16, .ofs_x = 1, .ofs_y = -2},
+    {.bitmap_index = 4782, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 4910, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 5038, .adv_w = 256, .box_w = 16, .box_h = 14, .ofs_x = 0, .ofs_y = -1},
+    {.bitmap_index = 5150, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 5278, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 5406, .adv_w = 256, .box_w = 14, .box_h = 14, .ofs_x = 1, .ofs_y = -1},
+    {.bitmap_index = 5504, .adv_w = 256, .box_w = 16, .box_h = 14, .ofs_x = 0, .ofs_y = -1},
+    {.bitmap_index = 5616, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2},
+    {.bitmap_index = 5744, .adv_w = 256, .box_w = 16, .box_h = 16, .ofs_x = 0, .ofs_y = -2}
 };
 
 /*---------------------
@@ -1098,8 +1135,8 @@ static const lv_font_fmt_txt_glyph_dsc_t glyph_dsc[] = {
  *--------------------*/
 
 static const uint16_t unicode_list_1[] = {
-    0x0, 0x1e, 0xef9, 0x2016, 0x27b1, 0x2aec, 0x2b61, 0x2b7e,
-    0x37ce, 0x3c19
+    0x0, 0x1, 0x2deb, 0x2e09, 0x3ce4, 0x4e01, 0x559c, 0x58d7,
+    0x594c, 0x5969, 0x65b9, 0x6a04
 };
 
 /*Collect the unicode lists and glyph_id offsets*/
@@ -1110,8 +1147,8 @@ static const lv_font_fmt_txt_cmap_t cmaps[] =
         .unicode_list = NULL, .glyph_id_ofs_list = NULL, .list_length = 0, .type = LV_FONT_FMT_TXT_CMAP_FORMAT0_TINY
     },
     {
-        .range_start = 21488, .range_length = 15386, .glyph_id_start = 96,
-        .unicode_list = unicode_list_1, .glyph_id_ofs_list = NULL, .list_length = 10, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
+        .range_start = 9733, .range_length = 27141, .glyph_id_start = 96,
+        .unicode_list = unicode_list_1, .glyph_id_ofs_list = NULL, .list_length = 12, .type = LV_FONT_FMT_TXT_CMAP_SPARSE_TINY
     }
 };
 
@@ -1136,7 +1173,7 @@ static const uint8_t kern_left_class_mapping[] =
     29, 29, 37, 38, 39, 40, 37, 41,
     42, 43, 44, 45, 2, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0
+    0, 0, 0, 0
 };
 
 /*Map glyph_ids to kern right classes*/
@@ -1155,7 +1192,7 @@ static const uint8_t kern_right_class_mapping[] =
     25, 30, 25, 30, 31, 32, 33, 34,
     35, 36, 37, 38, 0, 0, 3, 0,
     0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0
+    0, 0, 0, 0
 };
 
 /*Kern values between classes*/

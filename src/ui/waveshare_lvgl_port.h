@@ -12,6 +12,8 @@ class WaveshareLvglPort {
     // ⚠️ 给"别在用户操作时做慢活"用的：SD 写入等阻塞操作若落在滑动过程中，
     // 会造成几百毫秒的可感知卡顿（2026-09-05 实测 181~413ms）。
     static bool recentlyTouched(uint32_t withinMs);
+    // 本次按下以来手指移动的距离（|dx| 与 |dy| 的较大者）。
+    static uint16_t touchTravelPx();
 
     bool begin();
     void tick();

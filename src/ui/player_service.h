@@ -266,6 +266,14 @@ class PlayerService {
     bool localLibraryScanning() const;
     uint16_t localLibraryCount() const;
     bool localTrack(uint16_t index, LocalTrackItem* item) const;
+
+    // 本地曲目的收藏标记。
+    // ⚠️ 底层走**事件日志**而不是直接改内存+全量存盘 —— 800KB 的索引为了翻一个
+    // bit 全量重写既慢又磨损 SD（见 library_store.h）。
+    // 收藏的作用是**保护曲目不被 Cleaner 淘汰**，所以在真实删除开启前必须先有
+    // 设置入口，否则用户没有任何办法保住想留的歌。
+    bool localTrackFavorite(uint16_t index) const;
+    void setLocalTrackFavorite(uint16_t index, bool on);
     // 上一次真正播放过的音源（跨重启保留）。什么都没播时首页"正在播放"
     // 用它决定进哪个播放页；从未播放过则返回 None。
     PlayerSource lastSource() const;

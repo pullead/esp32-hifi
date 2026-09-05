@@ -24,6 +24,8 @@ extern bool playerCoreUsbDacActive();
 static void rowScrollGuardArm(lv_event_t* e);
 static bool rowClickWasScroll(lv_event_t* e);
 static void listScrollStamp(lv_event_t* e);
+// 定义在 src/ui/waveshare_lvgl_port.cpp
+uint16_t uiTouchTravelPx();
 
 // Palette v2 (2026-07-23): switched from the dark graphite/copper spec to a
 // light lavender/purple identity per explicit product direction -- see
@@ -2191,9 +2193,13 @@ void HifiUi::buildLocalNowPlaying() {
     lv_obj_set_style_radius(controlBar, 0, 0);
     lv_obj_clear_flag(controlBar, LV_OBJ_FLAG_SCROLLABLE);
 
-    constexpr uint8_t kSlotCount = 6;
-    constexpr int16_t kSlotWidth = 320 / kSlotCount; // 53px
-    static const char* kSlotSymbols[kSlotCount] = {LV_SYMBOL_SHUFFLE, LV_SYMBOL_PREV, LV_SYMBOL_PLAY, LV_SYMBOL_NEXT, LV_SYMBOL_LIST, LV_SYMBOL_LOOP};
+    // 6 -> 7 格，为 ★ 收藏腾位置。**不挤掉任何现有功能** —— 六个格子
+    // （播放模式/上一首/播放/下一首/返回列表/磁带视图）都在用。
+    // 45px 仍是宽裕的点击目标（刚收窄的列表标签才 40×20），而且这一页不滚动，
+    // 不存在滑动误触的问题。
+    constexpr uint8_t kSlotCount = 7;
+    constexpr int16_t kSlotWidth = 320 / kSlotCount; // 45px
+    static const char* kSlotSymbols[kSlotCount] = {LV_SYMBOL_SHUFFLE, LV_SYMBOL_PREV, LV_SYMBOL_PLAY, LV_SYMBOL_NEXT, "★", LV_SYMBOL_LIST, LV_SYMBOL_LOOP};
     for (uint8_t i = 0; i < kSlotCount; ++i) {
         const bool primary = i == 2; // play
         lv_obj_t* slot = lv_btn_create(controlBar);
@@ -2259,12 +2265,30 @@ void HifiUi::buildLocalNowPlaying() {
                 if (isSequential) lv_obj_add_flag(m_shuffleIcon, LV_OBJ_FLAG_HIDDEN);
             }
         } else if (i == 4) {
+            // ★ 收藏。放在正在播放页而不是列表行，因为：
+            //   1. 收藏这个动作天然发生在**听的时候**；
+            //   2. 这一页不滚动，大按钮不会带回列表那边刚修好的误触问题。
+            // ⚠️ LVGL 内置符号里**没有星形也没有心形**，所以 ★ 只能来自 CJK 字体。
+            // 第一版用了 lv_font_cjk_13，比旁边 montserrat_16 的图标小一档，
+            // 视觉上明显不匹配（用户反馈"太小了"）。
+            // 解决办法是给 lv_font_cjk_16 补上 ★☆ 两个字形并重新生成 ——
+            // 它原本是个极小子集（ASCII + 台后理管置设选择网络），
+            // README 明确警告不要用完整符号集重生成（会触发
+            // LV_FONT_FMT_TXT_LARGE），只加两个字形仍在安全范围内，
+            // flash 增量约几百字节。
+            //
+            // 状态用颜色表示而不是换字形：换字形要重建标签，改颜色只是一次
+            // 样式更新。
+            lv_obj_add_event_cb(slot, onLocalFavoriteAction, LV_EVENT_CLICKED, nullptr);
+            m_favIcon = makeText(slot, kSlotSymbols[i], &lv_font_cjk_16, kInkDim, LV_ALIGN_CENTER, 0, 0);
+            lv_obj_clear_flag(m_favIcon, LV_OBJ_FLAG_CLICKABLE);
+        } else if (i == 5) {
             // NOT onTransportAction/kActionOpenList -- that opens the RADIO
             // station list, wrong list for a local-library-aware page.
             lv_obj_add_event_cb(slot, onMusicClearFilterAction, LV_EVENT_CLICKED, nullptr);
             lv_obj_t* icon = makeText(slot, kSlotSymbols[i], &lv_font_montserrat_16, kInkDim, LV_ALIGN_CENTER, 0, 0);
             lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE);
-        } else { // i == 5: cassette view toggle
+        } else { // i == 6: cassette view toggle
             lv_obj_add_event_cb(slot, onLocalViewToggleAction, LV_EVENT_CLICKED, nullptr);
             addCassetteIcon(slot, kInkDim);
         }
@@ -2374,6 +2398,13 @@ void HifiUi::buildCassetteVisual(lv_obj_t* screen) {
 }
 
 void HifiUi::refreshLocalNowPlaying(const PlayerSnapshot& rawState) {
+    // ★ 状态要跟着切歌变。用 uiSetStyleColor 之类的守卫没必要 —— 这里一帧
+    // 最多一次，且颜色相同时 LVGL 自己不会重绘。
+    if (m_favIcon) {
+        const bool fav = m_currentLocalTrackIndex < playerService.localLibraryCount() &&
+                         playerService.localTrackFavorite(m_currentLocalTrackIndex);
+        lv_obj_set_style_text_color(m_favIcon, fav ? kAccentBright : kInkDim, 0);
+    }
     // If the source actually playing right now isn't local Sd (e.g. this
     // page is on screen but a radio stream is what's really running --
     // there's one shared decoder/snapshot, see PlayerService::playSdFile()'s
@@ -7627,6 +7658,15 @@ static bool rowClickWasScroll(lv_event_t* e) {
     lv_obj_t* row = lv_event_get_target(e);
     lv_obj_t* list = row ? lv_obj_get_parent(row) : nullptr;
     if (!list || list != s_rowPressList) return false;
+
+    // ⚠️ **第三条判据：手指实际移动了多少。**（2026-09-05 补）
+    // 前两条都从"列表滚动了多少"推断意图，有两种情况会脱节：
+    //   1. 在列表顶/底边缘拖动 —— 已经到头，手指在动但 scroll_y 不变；
+    //   2. 横向拖动 —— 列表只允许竖直滚动，横向位移不产生滚动。
+    // 两种都会被误判成点击并播放。看手指位移一次覆盖两种。
+    // 8px：略高于 LVGL 的 scroll_limit(5)，留出手指自然抖动的余量。
+    if (uiTouchTravelPx() > 8) return true;
+
     if (s_pressStoppedScroll) return true;   // 点停滑行，不是选歌
     // 2px 容差：手指抖动引起的亚像素滚动不该算滑动。
     const int32_t moved = lv_obj_get_scroll_y(list) - s_rowPressScrollY;
@@ -7687,6 +7727,23 @@ void HifiUi::onLocalTransportAction(lv_event_t* event) {
         }
         printf("[LOCAL] playPause -> showPause=%d\n", showPause);
         if (s_instance->m_playIcon) lv_label_set_text(s_instance->m_playIcon, showPause ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    }
+}
+
+// ★ 收藏切换。
+//
+// ⚠️ 收藏的意义是**保护曲目不被 Cleaner 淘汰** —— 在真实删除开启之前必须先
+// 有这个入口，否则用户没有任何办法保住想留的歌。
+// 底层 playerCoreSetTrackFavorite() 早就写好了，但在此之前**没有任何地方
+// 调用它**，是一段死代码。
+void HifiUi::onLocalFavoriteAction(lv_event_t*) {
+    if (!s_instance) return;
+    const uint16_t idx = s_instance->m_currentLocalTrackIndex;
+    if (idx >= playerService.localLibraryCount()) return;
+    const bool now = !playerService.localTrackFavorite(idx);
+    playerService.setLocalTrackFavorite(idx, now);
+    if (s_instance->m_favIcon) {
+        lv_obj_set_style_text_color(s_instance->m_favIcon, now ? kAccentBright : kInkDim, 0);
     }
 }
 

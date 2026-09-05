@@ -32,6 +32,8 @@ extern bool playerCorePlayRadioStation(uint16_t index);
 extern bool playerCoreLocalLibraryScanning();
 extern uint16_t playerCoreLocalLibraryCount();
 extern bool playerCoreLocalTrack(uint16_t index, LocalTrackItem* item);
+extern bool playerCoreTrackFavorite(uint16_t index);
+extern void playerCoreSetTrackFavorite(uint16_t index, bool on);
 extern bool playerCoreDecodeLocalTrackCover(uint16_t index, uint8_t scaleFactor, uint16_t** outPixels, uint16_t* outWidth, uint16_t* outHeight);
 extern UsbStorageState playerCoreUsbStorageState();
 extern bool playerCoreUsbStorageStats(UsbStorageStats* out);
@@ -270,6 +272,8 @@ bool PlayerService::localLibraryScanning() const { return playerCoreLocalLibrary
 uint16_t PlayerService::localLibraryCount() const { return playerCoreLocalLibraryCount(); }
 
 bool PlayerService::localTrack(uint16_t index, LocalTrackItem* item) const { return playerCoreLocalTrack(index, item); }
+bool PlayerService::localTrackFavorite(uint16_t index) const { return playerCoreTrackFavorite(index); }
+void PlayerService::setLocalTrackFavorite(uint16_t index, bool on) { playerCoreSetTrackFavorite(index, on); }
 
 PlayerSource PlayerService::lastSource() const { return static_cast<PlayerSource>(playerCoreLastSource()); }
 
