@@ -1908,9 +1908,11 @@ void HifiUi::buildLocalMusic() {
         lv_obj_t* scrollSlider = lv_slider_create(screen);
         lv_obj_set_pos(scrollSlider, 300, 36);
         lv_obj_set_size(scrollSlider, 12, kListHeight);
-        // Range is in scroll-Y pixels directly -- 0 (top) to how far the
-        // list can actually scroll, so the slider's value always maps
-        // 1:1 onto lv_obj_scroll_to_y() with no extra unit conversion.
+        // ⚠️ **值和 scroll_y 是反向的，不能 1:1 映射。**
+        // LVGL 的垂直 slider 以**底部为 0、向上增长**，而 scroll_y 以顶部为 0、
+        // 向下增长。原来的代码直接 1:1 赋值（注释还写着"无需换算"），
+        // 结果是列表往下滚、滑块往上走 —— 2026-09-05 用户报告的正是这个。
+        // 所以两个方向都要取反：value = max - scroll_y。
         lv_slider_set_range(scrollSlider, 0, contentHeight - kListHeight);
         lv_obj_set_style_radius(scrollSlider, 6, LV_PART_MAIN);
         lv_obj_set_style_radius(scrollSlider, 6, LV_PART_INDICATOR);
@@ -1928,7 +1930,8 @@ void HifiUi::buildLocalMusic() {
             [](lv_event_t* e) {
                 auto* target = static_cast<lv_obj_t*>(lv_event_get_user_data(e));
                 lv_obj_t* slider = lv_event_get_target(e);
-                lv_obj_scroll_to_y(target, lv_slider_get_value(slider), LV_ANIM_OFF);
+                const int32_t maxV = lv_slider_get_max_value(slider);
+                lv_obj_scroll_to_y(target, maxV - lv_slider_get_value(slider), LV_ANIM_OFF);
             },
             LV_EVENT_VALUE_CHANGED, list);
         // Keep the slider in sync when the list is scrolled by a direct
@@ -1938,7 +1941,8 @@ void HifiUi::buildLocalMusic() {
             [](lv_event_t* e) {
                 auto* slider = static_cast<lv_obj_t*>(lv_event_get_user_data(e));
                 lv_obj_t* scrolled = lv_event_get_target(e);
-                lv_slider_set_value(slider, lv_obj_get_scroll_y(scrolled), LV_ANIM_OFF);
+                const int32_t maxV = lv_slider_get_max_value(slider);
+                lv_slider_set_value(slider, maxV - lv_obj_get_scroll_y(scrolled), LV_ANIM_OFF);
             },
             LV_EVENT_SCROLL, scrollSlider);
     }

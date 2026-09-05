@@ -109,7 +109,11 @@
  *====================*/
 
 /*Default display refresh period. LVG will redraw changed areas with this period time*/
-#define LV_DISP_DEF_REFR_PERIOD 30      /*[ms]*/
+/* 30 -> 16：屏幕刷新周期。30ms 只有约 33fps，手指拖动时画面明显跟不上。
+ * 实测 CPU 占用只有 4.1%（脏区域治理之后），有充足余量。
+ * ⚠️ 改完要复测 [PERF] 的 busy_us —— 刷新变快会增加绘制负担，
+ *    这一项是拿余量换跟手度，不是白得的。*/
+#define LV_DISP_DEF_REFR_PERIOD 16      /*[ms]*/
 
 /*Input device read period in milliseconds*/
 // 2026-08-07: 30 -> 15ms，触摸采样频率翻倍，减少"跟手度不够"的感觉——I2C

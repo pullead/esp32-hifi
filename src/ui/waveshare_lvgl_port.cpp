@@ -360,7 +360,15 @@ bool WaveshareLvglPort::begin() {
     // 动却触发了点击"的反馈。调小之后滑动更容易被正确识别，代价是极短距
     // 离的滑动手势会更容易被当成滑动而不是点击（可以接受，列表这类场景
     // 本来就应该优先滑动）。
-    m_touchDriver.scroll_limit = 8;
+    // 8 -> 5：移动多少像素才从"点击候选"转成"滚动"。
+    // ⚠️ **这一项是调参，不是已证实的因果。** 2026-09-05 用户报告"滑动列表时
+    // 容易误触发播放"。行绑的是 LV_EVENT_CLICKED（已确认不是按下即触发），
+    // 手势抑制也不会在拖动中途造出假按下（查过，不成立）。
+    // 剩下最可能的是：位移不足 8px 就判成点击，叠加当时 30ms 的刷新延迟
+    // —— 看不到列表动，以为没滑动，抬手就成了点击。
+    // 调低会让"轻微拖动"更容易被认成滚动；副作用是手指抖动较大的点击可能
+    // 变成滚动而不触发。需要实际体验确认。
+    m_touchDriver.scroll_limit = 5;
     // Lower = slower slow-down = more momentum glide after release (LVGL's
     // own doc comment on this field: "Greater value means faster
     // slow-down"). Was 18; dropped toward LVGL's own ~10 default so a flick
@@ -623,9 +631,22 @@ void WaveshareLvglPort::updateGesture(bool pressed, uint16_t x, uint16_t y) {
         const int16_t dy = static_cast<int16_t>(m_touchCurrentY) - static_cast<int16_t>(m_touchStartY);
         const uint32_t duration = now - m_touchStartMs;
         if (!m_touchSuppressingGesture && duration <= kGestureMaxMs) {
-            const bool edgeBackCandidate = m_touchStartX <= kEdgeBackPx && dx >= kGesturePreclaimPx && abs(dy) <= kGestureCrossMaxPx;
-            const bool edgeTopCandidate = m_touchStartY <= kEdgeTopPx && dy >= kGesturePreclaimPx && abs(dx) <= kGestureCrossMaxPx;
-            const bool edgeBottomCandidate = m_touchStartY >= kHeight - kEdgeBottomPx && -dy >= kGesturePreclaimPx && abs(dx) <= kGestureCrossMaxPx;
+            // ⚠️ **预判必须要求"主轴占优"，不能只看交叉轴上限。**
+            //
+            // 原判据用 abs(dy) <= kGestureCrossMaxPx(=86) 作为边缘返回的门槛 ——
+            // 86px 是屏幕高度的一半，等于**一个几乎垂直的拖动也算水平手势**。
+            // 后果（2026-09-05 用户报告"滑动不跟手"）：在列表左侧 54px 内竖直
+            // 滑动时，手指右偏 10px 就被预判成边缘返回，随即 lv_indev_reset()，
+            // **整次拖动的滚动被彻底掐断** —— 手指在动，列表不动。
+            // 列表底部 18px 与底边缘手势区重叠，向上滑同理。
+            //
+            // 加上主轴至少是交叉轴 2 倍的要求：真正的边缘滑动一定是明显偏向
+            // 某个方向的，而列表滚动的水平分量只是手指自然的抖动。
+            const bool dxDominant = abs(dx) >= abs(dy) * 2;
+            const bool dyDominant = abs(dy) >= abs(dx) * 2;
+            const bool edgeBackCandidate = m_touchStartX <= kEdgeBackPx && dx >= kGesturePreclaimPx && dxDominant && abs(dy) <= kGestureCrossMaxPx;
+            const bool edgeTopCandidate = m_touchStartY <= kEdgeTopPx && dy >= kGesturePreclaimPx && dyDominant && abs(dx) <= kGestureCrossMaxPx;
+            const bool edgeBottomCandidate = m_touchStartY >= kHeight - kEdgeBottomPx && -dy >= kGesturePreclaimPx && dyDominant && abs(dx) <= kGestureCrossMaxPx;
             if (edgeBackCandidate || edgeTopCandidate || edgeBottomCandidate) {
                 m_touchSuppressingGesture = true;
                 m_touchSuppressUntilMs = now + kPostGestureClickSuppressMs;
