@@ -1743,6 +1743,12 @@ static uint8_t audioFillPercentForDownload() {
     return static_cast<uint8_t>(filled * 100ull / cap);
 }
 
+// 是否有**网络供给**的音频在播（电台 / 云音乐）。
+// s_f_isWebConnected 正是这个语义：本地文件播放走的是 s_f_isFSConnected。
+static bool netAudioActiveForDownload() {
+    return s_f_isWebConnected && audio.isRunning();
+}
+
 static void r6StatsReset() {
     s_r6MinFilled = 0xFFFFFFFFu;
     s_r6SumFilled = 0;
@@ -1787,8 +1793,19 @@ static constexpr const char* kSyncOffPrefKey = "sync_off";   // 四个 offset �
 // 每轮下载几首。见 dailySyncTask 里的说明。
 constexpr uint8_t kDailySyncTracksPerDay = 3;
 
+// ⚠️ **仅用于验证，验证完必须改回 false。**
+// 每日那道闸（今天跑过就不再跑）会让每一轮真机验证都白跑 —— 2026-09-05
+// 就因为它，一轮 12 分钟的抓取里一行 SYNC 都没有。
+// 置 true 时忽略 lastRunDay，每次开机跑一轮。
+constexpr bool kDailySyncForceOnBoot = true;
+
 static DailySyncState s_syncState;
 static DailySyncStats s_syncStats;
+// 推迟后多久重试。15 分钟：够让用户听完几首歌换个事做，
+// 又不至于频繁地去打扰正在听的电台。
+constexpr uint32_t kSyncRetryCooldownSec = 900;
+static uint32_t s_syncRetryAtSec = 0;
+
 static volatile bool s_syncRunning = false;
 static volatile bool s_syncDone = false;
 
@@ -1842,7 +1859,14 @@ static void dailySyncTask(void*) {
     }
 
     s_syncRunning = false;
-    s_syncDone = true;
+    // "因为电台在播而推迟"不是跑完了 —— 安排冷却后重试，否则用户听一下午
+    // 电台就等于当天不更新曲库。dailySyncRun 在这种情况下也不会记 lastRunDay。
+    if (s_syncStats.deferredNetAudio) {
+        s_syncRetryAtSec = s_totalRuntime + kSyncRetryCooldownSec;
+        s_syncDone = false;
+    } else {
+        s_syncDone = true;
+    }
     vTaskDelete(nullptr);
 }
 
@@ -1939,7 +1963,14 @@ static void jamendoProbeTask(void*) {
         // 连带整个 R6 也跳过了 —— 前置条件互相矛盾。
         // R6 要回答的是"下载会不会饿着解码器"，只需要"播放中不下载"和
         // "播放中下载"两组对比，空闲下载与它无关。
-        if (n > 0) {
+        // ⚠️ **R6 实验已完成，默认关闭。**
+        // 2026-09-05 实测发现它现在是纯负担：
+        //   1. probe_done 要等它整个跑完才置位，**卡住每日同步 10 分钟**；
+        //   2. 它直接调 downloadToFile，**绕过 daily_sync 里的电台让路策略** ——
+        //      也就是说它会在用户听电台时下载，正是要避免的事。
+        // 需要重新做争用测量时再打开。
+        constexpr bool kRunR6Experiment = false;
+        if (kRunR6Experiment && n > 0) {
             constexpr uint32_t kWaitPlaybackMs = 300000;   // 5 分钟
             const uint32_t waitUntil = millis() + kWaitPlaybackMs;
             while (!audio.isRunning() && millis() < waitUntil) vTaskDelay(pdMS_TO_TICKS(500));
@@ -2009,6 +2040,8 @@ static void jamendoProbeTask(void*) {
                          trustworthy ? "" : " [样本不足,结论不可信]");
                 printf("[R6][TEST] %s\n", s_r6Result);
             }
+        } else if (!kRunR6Experiment) {
+            strlcpy(s_r6Result, "disabled (experiment done)", sizeof(s_r6Result));
         } else {
             strlcpy(s_r6Result, "skipped: no candidates from provider", sizeof(s_r6Result));
         }
@@ -5845,6 +5878,9 @@ static void onWifiNetworkReady() {
     // Phase 3 验收：联网后拉一次真实候选。**只发现，不下载任何文件。**
     if (s_jamendo.available() && !s_jamendoProbeDone) {
         downloadSetAudioFillFn(audioFillPercentForDownload);   // 自适应节流
+        // 电台卡顿的实测结果（2026-09-05）：下载要对网络音频限速 + 让路。
+        downloadSetNetAudioFn(netAudioActiveForDownload);
+        dailySyncSetNetAudioFn(netAudioActiveForDownload);
         if (xTaskCreatePinnedToCore(jamendoProbeTask, "jamendoProbe", 10240, nullptr, 1, nullptr, 0) != pdPASS)
             MWR_LOG_ERROR("Failed to create jamendo probe task");
     }
@@ -6302,7 +6338,9 @@ static void loopLvglRuntime() {
             // 同时抢 TLS 握手所需的内部 RAM。
             if (s_lvglNetworkReady && s_jamendo.available() && s_jamendoProbeDone &&
                 !s_syncRunning && !s_syncDone &&
-                dailySyncDue(s_syncState, s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0)) {
+                s_totalRuntime >= s_syncRetryAtSec &&
+                (kDailySyncForceOnBoot ||
+                 dailySyncDue(s_syncState, s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0))) {
                 if (xTaskCreatePinnedToCore(dailySyncTask, "dailySync", 10240, nullptr, 1, nullptr, 0) == pdPASS) {
                     s_syncRunning = true;   // 立刻置位，别等任务调度起来才置，否则会重复创建
                     printf("[SYNC][STATE] started\n");
@@ -6314,13 +6352,27 @@ static void loopLvglRuntime() {
                 printf("[SYNC][STATE] running got=%u attempts=%u owned=%u failed=%u\n",
                        s_syncStats.downloaded, s_syncStats.attempts,
                        s_syncStats.skippedOwned, s_syncStats.failedDownload);
+            } else if (!s_syncDone) {
+                // ⚠️ 不触发时也要说明原因。否则"没跑"和"跑了但没输出"完全同形 ——
+                // 2026-09-05 为此浪费了一轮 12 分钟的抓取。
+                const uint32_t nowEp = s_f_rtc ? static_cast<uint32_t>(time(nullptr)) : 0;
+                printf("[SYNC][STATE] idle rtc=%d probe=%d net=%d day=%lu last=%lu "
+                       "due=%d force=%d cooldown=%ld\n",
+                       s_f_rtc ? 1 : 0, s_jamendoProbeDone ? 1 : 0,
+                       s_lvglNetworkReady ? 1 : 0,
+                       static_cast<unsigned long>(nowEp / 86400u),
+                       static_cast<unsigned long>(s_syncState.lastRunDay),
+                       dailySyncDue(s_syncState, nowEp) ? 1 : 0,
+                       kDailySyncForceOnBoot ? 1 : 0,
+                       static_cast<long>(s_syncRetryAtSec) - static_cast<long>(s_totalRuntime));
             } else if (s_syncDone) {
                 printf("[SYNC][STATE] done got=%u/%u attempts=%u owned=%u failed=%u "
-                       "empty=%u nospace=%d %luKB %lums err=\"%s\"\n",
+                       "empty=%u nospace=%d deferred=%d %luKB %lums err=\"%s\"\n",
                        s_syncStats.downloaded, kDailySyncTracksPerDay,
                        s_syncStats.attempts, s_syncStats.skippedOwned,
                        s_syncStats.failedDownload, s_syncStats.emptyFetches,
                        s_syncStats.stoppedNoSpace ? 1 : 0,
+                       s_syncStats.deferredNetAudio ? 1 : 0,
                        static_cast<unsigned long>(s_syncStats.bytes / 1024),
                        static_cast<unsigned long>(s_syncStats.elapsedMs),
                        s_syncStats.lastError);

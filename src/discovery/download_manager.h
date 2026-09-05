@@ -43,6 +43,8 @@ struct DownloadStats {
     // 还是一行永远走不到的死代码。
     uint32_t throttleMs = 0;      // 因为音频吃紧而额外让出的时间
     uint32_t throttleEvents = 0;  // 触发次数
+    uint32_t rateLimitedMs = 0;   // 因为电台在播而限速等待的时间
+    bool     sawNetAudio = false; // 本次下载期间是否有网络音频在播
 };
 
 // 音频压力回调：返回解码输入缓冲的水位百分比（0~100）。
@@ -53,6 +55,21 @@ struct DownloadStats {
 constexpr uint8_t kAudioFillUnknown = 0xFF;
 using DownloadAudioFillFn = uint8_t (*)();
 void downloadSetAudioFillFn(DownloadAudioFillFn fn);
+
+// 当前是否有**网络供给**的音频在播（电台 / 云音乐）。
+//
+// ⚠️ 为什么要把它和"本地播放"分开处理 —— 2026-09-05 用户实测：
+// **后台下载时电台明显卡顿，本地音乐不卡。**
+//
+// 这个差异直接排掉了 SD 争用：本地播放要读 SD，电台根本不碰 SD，
+// 如果瓶颈在 SD，受影响的应该是本地音乐，现象正好相反。
+// 剩下的差异是电台独有的那条路径 —— 持续的网络接收 + TLS 解密，
+// 而下载的 TLS 解密（mbedTLS AES）是 CPU 密集的，抢的是同一个核。
+//
+// 所以对网络音频要的不是"让一下 CPU"，而是**真正降低下载的 CPU 占空比**，
+// 也就是限速（见 kNetAudioRateCapBps）。
+using DownloadNetAudioFn = bool (*)();
+void downloadSetNetAudioFn(DownloadNetAudioFn fn);
 
 const char* downloadResultName(DownloadResult r);
 

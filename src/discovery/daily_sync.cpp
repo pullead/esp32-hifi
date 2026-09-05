@@ -14,6 +14,13 @@ namespace {
 
 constexpr uint32_t kSecondsPerDay = 86400;
 
+// 电台在播时最多等多久再放弃这一轮。10 分钟：够覆盖"听完一首/换台"这类
+// 短暂占用，又不会让同步任务挂着几小时。
+constexpr uint32_t kNetAudioWaitMaxMs = 10u * 60 * 1000;
+
+// 由调用方注入，判断是否有网络供给的音频在播。
+DownloadNetAudioFn s_netAudioFn = nullptr;
+
 // 语言配额。中文和日文在 Jamendo 上可下载曲目**非常少**（2026-09-03 与用户
 // 确认后接受），所以这两档基本填不满，回填是常态而不是异常路径 ——
 // 见 jamendo_provider.h 顶部的说明。
@@ -34,6 +41,8 @@ bool candidateUsable(const RemoteTrack& t) {
 } // namespace
 
 // ---------------------------------------------------------------------------
+
+void dailySyncSetNetAudioFn(DownloadNetAudioFn fn) { s_netAudioFn = fn; }
 
 bool dailySyncOwnsTrack(const TrackRecord* records, uint16_t count,
                         uint8_t provider, const char* providerTrackId) {
@@ -181,18 +190,47 @@ void dailySyncRun(MusicProvider& provider,
                     }
                 }
 
+                // —— 电台在播就先别开新的下载 ——
+                //
+                // 2026-09-05 用户实测：后台下载时**电台明显卡顿，本地音乐不卡**。
+                // download_manager 里的限速是安全网（针对下载途中电台才起播的
+                // 情况），但更好的做法是**一开始就别撞上** —— 每日同步有 24 小时
+                // 可用，用户的听感只有一次。
+                //
+                // 等不到就跳过这一档，不要把整轮卡死在这里。
+                if (s_netAudioFn) {
+                    const uint32_t waitStart = millis();
+                    bool waited = false;
+                    while (s_netAudioFn() && millis() - waitStart < kNetAudioWaitMaxMs) {
+                        if (!waited) {
+                            printf("[SYNC] network audio playing, deferring download\n");
+                            waited = true;
+                        }
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                    }
+                    if (s_netAudioFn()) {
+                        // 还在播 —— 今天这一轮就到这儿，明天再说。
+                        snprintf(st.lastError, sizeof(st.lastError),
+                                 "deferred: network audio still playing");
+                        st.deferredNetAudio = true;
+                        break;
+                    }
+                }
+
                 char path[160];
                 dailySyncBuildPath(path, sizeof(path), provider.name(), t.providerTrackId);
 
                 ++st.attempts;
                 DownloadStats ds{};
                 const DownloadResult r = downloadToFile(t.audioUrl, path, nullptr, &ds);
-                printf("[SYNC] %s try#%u %s %luKB %lums thr=%lux \"%s\"\n",
+                printf("[SYNC] %s try#%u %s %luKB %lums thr=%lux rate=%lums net=%d \"%s\"\n",
                        slot.lang ? slot.lang : "any", st.attempts,
                        downloadResultName(r),
                        static_cast<unsigned long>(ds.bytesWritten / 1024),
                        static_cast<unsigned long>(ds.elapsedMs),
                        static_cast<unsigned long>(ds.throttleEvents),
+                       static_cast<unsigned long>(ds.rateLimitedMs),
+                       ds.sawNetAudio ? 1 : 0,
                        t.title);
 
                 if (r != DownloadResult::Ok) {
@@ -261,13 +299,20 @@ void dailySyncRun(MusicProvider& provider,
 
     // 只有真正跑完一轮才记日期。**中途因为没空间停下的也算跑过** ——
     // 否则会每次触发检查都重跑，把失败放大成循环。
-    state->lastRunDay = nowEpoch / kSecondsPerDay;
+    //
+    // ⚠️ 但"因为电台在播而推迟"是例外：那不是失败，是主动让路。
+    // 记了日期就等于今天不再尝试，用户听一下午电台就等于当天不更新曲库。
+    // 调用方负责在冷却后重试。
+    if (!st.deferredNetAudio) {
+        state->lastRunDay = nowEpoch / kSecondsPerDay;
+    }
     st.elapsedMs = millis() - startMs;
 
     printf("[SYNC] done: got=%u/%u attempts=%u owned=%u failed=%u empty=%u "
-           "nospace=%d %luKB %lums\n",
+           "nospace=%d deferred=%d %luKB %lums\n",
            st.downloaded, cfg.tracksPerDay, st.attempts, st.skippedOwned,
            st.failedDownload, st.emptyFetches, st.stoppedNoSpace ? 1 : 0,
+           st.deferredNetAudio ? 1 : 0,
            static_cast<unsigned long>(st.bytes / 1024),
            static_cast<unsigned long>(st.elapsedMs));
 }

@@ -53,7 +53,22 @@ constexpr uint8_t  kFillLowPct      = 50;   // 偏低：**且在下降**才轻�
 constexpr uint32_t kBackoffCriticalMs = 20;
 constexpr uint32_t kBackoffLowMs      = 5;
 
+// 电台在播时把下载限到这个速率。
+//
+// 实测下载自然速率约 23KB/s，电台本身约 16KB/s（128kbps）—— **加起来对 WiFi
+// 带宽毫无压力**，所以瓶颈不是带宽，是 TLS 解密的 CPU 占用。限速的意义在于
+// 直接压低单位时间的解密工作量，让出 CPU 给电台的网络接收。
+//
+// 6KB/s 下一首 3.4MB 要约 9 分钟。对每天跑一次的后台任务完全可以接受 ——
+// 它有 24 小时可用，而用户的听感只有一次。
+constexpr uint32_t kNetAudioRateCapBps = 6u * 1024;
+
+// 单次限速等待的上限。等太久服务器会把闲置连接关掉，
+// 反而让已经下好的部分白费。
+constexpr uint32_t kRateSleepMaxMs = 400;
+
 DownloadAudioFillFn s_fillFn = nullptr;
+DownloadNetAudioFn  s_netAudioFn = nullptr;
 
 void ensureDir(const char* path) {
     if (!SD_MMC.exists(path)) SD_MMC.mkdir(path);
@@ -67,6 +82,7 @@ const char* baseName(const char* path) {
 } // namespace
 
 void downloadSetAudioFillFn(DownloadAudioFillFn fn) { s_fillFn = fn; }
+void downloadSetNetAudioFn(DownloadNetAudioFn fn) { s_netAudioFn = fn; }
 
 const char* downloadResultName(DownloadResult r) {
     switch (r) {
@@ -168,6 +184,9 @@ DownloadResult downloadToFile(const char* url, const char* finalPath,
     uint32_t lastProgressMs = millis();
     uint32_t nextProgressMark = 0;
     uint8_t  prevFill = kAudioFillUnknown;   // 上一块时的音频水位，用于判断趋势
+    bool     netAudioActive = false;         // 上一块时电台是否在播
+    uint32_t rateWindowStartMs = 0;          // 限速窗口起点
+    uint32_t rateWindowBaseBytes = 0;
 
     // 传输是否"干净地结束了"。区分两种退出方式：
     //   - 服务器主动关闭 / 收满 Content-Length  → cleanEof = true
@@ -220,6 +239,36 @@ DownloadResult downloadToFile(const char* url, const char* finalPath,
                    static_cast<unsigned long>(st.expectedBytes / 1024),
                    static_cast<unsigned long>(millis() - startMs));
         }
+
+        // —— 电台在播时限速（优先于下面的节流）——
+        //
+        // 用"从限速开始到现在，按上限最多允许下多少"来算，而不是每块固定睡
+        // 一个数：固定睡法在网速波动时要么限不住、要么限过头。
+        if (s_netAudioFn && s_netAudioFn()) {
+            if (!netAudioActive) {
+                // 电台刚起播（或本次下载一开始就在播）——重置限速窗口。
+                netAudioActive = true;
+                st.sawNetAudio = true;
+                rateWindowStartMs = millis();
+                rateWindowBaseBytes = st.bytesWritten;
+            }
+            const uint32_t elapsed = millis() - rateWindowStartMs;
+            const uint32_t sent = st.bytesWritten - rateWindowBaseBytes;
+            const uint32_t allowed =
+                static_cast<uint32_t>(static_cast<uint64_t>(kNetAudioRateCapBps) * elapsed / 1000u);
+            if (sent > allowed) {
+                uint32_t needMs = static_cast<uint32_t>(
+                    static_cast<uint64_t>(sent) * 1000u / kNetAudioRateCapBps) - elapsed;
+                if (needMs > kRateSleepMaxMs) needMs = kRateSleepMaxMs;
+                if (needMs) {
+                    st.rateLimitedMs += needMs;
+                    vTaskDelay(pdMS_TO_TICKS(needMs));
+                }
+            }
+            chunkCounter = 0;   // 已经等过了，不必紧接着再让一次
+            continue;           // 限速期间跳过下面那套按水位的节流
+        }
+        netAudioActive = false;
 
         // —— 自适应节流 ——
         //

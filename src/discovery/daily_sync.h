@@ -31,6 +31,7 @@
 
 #include "../library/library_types.h"
 #include "music_provider.h"
+#include "download_manager.h"   // DownloadNetAudioFn
 
 struct DailySyncConfig {
     uint8_t  tracksPerDay = 10;      // 一轮目标下载数
@@ -62,6 +63,9 @@ struct DailySyncStats {
     uint8_t  failedDownload = 0;
     uint8_t  emptyFetches = 0;      // provider 返回空数组的次数（含重试）
     bool     stoppedNoSpace = false;
+    // 因为电台在播而主动推迟。**这不是失败**，调用方应该稍后重试，
+    // 而不是当成"今天已经跑过了"。
+    bool     deferredNetAudio = false;
     bool     indexDirty = false;    // 有新曲进索引，调用方需要存盘
     uint32_t bytes = 0;
     uint32_t elapsedMs = 0;
@@ -78,6 +82,10 @@ bool dailySyncDue(const DailySyncState& state, uint32_t nowEpoch);
 // playingLocalId 传当前正在播放的曲目 id（没有就传 0），用于空间评估时保护它。
 //
 // state 会被就地更新（offset 推进、lastRunDay 置位），调用方负责存回 NVS。
+// 注入"是否有网络供给的音频在播"的判断。不注入就不做推迟（行为与加这条之前一致）。
+// 类型复用 download_manager 的定义，避免两处各定义一个同义的函数指针。
+void dailySyncSetNetAudioFn(DownloadNetAudioFn fn);
+
 void dailySyncRun(MusicProvider& provider,
                   TrackRecord* records, uint16_t* count, uint16_t capacity,
                   uint32_t nowEpoch, uint32_t playingLocalId,
