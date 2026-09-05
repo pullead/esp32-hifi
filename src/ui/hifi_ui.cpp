@@ -2199,6 +2199,9 @@ void HifiUi::buildLocalNowPlaying() {
     // 不存在滑动误触的问题。
     constexpr uint8_t kSlotCount = 7;
     constexpr int16_t kSlotWidth = 320 / kSlotCount; // 45px
+    // 顺序保持原样（2026-09-05 用户明确要求"位置不变"）。
+    // 备注：播放键在第 2 格，中心 112.5px，屏幕中心是 160 —— 偏左 47px。
+    // 曾改成第 3 格让它居中，用户不要，已撤回。**别再自作主张调回去。**
     static const char* kSlotSymbols[kSlotCount] = {LV_SYMBOL_SHUFFLE, LV_SYMBOL_PREV, LV_SYMBOL_PLAY, LV_SYMBOL_NEXT, "★", LV_SYMBOL_LIST, LV_SYMBOL_LOOP};
     for (uint8_t i = 0; i < kSlotCount; ++i) {
         const bool primary = i == 2; // play
